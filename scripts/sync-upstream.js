@@ -71,7 +71,7 @@ function extractArchive(archive, dest) {
     // ditto preserves macOS symlinks + resource forks (required for .app)
     execSync(`ditto -xk "${archive}" "${dest}"`);
   } else {
-    // 7zz for Windows MSIX and Linux (symlinks don't matter — only ASAR content used)
+    // Try 7z first, then Windows-native tar (MSIX/ZIP are zip-compatible)
     for (const bin of ["7zz", "7z"]) {
       try {
         execSync(`${bin} x -y -o"${dest}" "${archive}"`, { stdio: "pipe" });
@@ -80,6 +80,22 @@ function extractArchive(archive, dest) {
         if (fs.readdirSync(dest).length > 0) return;
       }
     }
+    // Windows built-in tar supports zip format
+    try {
+      execSync(`tar -xf "${archive}" -C "${dest}"`, { stdio: "pipe" });
+      return;
+    } catch {}
+    // PowerShell Expand-Archive requires .zip extension — rename then extract
+    try {
+      const zipAlias = archive.replace(/\.[^.]+$/, ".zip");
+      fs.copyFileSync(archive, zipAlias);
+      execSync(
+        `powershell -NoProfile -Command "Expand-Archive -Force -Path '${zipAlias}' -DestinationPath '${dest}'"`,
+        { stdio: "pipe" }
+      );
+      try { fs.unlinkSync(zipAlias); } catch {}
+      return;
+    } catch {}
     throw new Error(`Failed to extract ${archive}`);
   }
 }
@@ -138,14 +154,37 @@ async function getAppcastVersion(url) {
   };
 }
 
-async function getWindowsVersion() {
+async function getWindowsVersion(arch = "x64") {
   const msstore = require("./fetch-msstore");
   const cookie = await msstore.getCookie();
   const info = await msstore.getAppInfo("9plm9xgg6vks", "US");
   if (!info.categoryId) throw new Error("No CategoryID");
   const pkgs = await msstore.getFileList(cookie, info.categoryId, "Retail");
   if (pkgs.length === 0) throw new Error("No packages");
-  const pkg = pkgs[0];
+
+  // The store bundle ships multiple architectures (x64 / arm64 / x86).
+  // Package names look like: OpenAI.Codex_26.707.8479.0_x64__<hash>.msix
+  // Pick the arch we're actually building for — taking pkgs[0] blindly can
+  // grab arm64 and produce an exe that won't run on an x64 PC.
+  const archTag = `_${arch}_`;
+  const matches = pkgs.filter((p) => p.name.toLowerCase().includes(archTag));
+  if (matches.length === 0) {
+    const avail = pkgs.map((p) => p.name).join(", ");
+    throw new Error(`No ${arch} package found (available: ${avail})`);
+  }
+  // If several match, prefer the highest version.
+  const parseVer = (n) => (n.match(/_(\d+\.\d+\.\d+(?:\.\d+)?)_/)?.[1] || "0");
+  const cmpVer = (a, b) => {
+    const pa = a.split("."), pb = b.split(".");
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const d = (Number(pb[i]) || 0) - (Number(pa[i]) || 0);
+      if (d) return d;
+    }
+    return 0;
+  };
+  matches.sort((a, b) => cmpVer(parseVer(a.name), parseVer(b.name)));
+  const pkg = matches[0];
+
   const url = await msstore.getDownloadUrl(pkg.updateID, pkg.revisionNumber, "Retail", pkg.digest);
   const verMatch = pkg.name.match(/_(\d+\.\d+\.\d+(?:\.\d+)?)_/);
   return { version: verMatch?.[1] || "unknown", url, packageName: pkg.name };
@@ -223,7 +262,13 @@ function assembleOutput(resourcesDir, destDir, label) {
   // 1. Extract app.asar → _asar/ (for patching)
   const asarDest = path.join(destDir, "_asar");
   console.log("   [asar extract] -> _asar/");
-  execSync(`npx asar extract "${asarPath}" "${asarDest}"`);
+  try {
+    execSync(`npx asar extract "${asarPath}" "${asarDest}"`, { stdio: "pipe" });
+  } catch (e) {
+    // Some MSIXs omit native binaries from app.asar.unpacked — ignore if _asar/ was created
+    if (!fs.existsSync(path.join(asarDest, "package.json"))) throw e;
+    console.log("   [asar] partial extract (missing some unpacked natives — ok for patching)");
+  }
 
   // 2. Copy app.asar.unpacked/ as-is (native modules)
   const unpackedSrc = path.join(resourcesDir, "app.asar.unpacked");

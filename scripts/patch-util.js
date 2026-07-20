@@ -17,9 +17,13 @@ const PROJECT_ROOT = path.join(__dirname, "..");
  *   "assets" -> src/{plat}/webview/assets/
  * @param {RegExp} opts.pattern - Filename regex (e.g. /^index-.*\.js$/)
  * @param {string} [opts.platform] - Restrict to a single platform
+ * @param {boolean} [opts.all] - Return every matching file per platform
+ *   instead of a single best-guess chunk. Needed when a pattern (e.g.
+ *   /^src-.*\.js$/) matches multiple hashed chunks and the target code
+ *   could live in any of them.
  * @returns {Array<{platform: string, path: string}>}
  */
-function locateBundles({ dir, pattern, platform }) {
+function locateBundles({ dir, pattern, platform, all }) {
   const dirMap = {
     build: (plat) => path.join(SRC_DIR, plat, "_asar", ".vite", "build"),
     assets: (plat) => path.join(SRC_DIR, plat, "_asar", "webview", "assets"),
@@ -62,6 +66,11 @@ function locateBundles({ dir, pattern, platform }) {
     const files = fs.readdirSync(d).filter((f) => pattern.test(f));
     if (files.length === 0) {
       console.warn(`  [!] ${plat}: no match for ${pattern}`);
+      continue;
+    }
+
+    if (all) {
+      for (const f of files) results.push({ platform: plat, path: path.join(d, f) });
       continue;
     }
 

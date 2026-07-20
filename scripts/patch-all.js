@@ -19,6 +19,15 @@ const PATCHES = [
   "patch-plugin-auth.js",
   "patch-updater.js",
   "patch-archive-delete.js",
+  "patch-skip-onboarding.js",
+  "patch-custom-models.js",
+  "patch-model-picker.js",
+  "sync-cc-bridge.js",
+  "patch-ensemble.js",
+  "patch-ssh-remote.js",
+  "patch-conv-native.js",
+  "patch-conv-host.js",
+  "patch-conv-nav.js",
 ];
 
 function main() {

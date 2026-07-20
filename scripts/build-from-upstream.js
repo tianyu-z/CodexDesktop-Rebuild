@@ -12,11 +12,13 @@
  */
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execFileSync, execSync } = require("child_process");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SRC_DIR = path.join(PROJECT_ROOT, "src");
-const OUT_DIR = path.join(PROJECT_ROOT, "out");
+const OUT_DIR = process.env.CODEX_BUILD_OUTPUT_ROOT
+  ? path.resolve(process.env.CODEX_BUILD_OUTPUT_ROOT)
+  : path.join(PROJECT_ROOT, "out");
 
 const TARGET_TRIPLE_MAP = {
   "mac-arm64": "aarch64-apple-darwin",
@@ -91,7 +93,10 @@ function resolveCodexVendor(platform) {
     }).trim().split("\n").pop();
     const extractDir = path.join(tmpDir, "extracted");
     clearDir(extractDir);
-    execSync(`tar xzf "${path.join(tmpDir, tgzName)}" -C "${extractDir}"`, { stdio: "pipe" });
+    execFileSync("tar", ["xzf", tgzName, "-C", path.basename(extractDir)], {
+      cwd: tmpDir,
+      stdio: "pipe",
+    });
     const p = path.join(extractDir, "package", "vendor", triple, "codex", binName);
     if (fs.existsSync(p)) return p;
   } catch (e) {
@@ -239,15 +244,67 @@ function buildWin(platform) {
   // Replace codex CLI
   replaceCodex(platform, resourcesDir, "codex.exe");
 
+  // Codex.exe in the MSIX is a package-identity launcher and exits immediately
+  // when run from an unpacked portable directory. Use the real Owl runtime for
+  // both portable entry-point names.
+  const runtimeExe = path.join(outApp, "ChatGPT.exe");
+  const portableExe = path.join(outApp, "Codex.exe");
+  if (fs.existsSync(runtimeExe)) {
+    fs.copyFileSync(runtimeExe, portableExe);
+    console.log("   [launcher] portable Codex.exe -> ChatGPT runtime");
+  }
+
   // Create ZIP
   const version = getVersion(asarDir);
   const zipName = `Codex-win-x64-${version}.zip`;
   const zipPath = path.join(OUT_DIR, zipName);
   console.log(`   [zip] ${zipName}`);
-  execSync(`7zz a -tzip -mx=5 "${zipPath}" .`, { cwd: outApp });
+  createZip(outApp, zipPath);
 
   const sizeMB = (fs.statSync(zipPath).size / 1048576).toFixed(1);
   console.log(`   [ok] ${zipPath} (${sizeMB} MB)`);
+}
+
+function createZip(sourceDir, zipPath) {
+  fs.rmSync(zipPath, { force: true });
+  for (const bin of ["7zz", "7z"]) {
+    try {
+      execFileSync(bin, ["a", "-tzip", "-mx=5", zipPath, "."], {
+        cwd: sourceDir,
+        stdio: "pipe",
+      });
+      return;
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        console.log(`   [!] ${bin} failed, trying next ZIP backend`);
+      }
+    }
+  }
+  if (process.platform !== "win32") {
+    throw new Error("No working 7z/7zz executable found");
+  }
+
+  const systemTar = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
+  if (fs.existsSync(systemTar)) {
+    try {
+      execFileSync(systemTar, ["-a", "-cf", zipPath, "."], {
+        cwd: sourceDir,
+        stdio: "pipe",
+      });
+      return;
+    } catch {
+      fs.rmSync(zipPath, { force: true });
+      console.log("   [!] Windows tar failed, trying .NET ZIP backend");
+    }
+  }
+
+  const quote = (value) => String(value).replace(/'/g, "''");
+  const command = [
+    "$ErrorActionPreference='Stop'",
+    "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+    `[IO.Compression.ZipFile]::CreateFromDirectory('${quote(sourceDir)}','${quote(zipPath)}',[IO.Compression.CompressionLevel]::Optimal,$false)`,
+  ].join(";");
+  execFileSync("powershell.exe", ["-NoProfile", "-Command", command], { stdio: "pipe" });
 }
 
 // ─── ASAR integrity ─────────────────────────────────────────────

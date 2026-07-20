@@ -119,8 +119,33 @@ function main() {
       }
     });
 
+    // Menu/shortcut gate — applied independently of the AST devTools patches, since a
+    // bundle can already have devTools:!0 (patches.length===0) yet still hide the menu
+    // item + its Ctrl+Shift+I / F12 accelerator behind a debug flag `r`:
+    //   ...r?[{role:`toggleDevTools`}]:[]
+    // Force the gate true so the item + accelerator always exist. String-based: the gate
+    // var name is minified/unstable across builds; the literal role token is not.
+    function forceMenuGate(src) {
+      const MENU_GATE = "...r?[{role:`toggleDevTools`}]:[]";
+      const MENU_GATE_FORCED = "...!0?[{role:`toggleDevTools`}]:[]";
+      if (src.includes(MENU_GATE)) {
+        console.log("   * [menuGate] toggleDevTools menu item + accelerator force-enabled");
+        return src.split(MENU_GATE).join(MENU_GATE_FORCED);
+      }
+      if (src.includes(MENU_GATE_FORCED)) {
+        console.log("   [ok] menu gate already forced");
+      } else {
+        console.log("   [!] toggleDevTools menu gate not found (upstream layout changed)");
+      }
+      return src;
+    }
+
     if (patches.length === 0) {
-      console.log("   [ok] DevTools already enabled or no match");
+      console.log("   [ok] DevTools property already enabled or no match");
+      if (!isCheck) {
+        const forced = forceMenuGate(source);
+        if (forced !== source) fs.writeFileSync(bundle.path, forced, "utf-8");
+      }
       continue;
     }
 
@@ -139,6 +164,8 @@ function main() {
       console.log(`   * [${p.rule}] offset ${p.start}: ${p.original} -> ${p.replacement}`);
       patched = patched.slice(0, p.start) + p.replacement + patched.slice(p.end);
     }
+
+    patched = forceMenuGate(patched);
 
     fs.writeFileSync(bundle.path, patched, "utf-8");
     console.log(`   [ok] DevTools force-enabled: ${patches.length} replacements`);

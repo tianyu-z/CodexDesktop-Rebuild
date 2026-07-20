@@ -75,11 +75,8 @@ const candidates = [
 
 const cliPath = candidates.find(p => fs.existsSync(p));
 
-// Verify CLI exists
-if (!fs.existsSync(cliPath)) {
-  console.error(`CLI not found at: ${cliPath}`);
-  console.error('Tried: resources/bin/ and node_modules/@cometix/codex/vendor/');
-  process.exit(1);
+if (!cliPath) {
+  console.warn('[start-dev] Local Codex CLI not found. Fully Remote mode can still start over SSH.');
 }
 
 // Resolve app entry: prefer platform-specific _asar/ (has its own package.json)
@@ -87,7 +84,7 @@ const appRoot = path.join(__dirname, '..', 'src', srcPlatform, '_asar');
 const appEntry = fs.existsSync(appRoot) ? appRoot : path.join(__dirname, '..');
 
 console.log(`[start-dev] Platform: ${platform}, Arch: ${arch}`);
-console.log(`[start-dev] CLI Path: ${cliPath}`);
+console.log(`[start-dev] CLI Path: ${cliPath || '(none; Fully Remote only)'}`);
 console.log(`[start-dev] App Root: ${appEntry}`);
 
 // Launch Electron with CLI path
@@ -97,7 +94,7 @@ const child = spawn(electronBin, [appEntry], {
   stdio: 'inherit',
   env: {
     ...process.env,
-    CODEX_CLI_PATH: cliPath,
+    ...(cliPath ? { CODEX_CLI_PATH: cliPath } : {}),
     BUILD_FLAVOR: process.env.BUILD_FLAVOR || 'dev',
     ELECTRON_RENDERER_URL: process.env.ELECTRON_RENDERER_URL || 'app://-/index.html',
     CODEX_ELECTRON_RESOURCES_PATH: path.join(__dirname, '..', 'src', srcPlatform),
