@@ -20,6 +20,7 @@ const PATCHES = [
   "patch-updater.js",
   "patch-archive-delete.js",
   "patch-branch-edit.js",
+  "patch-model-add.js",
 ];
 
 function main() {
