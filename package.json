@@ -1,6 +1,6 @@
 {
-  "name": "codex-rebuild",
-  "productName": "Codex",
+  "name": "chatgpt-dev",
+  "productName": "chatgpt-dev",
   "version": "26.901.51231",
   "description": "Codex Electron App - Cross-platform Build",
   "main": "src/.vite/build/bootstrap.js",

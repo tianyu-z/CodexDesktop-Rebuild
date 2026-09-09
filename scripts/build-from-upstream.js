@@ -121,7 +121,8 @@ function buildMac(platform) {
   if (fs.existsSync(extractDir)) {
     const findApp = (dir) => {
       for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (e.name === "Codex.app" && e.isDirectory()) return path.join(dir, e.name);
+        // Upstream renamed the bundle Codex.app -> ChatGPT.app; accept either.
+        if ((e.name === "ChatGPT.app" || e.name === "Codex.app") && e.isDirectory()) return path.join(dir, e.name);
         if (e.isDirectory()) { const r = findApp(path.join(dir, e.name)); if (r) return r; }
       }
       return null;
@@ -130,7 +131,7 @@ function buildMac(platform) {
   }
 
   if (!appPath) {
-    console.error(`[x] Codex.app not found in cache. Run sync-upstream first.`);
+    console.error(`[x] ChatGPT.app/Codex.app not found in cache. Run sync-upstream first.`);
     process.exit(1);
   }
 
@@ -139,9 +140,40 @@ function buildMac(platform) {
   // 2. Copy .app to output (ditto preserves symlinks + resource forks)
   const outAppDir = path.join(OUT_DIR, platform);
   clearDir(outAppDir);
-  const outApp = path.join(outAppDir, "Codex.app");
-  console.log("   [copy] Codex.app -> out/");
+  const outApp = path.join(outAppDir, "chatgpt-dev.app");
+  console.log(`   [copy] ${path.basename(appPath)} -> out/chatgpt-dev.app`);
   execSync(`ditto "${appPath}" "${outApp}"`);
+
+  // Rebrand identity so this never collides with the official Codex/ChatGPT app.
+  // (The in-app name + userData dir are additionally overridden inside app.asar.)
+  const outInfoPlist = path.join(outApp, "Contents", "Info.plist");
+  try {
+    execSync(`plutil -replace CFBundleIdentifier -string "com.cometix.chatgpt-dev" "${outInfoPlist}"`, { stdio: "pipe" });
+    execSync(`plutil -replace CFBundleName -string "chatgpt-dev" "${outInfoPlist}"`, { stdio: "pipe" });
+    execSync(`plutil -replace CFBundleDisplayName -string "chatgpt-dev" "${outInfoPlist}"`, { stdio: "pipe" });
+    console.log("   [rebrand] Info.plist -> chatgpt-dev (com.cometix.chatgpt-dev)");
+  } catch (e) { console.log(`   [!] rebrand failed: ${e.message}`); }
+
+  // Wrapper executable: pass a private Chromium --user-data-dir as a REAL launch
+  // argument. Chromium's process singleton reads this switch before any app JS
+  // runs, so injecting it from JS is too late; without it the app shares the
+  // official Codex/ChatGPT user-data-dir and quits as a "second instance".
+  try {
+    const macOSDir = path.join(outApp, "Contents", "MacOS");
+    const realExecName = execSync(`plutil -extract CFBundleExecutable raw "${outInfoPlist}"`, { encoding: "utf-8" }).trim();
+    const realExec = path.join(macOSDir, realExecName);
+    if (fs.existsSync(realExec)) {
+      const wrapperName = "chatgpt-dev";
+      const wrapper = path.join(macOSDir, wrapperName);
+      const sh = `#!/bin/sh\n`
+        + `DIR="$(cd "$(dirname "$0")" && pwd)"\n`
+        + `exec "$DIR/${realExecName}" --user-data-dir="$HOME/Library/Application Support/chatgpt-dev" "$@"\n`;
+      fs.writeFileSync(wrapper, sh);
+      fs.chmodSync(wrapper, 0o755);
+      execSync(`plutil -replace CFBundleExecutable -string "${wrapperName}" "${outInfoPlist}"`, { stdio: "pipe" });
+      console.log(`   [wrapper] CFBundleExecutable ${realExecName} -> ${wrapperName} (adds --user-data-dir)`);
+    }
+  } catch (e) { console.log(`   [!] wrapper failed: ${e.message}`); }
 
   const resourcesDir = path.join(outApp, "Contents", "Resources");
 
@@ -175,10 +207,10 @@ function buildMac(platform) {
 
   // 8. Create DMG
   const version = getVersion(asarDir);
-  const dmgName = `Codex-${platform}-${version}.dmg`;
+  const dmgName = `chatgpt-dev-${platform}-${version}.dmg`;
   const dmgPath = path.join(OUT_DIR, dmgName);
   console.log(`   [dmg] ${dmgName}`);
-  execSync(`hdiutil create -volname Codex -srcfolder "${outAppDir}" -ov -format UDZO "${dmgPath}"`, { stdio: "pipe" });
+  execSync(`hdiutil create -volname chatgpt-dev -srcfolder "${outAppDir}" -ov -format UDZO "${dmgPath}"`, { stdio: "pipe" });
   const sizeMB = (fs.statSync(dmgPath).size / 1048576).toFixed(1);
   console.log(`   [ok] ${dmgPath} (${sizeMB} MB)`);
 }

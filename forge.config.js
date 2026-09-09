@@ -4,9 +4,9 @@ const fs = require("fs");
 
 module.exports = {
   packagerConfig: {
-    name: "Codex",
-    executableName: "Codex",
-    appBundleId: "com.openai.codex",
+    name: "chatgpt-dev",
+    executableName: "chatgpt-dev",
+    appBundleId: "com.cometix.chatgpt-dev",
     icon: "./resources/electron",
     // Build mode is set by prepare-src.js via src/.build-mode marker file.
     // "upstream-asar": mac/win — we provide pre-built app.asar, forge skips ASAR packing.
@@ -50,7 +50,7 @@ module.exports = {
     },
     win32metadata: {
       CompanyName: "OpenAI",
-      ProductName: "Codex",
+      ProductName: "chatgpt-dev",
     },
   },
   rebuildConfig: {},
@@ -60,7 +60,7 @@ module.exports = {
     {
       name: "@electron-forge/maker-squirrel",
       config: {
-        name: "Codex",
+        name: "chatgpt-dev",
         authors: "OpenAI, Cometix Space",
         description: "Codex Desktop App",
         setupIcon: "./resources/electron.ico",
@@ -70,11 +70,11 @@ module.exports = {
     { name: "@electron-forge/maker-zip", platforms: ["win32"] },
     {
       name: "@electron-forge/maker-deb",
-      config: { options: { name: "codex", productName: "Codex", genericName: "AI Coding Assistant", categories: ["Development", "Utility"], bin: "Codex", maintainer: "Cometix Space", homepage: "https://github.com/Haleclipse/CodexDesktop-Rebuild", icon: "./resources/electron.png" } },
+      config: { options: { name: "chatgpt-dev", productName: "chatgpt-dev", genericName: "AI Coding Assistant", categories: ["Development", "Utility"], bin: "chatgpt-dev", maintainer: "Cometix Space", homepage: "https://github.com/Haleclipse/CodexDesktop-Rebuild", icon: "./resources/electron.png" } },
     },
     {
       name: "@electron-forge/maker-rpm",
-      config: { options: { name: "codex", productName: "Codex", genericName: "AI Coding Assistant", categories: ["Development", "Utility"], bin: "Codex", license: "Apache-2.0", homepage: "https://github.com/Haleclipse/CodexDesktop-Rebuild", icon: "./resources/electron.png" } },
+      config: { options: { name: "chatgpt-dev", productName: "chatgpt-dev", genericName: "AI Coding Assistant", categories: ["Development", "Utility"], bin: "chatgpt-dev", license: "Apache-2.0", homepage: "https://github.com/Haleclipse/CodexDesktop-Rebuild", icon: "./resources/electron.png" } },
     },
     { name: "@electron-forge/maker-zip", platforms: ["linux"] },
   ],

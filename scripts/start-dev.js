@@ -92,11 +92,18 @@ console.log(`[start-dev] App Root: ${appEntry}`);
 
 // Launch Electron with CLI path
 const electronBin = require('electron');
+
+// Some parent shells (e.g. an Electron-based IDE terminal) export
+// ELECTRON_RUN_AS_NODE=1, which would make Electron boot as plain Node and
+// crash (app is undefined). Strip it so the GUI process starts normally.
+const cleanEnv = { ...process.env };
+delete cleanEnv.ELECTRON_RUN_AS_NODE;
+
 const child = spawn(electronBin, [appEntry], {
   cwd: path.join(__dirname, '..'),
   stdio: 'inherit',
   env: {
-    ...process.env,
+    ...cleanEnv,
     CODEX_CLI_PATH: cliPath,
     BUILD_FLAVOR: process.env.BUILD_FLAVOR || 'dev',
     ELECTRON_RENDERER_URL: process.env.ELECTRON_RENDERER_URL || 'app://-/index.html',
