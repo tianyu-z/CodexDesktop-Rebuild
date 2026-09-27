@@ -21,6 +21,24 @@ test('ordinary CLI commands are delegated',async t=>{const f=await fixture(t,['-
 test('parallel native requests retain original client ids and payloads',async t=>{const f=await fixture(t);f.send({id:1,method:'initialize',params:{clientInfo:{name:'fixture',version:'1'}}});f.send({id:'upstream:1',method:'config/read',params:{includeLayers:true}});const results=[JSON.parse(await f.next()),JSON.parse(await f.next())];assert.deepEqual(new Set(results.map(r=>r.id)),new Set([1,'upstream:1']));assert.equal(results.find(r=>r.id===1).result.echo.clientInfo.name,'fixture');});
 test('server initiated request ids are remapped without stealing client responses',async t=>{const f=await fixture(t);f.send({id:1,method:'approval',params:{}});const approval=JSON.parse(await f.next());assert.notEqual(approval.id,1);assert.equal(approval.method,'approval/native');f.send({id:approval.id,result:{decision:'decline'}});const result=JSON.parse(await f.next());assert.equal(result.id,1);assert.equal(result.result.decision,'decline');});
 
+test('production gateway advertises local dual workflows and stores custom template revisions', async t => {
+  const f = await fixture(t);
+  f.send({ id: 1, method: 'engine/capabilities', params: {} });
+  const local = JSON.parse(await f.next());
+  assert.equal(local.result.bothAvailable, true);
+  f.send({ id: 2, method: 'engine/templates/list', params: {} });
+  const listed = JSON.parse(await f.next());
+  assert.deepEqual(listed.result.templates.map(template => template.id).sort(), ['debby', 'polly']);
+  const template = { ...listed.result.templates.find(template => template.id === 'debby'), id: 'custom-test', name: 'Custom gateway test' };
+  f.send({ id: 3, method: 'engine/templates/save', params: { template } });
+  const saved = JSON.parse(await f.next());
+  assert.equal(saved.result.template.id, 'custom-test');
+  f.send({ id: 4, method: 'engine/templates/read', params: { id: 'custom-test', revision: saved.result.template.revision } });
+  assert.deepEqual(JSON.parse(await f.next()).result.template, saved.result.template);
+  f.send({ id: 5, method: 'engine/capabilities', params: { hostId: 'remote-ssh:fixture' } });
+  assert.equal(JSON.parse(await f.next()).result.bothAvailable, false);
+});
+
 
 test('shutdown closes native transport while Claude materialization is pending', async t => {
   const f = await fixture(t, ['app-server'], `

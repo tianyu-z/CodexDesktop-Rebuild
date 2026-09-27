@@ -60,6 +60,7 @@ test('both creates one public turn with a frozen template, exact two models and 
   assert.equal(w.options.nativeOptions.effort, 'high'); assert.equal(w.options.template.id, 'debby');
   assert.equal(w.options.parameters.rounds, 1);
   assert.equal(f.calls.filter(row => row.method === 'turn/start').length, 0);
+  assert.equal(f.calls.filter(row => row.method === 'thread/resume').length, 0, 'A fresh loaded thread has no rollout to resume before its first injection');
   const wire = f.calls.find(row => row.method === 'thread/start').params;
   assert.equal(wire.engineMode, undefined); assert.equal(wire.engineModels, undefined); assert.equal(wire.template, undefined);
   assert.equal(wire.agentMode, 'guardian-approvals');
@@ -247,10 +248,20 @@ test('continuing after immediate stop starts the frozen workflow when no schedul
   const { turn } = await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'text', text: 'Start and stop immediately' }] });
   await f.router.request('turn/interrupt', { threadId: 'chat', turnId: turn.id });
   assert.equal(f.store.get('chat').turns[0].workflow.state, null); assert.equal(calls.length, 0);
+  // The public thread exists on disk after restart, but its native session has
+  // not been loaded. Native inject_items requires an explicit resume first.
+  let loaded = false;
+  const request = f.native.request;
+  f.native.request = async (method, params) => {
+    if (method === 'thread/resume') loaded = true;
+    if (method === 'thread/inject_items' && !loaded) throw new Error('thread not found: chat');
+    return request(method, params);
+  };
   await f.router.request('engine/runs/retry', { threadId: 'chat', turnId: turn.id });
   for (let i = 0; i < 100 && f.store.get('chat').activeTurn; i++) await tick();
   const row = f.store.get('chat').turns[0];
   assert.equal(row.turn.status, 'completed', row.turn.error?.message);
   assert.equal(calls.length, 5); assert.equal(f.store.get('chat').turns.length, 1);
+  assert.equal(loaded, true);
   assert.ok(calls.filter(call => call.engine === 'claude').every(call => call.model === selected.engineModels.claude));
 });

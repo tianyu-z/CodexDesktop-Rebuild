@@ -8,6 +8,10 @@ import { ConversationStore } from './store.mjs';
 import { ClaudeAdapter } from './claude-adapter.mjs';
 import { EngineRouter } from './router.mjs';
 import { NativeClient } from './upstream.mjs';
+import { TemplateStore } from './templates/store.mjs';
+import { RoleRunner } from './orchestration/role-runner.mjs';
+import { WorkflowScheduler } from './orchestration/scheduler.mjs';
+import { GitWorkspaceManager } from './workspaces/manager.mjs';
 
 const args = process.argv.slice(2);
 const command = process.env.CDX_REAL_CODEX;
@@ -42,7 +46,13 @@ if (serverIndex < 0 || (subcommand && !subcommand.startsWith('-'))) {
   const native = new NativeClient({ command, args, env: process.env,
     onNotification: message => router?.nativeNotification(message), onRequest: emit,
     onExit: () => { void shutdown(); } });
-  router = new EngineRouter({ store, native, adapter: new ClaudeAdapter({ executablePath: process.env.CDX_CLAUDE_PATH }), emit });
+  const adapter = new ClaudeAdapter({ executablePath: process.env.CDX_CLAUDE_PATH });
+  const templates = new TemplateStore(join(directory, 'templates'));
+  const runner = new RoleRunner({ claudeAdapter: adapter, codexCommand: command });
+  const workspaces = new GitWorkspaceManager(join(directory, 'workspaces'));
+  const operationsFactory = async context => (await import('./orchestration/polly.mjs')).createPollyOperations(context);
+  router = new EngineRouter({ store, native, adapter, emit, templates,
+    workflowFactory: callbacks => new WorkflowScheduler({ ...callbacks, runner, workspaces, operationsFactory }) });
   const input = createInterface({ input: process.stdin });
   const tasks = new Set();
   input.on('line', line => {

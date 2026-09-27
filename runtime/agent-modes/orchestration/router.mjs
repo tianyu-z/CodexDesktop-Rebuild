@@ -109,7 +109,15 @@ export class WorkflowRouter {
         if (run.controller.signal.aborted) throw new Error('Workflow interrupted before startup.');
         const chat = this.store.get(id);
         if (!chat.nativeMaterialized && !chat.turns.some(row => row.engine === 'codex')) {
-          await abortable(this.router.native.request('thread/inject_items', { threadId: id, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: '' }] }] }), run.controller.signal);
+          const inject = () => abortable(this.router.native.request('thread/inject_items', { threadId: id, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: '' }] }] }), run.controller.signal);
+          try { await inject(); }
+          catch (error) {
+            // A restarted gateway can know the durable public ID without loading
+            // its session. Fresh sessions, conversely, have no rollout to resume.
+            if (!/thread not found/i.test(messageOf(error))) throw error;
+            await abortable(this.router.native.request('thread/resume', { threadId: id, excludeTurns: true }), run.controller.signal);
+            await inject();
+          }
           const current = this.store.require(id); current.nativeMaterialized = true; this.store.save(current);
           if (!current.thread.name && config.input.trim()) await abortable(this.router.native.request('thread/name/set', { threadId: id, name: config.input.trim().slice(0, 80) }), run.controller.signal);
         }

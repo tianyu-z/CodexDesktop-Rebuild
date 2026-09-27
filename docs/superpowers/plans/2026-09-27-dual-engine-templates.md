@@ -83,7 +83,7 @@ assert.equal(recordedOptions.systemPrompt.preset, 'claude_code');
 
 Files: create `runtime/agent-modes/workspaces/{git,manager}.mjs`, `tests/agent-modes/workspaces.test.mjs`.
 
-- [ ] Write real temporary-Git tests covering dirty tracked files, staged state, untracked files, binaries, task isolation, dependencies, fixed review artifacts, conflicts and safe application.
+- [x] Write real temporary-Git tests covering dirty tracked files, staged state, untracked files, binaries, task isolation, dependencies, fixed review artifacts, conflicts and safe application.
 
 ```js
 const base = await workspaces.prepare({cwd, runId:'workflow'});
@@ -93,17 +93,17 @@ assert.equal(await readFile(join(worker.cwd,'existing.txt'),'utf8'), 'user edit'
 assert.equal(await git(cwd,['diff','--cached']), originalIndexDiff);
 ```
 
-- [ ] Run tests before implementation.
-- [ ] Use private index/temp Git objects for startup snapshot, never reset/stash the user's checkout. Track owned worktrees under workflow data. Task worktrees start from base plus declared dependency outcomes. No two workers write one directory.
-- [ ] Freeze worker outcome into immutable commits/diffs including binary changes; prepare separate read-only review checkout and acceptance contract. Integration follows dependency order, reports conflicts for bounded repair, and records exact reviewed artifact hashes.
-- [ ] Apply integrated delta only if affected paths still match the baseline; preserve unrelated edits/index, detect symlink/type/path escapes, retain artifacts on error/cancel. Non-Git write workflow fails before mutation; no implicit git init. No remote push/PR behavior.
-- [ ] Run tests; spec and quality review; commit.
+- [x] Run tests before implementation.
+- [x] Use private index/temp Git objects for startup snapshot, never reset/stash the user's checkout. Track owned worktrees under workflow data. Task worktrees start from base plus declared dependency outcomes. No two workers write one directory.
+- [x] Freeze worker outcome into immutable commits/diffs including binary changes; prepare separate read-only review checkout and acceptance contract. Integration follows dependency order, reports conflicts for bounded repair, and records exact reviewed artifact hashes.
+- [x] Apply integrated delta only if affected paths still match the baseline; preserve unrelated edits/index, detect symlink/type/path escapes, retain artifacts on error/cancel. Non-Git write workflow fails before mutation; no implicit git init. No remote push/PR behavior.
+- [x] Run tests; spec and quality review; commit.
 
 ## Task 4: Workflow scheduling and durable multi-run state
 
 Files: create `runtime/agent-modes/orchestration/{scheduler,inputs,polly}.mjs`, modify `store.mjs` and `handoff.mjs`; add `tests/agent-modes/{scheduler,polly}.test.mjs`, extend store/handoff tests.
 
-- [ ] Write deterministic runner tests with deferred results proving concurrency, predecessor barriers, immutable model/input snapshots, same-round cross-critique, opposite-engine review and bounded repairs.
+- [x] Write deterministic runner tests with deferred results proving concurrency, predecessor barriers, immutable model/input snapshots, same-round cross-critique, opposite-engine review and bounded repairs.
 
 ```js
 const handle = scheduler.start({runId:'w',template:debby,parameters:{rounds:1},
@@ -116,18 +116,18 @@ assert.match(calls[2].prompt, /A0/);
 assert.match(calls[3].prompt, /C0/);
 ```
 
-- [ ] Run tests before implementing scheduler.
-- [ ] Interpreter executes validated graph, expands bounded repeat/parallel stages and dynamically planned tasks. Model slots bound on every dispatch. Coordinator planning has structured output contract; no execution of generated code. Event-driven readiness and inbox completion; no model polling.
-- [ ] Polly applies workspace contract, task limits, independent task parallelism, opposite-engine fixed-artifact review and at most configured repair rounds. Validate planner's file scopes/dependencies and review verdicts; missing or malformed output is a run failure, never silently accepted. Integrate and validate actual output; apply authorized edits with baseline protection.
-- [ ] Migrate v1 to backed-up v2 atomically. Persist template/model snapshots, active turn, role runs/events/attempts, scoped bindings and cursors. Old methods retain single-engine compatibility; mode validation separated from engine validation. Startup marks abandoned runs interrupted, with no automatic tool/turn replay.
-- [ ] Failed/cancelled role preserves siblings; dependent steps pause and can retry only selected failure with same immutable config. Whole-turn stop freezes scheduling, cancels approvals and waits for owned process cleanup. Persist public messages/tool results and source attribution for history handoff, without internal reasoning.
-- [ ] Run scheduler/store/handoff tests; spec and quality review; commit.
+- [x] Run tests before implementing scheduler.
+- [x] Interpreter executes validated graph, expands bounded repeat/parallel stages and dynamically planned tasks. Model slots bound on every dispatch. Coordinator planning has structured output contract; no execution of generated code. Event-driven readiness and inbox completion; no model polling.
+- [x] Polly applies workspace contract, task limits, independent task parallelism, opposite-engine fixed-artifact review and at most configured repair rounds. Validate planner's file scopes/dependencies and review verdicts; missing or malformed output is a run failure, never silently accepted. Integrate and validate actual output; apply authorized edits with baseline protection.
+- [x] Migrate v1 to backed-up v2 atomically. Persist template/model snapshots, active turn, role runs/events/attempts, scoped bindings and cursors. Old methods retain single-engine compatibility; mode validation separated from engine validation. Startup marks abandoned runs interrupted, with no automatic tool/turn replay.
+- [x] Failed/cancelled role preserves siblings; dependent steps pause and can retry only selected failure with same immutable config. Whole-turn stop freezes scheduling, cancels approvals and waits for owned process cleanup. Persist public messages/tool results and source attribution for history handoff, without internal reasoning.
+- [x] Run scheduler/store/handoff tests; spec and quality review; commit.
 
 ## Task 5: Router, template APIs and desktop frontend
 
 Files: modify `router.mjs`, `gateway.mjs`, `codex-events.mjs`, `scripts/assets/agent-modes-ui.js`, `scripts/patch-agent-modes.js`; add focused dual-router tests and extend frontend/patch tests. Extract `orchestration/router.mjs` and `scripts/assets/agent-templates-ui.js` if needed to keep responsibilities readable.
 
-- [ ] Write tests for `both` mode turn creation, first-turn/prewarm races, separate model values, strict extended-field stripping, per-run approvals, interruption, metadata suppression and chat history pagination.
+- [x] Write tests for `both` mode turn creation, first-turn/prewarm races, separate model values, strict extended-field stripping, per-run approvals, interruption, metadata suppression and chat history pagination.
 
 ```js
 api.setDraftSelection(scope,{engineMode:'both',engineModels:{codex:'gpt-x',claude:'claude-y'},
@@ -138,20 +138,20 @@ assert.equal(fields.engineModels.claude,'claude-y');
 assert.equal(fields.template.id,'debby');
 ```
 
-- [ ] Implement template CRUD/import/export RPCs and multi-run read/interrupt/retry APIs. Capabilities reflect actually available local runner and schema versions, with remote still unavailable until remote gateway exists. Route all ownership keys through host/chat/turn/run identity.
-- [ ] Expose both model controls together, preserving native Codex picker and effort settings. Extend immutable creation intent/request capture to `engineModels` and `template`; snapshot at send time rather than reread mutable UI after thread creation. Disable only active chat controls.
-- [ ] Template management UI supports new/duplicate/edit/delete/import/export, basic role/name/parameter form plus YAML editor, field errors and built-in read-only behavior. Show built-in descriptions and coordinator engine; default Polly, Debby rounds switch.
-- [ ] Group attributed results in the existing turn, with role/task/engine/model/status, expandable outputs and individual stop/retry. Whole-turn stop uses normal composer control. Display partial failures accurately and allow ending the turn while retaining results. Preserve exact source across reload/mode changes.
-- [ ] Run router/frontend/patch tests and full existing suite; spec and quality review; commit.
+- [x] Implement template CRUD/import/export RPCs and multi-run read/interrupt/retry APIs. Capabilities reflect actually available local runner and schema versions, with remote still unavailable until remote gateway exists. Route all ownership keys through host/chat/turn/run identity.
+- [x] Expose both model controls together, preserving native Codex picker and effort settings. Extend immutable creation intent/request capture to `engineModels` and `template`; snapshot at send time rather than reread mutable UI after thread creation. Disable only active chat controls.
+- [x] Template management UI supports new/duplicate/edit/delete/import/export, basic role/name/parameter form plus YAML editor, field errors and built-in read-only behavior. Show built-in descriptions and coordinator engine; default Polly, Debby rounds switch.
+- [x] Group attributed results in the existing turn, with role/task/engine/model/status, expandable outputs and individual stop/retry. Whole-turn stop uses normal composer control. Display partial failures accurately and allow ending the turn while retaining results. Preserve exact source across reload/mode changes.
+- [x] Run router/frontend/patch tests and full existing suite; spec and quality review; commit.
 
 ## Task 6: Actual-harness validation, preview and installation
 
 Files: create `tests/agent-modes/live-dual.mjs`; update `docs/agent-modes.md` and evidence under ignored `.artifacts/`.
 
-- [ ] Run `node --test tests/agent-modes/*.test.mjs`; require zero failures.
-- [ ] In an isolated temporary Git project, execute Debby with distinct exact models, a bounded debate, Polly with two independently modified files plus cross-review, and a custom reversed coordinator/step workflow. Verify live process/model evidence and actual file contents.
-- [ ] Exercise one-sided model failure, read-only mutation attempts, permission allow/deny, pending approval cancellation, role stop, whole-turn stop and gateway restart. Confirm no duplicate inputs, no unauthorized file writes and no owned process leaks.
-- [ ] Build independent preview with version-bound patches; verify ASAR integrity/signature. Do not rebuild a running preview.
+- [x] Run `node --test tests/agent-modes/*.test.mjs`; require zero failures.
+- [x] In an isolated temporary Git project, execute Debby with distinct exact models, a bounded debate, Polly with two independently modified files plus cross-review, and a custom reversed coordinator/step workflow. Verify live process/model evidence and actual file contents.
+- [x] Exercise one-sided model failure, read-only mutation attempts, permission allow/deny, pending approval cancellation, role stop, whole-turn stop and gateway restart. Confirm no duplicate inputs, no unauthorized file writes and no owned process leaks.
+- [x] Build independent preview with version-bound patches; verify ASAR integrity/signature. Do not rebuild a running preview.
 - [ ] Through the native app GUI, select both models, change template and debate rounds, create/edit/export/import custom template, execute all workflows, inspect grouped output and retry/stop, reopen chat/app and verify persistence.
 - [ ] Fix observed failures and rerun affected checks. Final spec/quality review before installation.
 - [ ] Back up installed app and matching storage, confirm no active work would be interrupted, install using existing authorized workflow, verify installed hashes/signature/UI. Preserve code, user history and recovery artifacts; document any limits honestly.
@@ -165,9 +165,10 @@ All six tasks are necessary for the requested first release. The task is not com
 
 ## Execution checkpoint
 
-- Template data/schema/revision store: spec and quality approved.
-- Native role runners: spec and quality approved, 60 focused tests plus real new/resume smoke for both engines.
-- Workflow conversation store and public handoff: implemented; final quality fixes under re-review.
-- Workspace manager: initial implementation complete; review fixes in progress, including ancestor-safe apply via an isolated Node helper pinned to directory identity.
-- Renderer dual selection snapshots: 32 focused tests passed; full controls/template management/run presentation and asset seams in progress independently.
-- Scheduler, gateway integration, live full workflows, preview and installed-app validation remain required.
+- Templates, native role runners, conversation store/public handoff: spec and quality approved.
+- Workspace manager: spec and quality approved after canonical diff settings, add/add integration, concurrent short-write publication and transition fixes; committed after review in `1ecb288`.
+- Scheduler recovery, history cursors, permission failure propagation, early write preflight: reviewed and committed with router/frontend recovery fixes in `4b5eac7`.
+- Frontend/template controls and native shortcut guards: spec/quality approved; cache ordering regression fixed; 71 frontend tests passed.
+- Router/gateway: spec and quality approved, including host ownership and immediate-stop recovery. Gateway factory wiring awaits final Polly commit.
+- Polly: spec approved including effective ownership dependencies. Live findings for strict output schemas, task-vs-integration review scope and optional skipped checks fixed. Final quality fixes for direct-run contract and shared application receipts approved.
+- Real Debby and custom reversed-coordinator tests passed. Real Polly completed after explicit same-turn retry: 10 successful attempts plus one retained failed verification, both exact models, one user message, exact two-file application. All five real dual resilience scenarios passed. Final full source suite passed 379/379 after all custom-template fixes (`.artifacts/dual-final-verification.log`). Signed preview built. GUI blocked by locked Mac; unlock requested. Final GUI/installation remain required.

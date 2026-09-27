@@ -243,6 +243,10 @@ class WorkflowExecution {
       this.operationPromise = Promise.resolve(this.owner.operationsFactory({ invoke: descriptor => this.invoke(descriptor), options: this.options,
         workspaces: this.owner.workspaces, signal: this.controller.signal,
         fail: error => { this.executionError ??= errorText(error); this.stop(); },
+        getInvocation: run => {
+          const descriptor = this.state.invocations[roleKey(run)];
+          return descriptor === undefined ? undefined : frozen(descriptor);
+        },
         checkpoint: (key, value) => { this.alive(); if (typeof key !== 'string' || !key || ['__proto__', 'constructor', 'prototype'].includes(key)) throw new TypeError('Invalid checkpoint key.'); this.state.checkpoints[key] = clone(value); this.notify(); },
         getCheckpoint: key => clone(this.state.checkpoints[key]), notifySnapshot: () => this.notify(),
       }));

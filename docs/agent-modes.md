@@ -4,10 +4,28 @@
 
 ## 使用
 
-1. 新建或打开本地会话，在输入框旁选择 **Only Codex** 或 **Only Claude Code**。
+1. 新建或打开本地会话，在输入框旁选择 **Only Codex**、**Only Claude Code** 或 **Codex + Claude Code**。
 2. Claude 模型列表从本机 Claude Code 动态读取，直接选择具体版本，例如 Opus 4.8、4.6、5、5.5；Default 沿用 Claude 的配置。模型栏旁的刷新按钮可重新读取目录。
 3. 一轮执行结束或中断完成后，可以在同一会话切换引擎。公开消息和工具结果会作为明确标注的历史资料交给接手引擎；两者分别恢复自己的原生会话。
-4. **Codex + Claude Code** 显示为禁用。本版本不会并行启动两种引擎。
+4. 双引擎模式分别选择 Codex 和 Claude 模型，并选择 Polly、Debby 或自定义模板。发送时固定本轮模型、模板修订和参数；运行期间该会话的选择器及模型快捷键锁定。
+
+## 双引擎工作流
+
+两种引擎分别使用原生 Codex App Server 和官方 Claude Code Agent SDK。模板中的角色绑定所选的两个模型槽；规划、审查、汇总均不引入隐藏的第三个模型。
+
+| 模板 | 行为 |
+| --- | --- |
+| Polly · 协作开发 | Claude 规划有界任务；Codex、Claude 在独立 Git 工作区执行；对方引擎审查固定结果；在配置上限内修复、集成、检查和再次审查，通过后安全写回原项目；Claude 汇总 |
+| Debby · 双方讨论 | 两边先独立回答，可启用 1–5 轮交叉讨论，最后 Claude 汇总共同点和分歧；默认 0 轮交叉讨论，双方原始回答均保留 |
+| 自定义模板 | 新建、复制、编辑、导入或导出 app schema v1 的 YAML/JSON；可修改角色所属引擎、提示词、参数和步骤；内置模板只读，复制后编辑 |
+
+模板提示词和协作规则改写自 [Omnigent](https://github.com/omnigent-ai/omnigent)，固定参考修订为 `56c6a7f73024a257a5d359378e8ebb68a66dde7f`，保留 Apache 2.0 归属。本实现解释自己的声明式格式，不直接执行上游 Python/plugin 包。精确格式与限制见 [模板契约](../runtime/agent-modes/templates/README.md)。
+
+一条用户消息对应一个公开回合，其下保留各角色的引擎、请求/实际模型、步骤、尝试次数、工具输出和状态。失败的角色可单独重试；成功的兄弟角色结果保留。应用重启不会自动重放工具；最新中断回合可选定失败角色重试，或在步骤间中断时点击 **Continue workflow**。旧回合不提供恢复入口。
+
+Polly 的写入需要已有 Git 仓库。开始规划前捕获包含未提交、暂存和未跟踪文件的基线，不改写用户索引；忽略文件不复制，缺少依赖时报告工作区准备要求，不隐式安装。审查使用固定 diff 和独立检出。写回时检测受影响路径是否仍与基线一致，保留无关改动和暂存状态；冲突、中断或检测到并发编辑时保留恢复资料。自定义单个 write `run` 只保留隔离产物，单独 `crossReview` 不自动写回；自动集成/写回由 `executeTasks` 后的集成审查步骤指定。
+
+检查记录区分模型报告与运行时验证：模型报告执行了哪些测试，运行时确认固定产物、范围、依赖、审查归属和写回结果。被拒绝的审查、超出修复上限或写回失败均保留明确的未交付状态。只读角色施加原生工具/权限限制；Claude 的工具集限制不等同于操作系统沙箱，受管策略的 hook 优先级仍由原生 harness 决定。
 
 Claude 默认沿用这台 Mac 的 VS Code Insiders 插件连接配置：
 
@@ -33,7 +51,7 @@ Claude 使用自己的用户、项目、本地配置和工具权限策略。Code
 | 混合历史的 fork / rollback / revert | 暂不可用；原生 Codex-only 会话保留这些操作 |
 | Claude 专有能力缺口 | Codex compact、realtime、review 等没有等价实现的请求明确报错 |
 | 自动标题 | Claude 会话使用首条消息生成标题，不额外调用 Codex 推理 |
-| 双引擎 | 保留枚举和每轮 `runs[]` 数据结构；尚无协作、结果汇总或共享文件写入调度 |
+| 双引擎 | 本地 Polly、Debby、自定义声明式模板；远程双引擎暂不可用 |
 
 切换不转移隐藏推理。长历史按有界输入传递，并提供本地完整公开历史文件的引用。Claude 的通用工具卡片保留实际输入和输出；补丁不会从工具名称猜测或伪造文件 diff。
 
@@ -69,10 +87,13 @@ Claude 下拉列表以当前提供方的 API 目录为准，使用同一连接�
 - `claude-environment.mjs`：按轮次读取 VS Code Insiders 的连接环境，不持久化凭据。
 - `claude-models.mjs`：读取原生模型目录，处理刷新、缓存和查询进程退出。
 - `claude-provider-models.mjs`：读取提供方目录、分页、协议兼容筛选和目录来源说明；不跨域传递凭据。
+- `templates/`：严格模板校验、内置模板、不可变本地修订与导入导出。
+- `orchestration/`：独立原生角色、全局并发调度、Polly 产物流程、公开回合路由和恢复。
+- `workspaces/`：私有索引快照、隔离工作区、固定审查产物、集成与保护并发编辑的写回。
 - `scripts/patch-agent-modes.js` / `scripts/assets/agent-modes-ui.js`：版本绑定的前端补丁与独立界面逻辑。
 - `scripts/build-agent-modes-preview.js`：复制应用、打包 ASAR、更新完整性哈希、签名并验证。
 
-线程 ID 沿用 Codex 原生 ID，Claude session ID 单独绑定。前端元数据使用 `engineMode` / `engineModel`，不会占用原有代表权限的 `agentMode`。
+线程 ID 沿用 Codex 原生 ID，Claude session ID 单独绑定。双引擎角色拥有独立原生会话，内部 Codex 会话从公开侧栏中过滤。前端元数据使用 `engineMode` / `engineModel` / `engineModels` / `template`，不会占用原有代表权限的 `agentMode`。
 
 接入通过 `CODEX_CLI_PATH` 指向随应用携带的网关。原 Codex 可执行文件不被替换，远程连接不使用本地 Claude 网关。SDK 固定为 `@anthropic-ai/claude-agent-sdk@0.3.282`，本机验证版本为 Claude Code `2.1.283`、Codex CLI `0.153.4-cometix`、Node `24.14.1`。
 
@@ -84,6 +105,8 @@ Claude 下拉列表以当前提供方的 API 目录为准，使用同一连接�
 ```
 
 JSON 文件以线程 ID 的 SHA-256 命名，写入使用临时文件原子替换。文件权限 0600，目录 0700；一个网关独占一个目录。重启将未完成执行标记为中断，不重放工具或自动批准请求。完整历史引用为同名 `.history.txt`。不要删除这个目录，否则 Claude 的合并历史与会话绑定将丢失。
+
+v1 会话首次读取时原样备份到 `v1-backups/` 后迁移到 v2。`templates/` 保存自定义模板修订；`workspaces/` 保存执行、审查、集成及恢复产物；内部 Codex 会话登记表独立于公开聊天保存，删除聊天不会让这些内部会话重新出现在侧栏。
 
 ## 构建与验证
 
@@ -105,9 +128,13 @@ node tests/agent-modes/live-smoke.mjs
 # 使用现有连接配置，会实际调用两种模型：
 node tests/agent-modes/live-smoke.mjs --claude
 node tests/agent-modes/live-permissions.mjs
+# 双引擎真实模型验证，产物和证据写入 .artifacts/：
+CDX_LIVE_DUAL=1 node tests/agent-modes/live-dual.mjs debby
+CDX_LIVE_DUAL=1 node tests/agent-modes/live-dual.mjs custom
+CDX_LIVE_DUAL=1 node tests/agent-modes/live-dual.mjs polly
 ```
 
-当前验证：172 项自动化测试通过，覆盖流式事件、SDK 契约、配置隔离、审批归属、取消通知、退出清理、异步响应竞态、重启、分页、模式重试、提供方目录分页和凭据隔离、项目连接配置覆盖、自定义代理请求头、动态模型目录、RPC 代理边界和补丁幂等。真实 Foundry Claude 推理成功，连接配置安装版界面返回 `CLAUDE_DESKTOP_OK`，该轮只有 Claude 执行；同一会话 Codex → Claude → Codex 的双向事实回忆、文件读取、网关重启和历史分页通过。真实 Bash 权限允许后写入成功，拒绝后没有写入，取消待审批任务后未写入且拥有的 Claude 进程退出。预览版界面已验证错误结束后控件恢复、原会话切换到 Codex、回复引擎标记，以及应用重启后的混合历史和模式恢复。
+此前单引擎版本验证：172 项自动化测试通过，覆盖流式事件、SDK 契约、配置隔离、审批归属、取消通知、退出清理、异步响应竞态、重启、分页、模式重试、提供方目录分页和凭据隔离、项目连接配置覆盖、自定义代理请求头、动态模型目录、RPC 代理边界和补丁幂等。真实 Foundry Claude 推理成功，连接配置安装版界面返回 `CLAUDE_DESKTOP_OK`，该轮只有 Claude 执行；同一会话 Codex → Claude → Codex 的双向事实回忆、文件读取、网关重启和历史分页通过。真实 Bash 权限允许后写入成功，拒绝后没有写入，取消待审批任务后未写入且拥有的 Claude 进程退出。预览版界面已验证错误结束后控件恢复、原会话切换到 Codex、回复引擎标记，以及应用重启后的混合历史和模式恢复。
 
 动态模型修复的预览版已实际加载 17 个选项，逐一选中 Opus 4.8、4.6、5、5.5；Opus 5.5 在界面返回 `MODEL_PICKER_OPUS55_OK`，后台只有一个已完成的 Claude 轮次，保存的模型为 `claude-opus-5-5`。刷新窗口后选择仍保持。四个具体 ID 也分别通过真实推理验证，返回的实际使用模型与请求一致。一次性界面测试会话已归档。证据保存在 `.artifacts/model-picker-gui.json`、`.artifacts/explicit-model-live.json` 和 `.artifacts/agent-modes-tests-model-picker.log`。
 
@@ -116,6 +143,14 @@ node tests/agent-modes/live-permissions.mjs
 最终源代码及包内 adapter 均已实际读取到上述完整目录；安装包与预览包的运行时文件逐个与源文件核对，签名严格校验通过。记录见 `.artifacts/provider-catalog-release-verification.json`，也记录了首次包内完整目录断言未通过、未改代码复查成功的情况。
 
 2026-09-27 21:04 UTC 已将提供方目录修复安装到实际使用的 `/Applications/chatgpt-dev.app` 并重新启动。在本地 New project 10 的 Only Claude Code 模式中，实际下拉框显示 30 个不同的模型选项；Opus 4.5 和 Opus 5.5 均已通过实际选择验证，最后停留在 Opus 5.5。证据见 `.artifacts/installed-model-catalog-gui.json`。此前的锁屏阻塞已解除；上述 17 选项的证据仅属于早期 SDK 版本。
+
+## 双引擎验证记录
+
+真实 Debby 完成 5 个角色（独立回答、1 轮交叉讨论、Claude 汇总）；自定义反转协调者完成 3 个角色，由所选 Codex 模型汇总。真实 Polly 完成两种引擎独立改文件、交叉审查、修复、集成检查、最终审查及原项目写回；两个文件字节内容和保留文件均由测试驱动检查。一次检查输出因包含非必要的 `not-run` 被过严验证拒绝，修正后在原回合显式重试并完成，保留失败尝试，没有重放已完成实现。10 个成功尝试加 1 个历史失败尝试均记录准确的 `gpt-6-luna` / `claude-opus-4-6`，公开用户消息只有一条。
+
+真实网关子进程还验证了五组异常流程：单侧无效模型、单角色停止/重试、整个回合停止/重启/重试、尚无角色时的继续，以及两种引擎的权限允许/拒绝/待审批取消。已归档 23 个拥有的测试 Codex 会话，无清理错误。证据见 `.artifacts/live-dual-debby-evidence.json`、`.artifacts/live-dual-custom-evidence.json`、`.artifacts/live-polly-verified.json` 与 `.artifacts/live-dual-resilience-summary.json`。
+
+最终源码自动化测试 **379/379 通过**，各模块规格及代码质量复查通过。独立预览包已经完成打包和严格签名校验。Mac 锁屏阻止了原生界面验收，已请求用户解锁；双引擎版本尚未替换已安装的 App。
 
 ## 安装与回退
 
@@ -131,7 +166,7 @@ node tests/agent-modes/live-permissions.mjs
 
 回退时先退出 `chatgpt-dev`，将当前应用移到另一个保留位置，再把记录中的原应用备份复制回 `/Applications/chatgpt-dev.app`。保留 `engine-conversations` 数据目录；回退后原版界面不会显示 Claude 的附加历史，再次安装补丁后可恢复。回退不要求删除或改写原生 Codex 历史。
 
-源代码在 `codex/claude-code-modes` 分支，原有模型选择定制单独保存在基线提交中。此改造不包含 Omnigent 服务；后续可在现有引擎适配器上增加执行策略、每轮多个运行、隔离工作树、预算和结果汇总。
+源代码在 `codex/claude-code-modes` 分支，原有模型选择定制单独保存在基线提交中。上述安装记录对应此前的单引擎切换版本；双引擎版本的真实 Polly、界面及安装验收仍在进行，不能仅据源码能力推断当前已安装包的功能。
 
 ## 远程验证进展
 
