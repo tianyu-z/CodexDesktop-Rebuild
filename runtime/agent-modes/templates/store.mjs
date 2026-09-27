@@ -66,7 +66,8 @@ function parse(text) {
   return document.toJS({ maxAliasCount: 0 });
 }
 
-/** Synchronous local store. Revisions are immutable; current.json is a replaceable pointer/tombstone. */
+/** Synchronous store under the gateway's single-process ownership lock.
+ * Revisions are immutable; current.json is a replaceable pointer/tombstone. */
 export class TemplateStore {
   constructor(directory) {
     if (typeof directory !== 'string' || !directory.trim() || directory.includes('\0')) fail('$', 'a template storage directory is required');
@@ -89,18 +90,6 @@ export class TemplateStore {
     if (!current || typeof current !== 'object' || Array.isArray(current) || Object.keys(current).some(key => !['revision', 'deleted'].includes(key)) || typeof current.deleted !== 'boolean') fail('$', 'invalid template current pointer');
     validateRevision(current.revision);
     return current;
-  }
-  #locked(action) {
-    safePath(this.directory, 'directory');
-    const path = join(this.directory, '.write-lock');
-    let fd;
-    try { fd = openSync(path, 'wx', 0o600); }
-    catch (error) {
-      if (error.code === 'EEXIST') fail('$', 'template store is busy; a write lock exists');
-      throw error;
-    }
-    try { return action(); }
-    finally { closeSync(fd); unlinkSync(path); }
   }
   list() {
     const values = [...this.builtins.values()].map(clone);
@@ -137,29 +126,25 @@ export class TemplateStore {
   save(input) {
     const value = validateTemplate(input);
     if (this.builtins.has(value.id)) fail('$.id', 'built-in templates are immutable; save a copy with a new ID');
-    return this.#locked(() => {
-      const paths = this.#paths(value.id, true), current = this.#current(paths);
-      // Caller metadata is an optimistic concurrency token only when this ID already exists.
-      if (current && own(input, 'revision') && input.revision !== current.revision) fail('$.revision', `revision conflict: expected ${current.revision}, received ${input.revision}`);
-      // Include an unpointed snapshot from a crash between snapshot and pointer writes.
-      const revisions = readdirSync(paths.revisions).filter(name => /^[1-9][0-9]*\.json$/.test(name)).map(name => Number(name.slice(0, -5)));
-      const latest = Math.max(current?.revision ?? 0, ...revisions);
-      validateRevision(latest + 1);
-      value.revision = latest + 1; value.builtin = false;
-      atomicJson(join(paths.revisions, `${value.revision}.json`), value);
-      atomicJson(paths.current, { revision: value.revision, deleted: false });
-      return clone(value);
-    });
+    const paths = this.#paths(value.id, true), current = this.#current(paths);
+    // Caller metadata is an optimistic concurrency token only when this ID already exists.
+    if (current && own(input, 'revision') && input.revision !== current.revision) fail('$.revision', `revision conflict: expected ${current.revision}, received ${input.revision}`);
+    // Include an unpointed snapshot from a crash between snapshot and pointer writes.
+    const revisions = readdirSync(paths.revisions).filter(name => /^[1-9][0-9]*\.json$/.test(name)).map(name => Number(name.slice(0, -5)));
+    const latest = Math.max(current?.revision ?? 0, ...revisions);
+    validateRevision(latest + 1);
+    value.revision = latest + 1; value.builtin = false;
+    atomicJson(join(paths.revisions, `${value.revision}.json`), value);
+    atomicJson(paths.current, { revision: value.revision, deleted: false });
+    return clone(value);
   }
   remove(id) {
     validateId(id);
     if (this.builtins.has(id)) fail('$.id', 'built-in templates are immutable');
-    return this.#locked(() => {
-      const paths = this.#paths(id), current = this.#current(paths);
-      if (!current || current.deleted) return false;
-      atomicJson(paths.current, { revision: current.revision, deleted: true });
-      return true;
-    });
+    const paths = this.#paths(id), current = this.#current(paths);
+    if (!current || current.deleted) return false;
+    atomicJson(paths.current, { revision: current.revision, deleted: true });
+    return true;
   }
   import(text) { return this.save(parse(text)); }
   export(id, revision, format = 'yaml') {

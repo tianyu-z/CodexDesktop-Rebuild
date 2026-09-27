@@ -215,14 +215,16 @@ Re-creating its ID increments the latest revision. Missing IDs return `null` fro
 Current shipped built-in revision 1 is immutable; executions must also retain
 their full template snapshot to survive future built-in package upgrades.
 
-Writes use a store-wide exclusive `.write-lock`, fsynced temporary JSON files,
-and atomic renames. Concurrent writers receive a busy error and can retry; a
-stale supplied revision still fails after retry. A crash between snapshot and
-pointer writes may leave an unpointed immutable snapshot; later revision numbers
-skip it. An abrupt process death while holding `.write-lock` requires removal of
-that lock after confirming no writer is running; locks are not auto-expired.
-Paths below the configured trusted storage root reject symlinks and traversal.
-The application must supply its own storage directory, not one from a template.
+Writes use fsynced temporary JSON files and atomic renames. The application must
+hold the gateway's single-owner process lock for this storage directory; multiple
+independent processes may not write it concurrently. Synchronous calls within
+that owner are serialized, including calls through separate `TemplateStore`
+instances, and stale revision tokens fail before writing a snapshot. There is no
+additional persistent template write lock to survive a process crash. A crash
+between snapshot and pointer writes may leave an unpointed immutable snapshot;
+later revision numbers skip it. Paths below the configured trusted storage root
+reject symlinks and traversal. The application must supply its own storage
+directory, not one from a template.
 
 Imports accept one YAML or JSON document up to 2 MiB using the YAML core schema.
 Explicit tags, aliases/anchors, duplicate keys, non-string keys, multiple

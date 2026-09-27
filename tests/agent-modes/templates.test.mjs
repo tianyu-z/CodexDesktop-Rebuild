@@ -96,6 +96,17 @@ test('deletion hides current templates but keeps history and monotonically incre
   assert.equal(new TemplateStore(directory).save(template()).revision, 2);
 });
 
+test('gateway-owned storage recovers after restart without a stale template lock blocking edits', t => {
+  const { directory, store } = setup(t);
+  store.save(template());
+  writeFileSync(join(directory, '.write-lock'), '');
+  const restarted = new TemplateStore(directory);
+  const edited = restarted.read('custom'); edited.name = 'After restart';
+  assert.equal(restarted.save(edited).revision, 2);
+  assert.equal(restarted.remove('custom'), true);
+  assert.equal(restarted.read('custom', 2).name, 'After restart');
+});
+
 test('invalid IDs, revision paths and symlink escapes never touch outside storage', t => {
   const { store, directory } = setup(t);
   for (const id of ['../x', '/tmp/x', 'x/y', '..', '__proto__', 'constructor', 'A', 'x.json', 'x\\y']) {
