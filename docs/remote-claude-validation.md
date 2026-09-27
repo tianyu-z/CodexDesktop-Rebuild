@@ -4,11 +4,34 @@
 
 ## 结论
 
-rno、bar、ala、blc、blc-2、sko 均已验证：本机通过 SSH 启动集群上的真实 Claude Code，取得模型回复，并使用真实 Read 工具读取该集群临时目录里的随机内容。rno 还通过了退出进程后恢复 Claude 会话并回忆上一轮内容的测试。
+rno、bar、ala、blc、blc-2、sko 均已验证：本机通过 SSH 启动集群上的真实 Claude Code，**使用该集群既有 Codex 提供方的同源 Anthropic API 路径，直接调用 API，不经过 Mac 的模型请求转发器**。真实 Read 工具已读取各集群临时目录里的随机内容并返回精确结果。rno 还在早期转发测试中通过了退出进程后恢复 Claude 会话并回忆上一轮内容的测试。
 
 这些结果证明远程执行链路可用。当前安装版的远程项目仍未接入 Claude 模式，不能把本记录当作客户端界面或远程混合引擎已经完成的验收。
 
-## 通过的集群
+## 与 Codex 相同网络路径的直接调用
+
+用户要求尽可能沿用 Codex 的远程原理后，重新核对了实际连接代码和各集群配置。桌面端通过 SSH 启动远程 `codex app-server --listen unix://`，再由 SSH 承载 `codex app-server proxy` 的 WebSocket 字节流。模型调用和文件工具在远程执行，不是把本机 Codex 进程转发给远程目录。
+
+之前只复用了 Mac 的 Claude 环境变量，遗漏了远程 Codex 配置中的请求头（包括服务要求的用户请求头）。直接复用远程 `model_provider` 对应的 `base_url`、`http_headers`、`env_http_headers` 和原有认证，再使用同一服务的 Anthropic 路径后，六个集群均通过验证。
+
+| SSH 别名 | 直接模型调用与 Read | 用时 | 经过 Mac API 转发 |
+| --- | --- | --- | --- |
+| rno | 通过 | 3.70 秒 | 否 |
+| bar | 通过 | 2.86 秒 | 否 |
+| ala | 通过 | 3.62 秒 | 否 |
+| blc | 通过 | 6.44 秒 | 否 |
+| blc-2 | 通过 | 4.72 秒 | 否 |
+| sko | 通过 | 2.43 秒 | 否 |
+
+模型为 `claude-haiku-4-5`。每个测试在远程临时目录生成新的随机标记，提示词只包含文件路径，必须同时出现 Read 工具事件及精确匹配的模型回复。只允许 Read，禁用额外 MCP 和 hooks，不持久化测试会话；测试退出后清理临时目录。凭据和请求头只在远程进程内读取及传递，没有复制到 Mac 或改写远程配置。
+
+rno、bar、ala、blc-2、sko 使用集群内部 Foundry 服务；blc 使用其既有配置中的另一 Foundry 地址。两种情况都由远程主机直接访问。rno 还通过真实 API 目录 GET，返回的目录与本机同源代理目录一致。
+
+正式接入以这种直接调用为默认方式。早期反向转发测试证明了另一条可行路线，但**不再构成必须经过 Mac 的结论**。
+
+官方行为参考：[Remote connections — Connect to an SSH host](https://developers.openai.com/codex/remote-connections#connect-to-an-ssh-host)。本机版本另通过实际 `createSshProxyStream` 和 `startRemoteAppServer` 代码核实。
+
+## 早期通过本机转发的测试
 
 | SSH 别名 | Claude Code | 模型回复 | 远程文件 Read | 会话恢复 |
 | --- | --- | --- | --- | --- |
@@ -23,7 +46,7 @@ rno、bar、ala、blc、blc-2、sko 均已验证：本机通过 SSH 启动集群
 
 文件测试先在集群 `/tmp` 的独立临时目录写入随机标记。提示词只提供文件路径，未提供标记内容；验收同时要求收到 Read 工具事件和精确匹配的结果。只在此次调用允许 Read，并禁止加载额外 MCP 服务。会话恢复测试使用独立的临时 Claude 配置目录；第二个进程通过原生 session ID 恢复，提示词不包含第一轮标记。
 
-## 网络与认证
+## 早期网络与认证观察（已由直接调用验证补充）
 
 - 本机使用用户指定的 VS Code Insiders `claudeCode.environmentVariables`，真实调用成功。
 - rno、bar、ala、blc-2、sko 无法解析该配置中的 Foundry 内网域名；公网 HTTPS 探测正常。
@@ -31,6 +54,8 @@ rno、bar、ala、blc、blc-2、sko 均已验证：本机通过 SSH 启动集群
 - 六个集群经临时 SSH 反向转发后均成功。链路为：集群 Claude → 集群回环端口 → 加密 SSH → 本机回环转发器 → 原 Foundry HTTPS 服务。上游 TLS 校验保持启用。
 - 本机转发器仅访问固定的上游地址，使用随机路径能力标识。连接配置在内存中读取，通过 SSH 标准输入提供给测试进程；未将密钥写入测试源码、报告或远程配置文件。
 - 测试转发器和 SSH 连接均已结束，未部署常驻服务，也未替换集群的 Codex 或 Claude 安装。
+
+以上是使用 Mac 地址和连接参数进行测试时的观察，不代表各集群使用自身配置也需要经过 Mac。最新直接调用结果见前节。
 
 ## 尚未通过 SSH 的别名
 
@@ -63,5 +88,7 @@ rno、bar、ala、blc、blc-2、sko 均已验证：本机通过 SSH 启动集群
 - `remote-relay-resume.json`：rno 会话恢复与上下文回忆。
 - `remote-codex-protocol.json`：各集群 Codex 协议能力检查。
 - `probe-remote-relay.mjs`：此次临时测试脚本；不是应用运行时组件。
+- `remote-direct-files.json`：六个集群不经 Mac API 转发的真实模型调用和文件读取结果。
+- `probe-remote-direct.py`：读取远程既有提供方配置并运行一次性 Read 验证的脚本，不是应用运行时组件。
 
 远程界面的模式切换、混合引擎上下文、工具审批、断线恢复和重启恢复仍需在实现后单独验收。

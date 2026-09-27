@@ -122,4 +122,4 @@ node tests/agent-modes/live-permissions.mjs
 
 ## 远程验证进展
 
-2026-09-27 已通过 SSH 验证 rno、bar、ala、blc、blc-2、sko 的真实 Claude 推理和远程文件读取，以及 rno 的原生会话恢复。测试需要将集群请求通过 SSH 转发到本机可用的 Foundry 连接。当前安装版尚未接入远程 Claude 选择器；具体结果、未连通别名和待实现边界见[远程验证记录](remote-claude-validation.md)与[远程接入设计草案](superpowers/specs/2026-09-27-remote-agent-modes-design.md)。
+2026-09-27 已通过 SSH 验证 rno、bar、ala、blc、blc-2、sko 的真实 Claude 推理和远程文件读取。最新测试直接使用各集群已有 Codex 提供方的同源 API 和请求头，六个集群都不需要经过 Mac 的 API 转发器；此前仅用 Mac 连接参数得出的网络限制已得到修正。rno 也在早期测试中通过原生会话恢复。目标架构沿用 Codex 的远程原理：桌面端经 SSH 控制远程引擎，引擎和文件工具在远程运行，API 从远程访问。当前安装版尚未接入远程 Claude 选择器；具体结果、未连通别名和待实现边界见[远程验证记录](remote-claude-validation.md)与[远程接入设计草案](superpowers/specs/2026-09-27-remote-agent-modes-design.md)。
