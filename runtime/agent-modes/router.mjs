@@ -309,7 +309,12 @@ export class EngineRouter {
     const id = `claude-approval:${randomUUID()}`;
     const base = { threadId: run.threadId, turnId: run.turn.id, itemId: request.id };
     return new Promise(resolve => {
-      const finish = response => { this.approvals.delete(id); request.signal?.removeEventListener('abort', cancel); resolve(response); };
+      const finish = response => {
+        if (!this.approvals.delete(id)) return;
+        request.signal?.removeEventListener('abort', cancel);
+        this.notify('serverRequest/resolved', { threadId: run.threadId, requestId: id });
+        resolve(response);
+      };
       const cancel = () => finish(deny());
       this.approvals.set(id, { runId: run.id, finish, request });
       request.signal?.addEventListener('abort', cancel, { once: true });

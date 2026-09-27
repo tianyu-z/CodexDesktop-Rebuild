@@ -2,15 +2,17 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { ClaudeEventNormalizer } from './claude-events.mjs';
+import { resolveClaudeEnvironment } from './claude-environment.mjs';
 
 const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const errorText = (error) => error instanceof Error ? error.message : String(error);
 
 /** One isolated SDK query per run; native Claude persists the resumable session. */
 export class ClaudeAdapter {
-  constructor({ executablePath = join(homedir(), '.local', 'bin', 'claude'), queryImpl } = {}) {
+  constructor({ executablePath = join(homedir(), '.local', 'bin', 'claude'), queryImpl, environment = resolveClaudeEnvironment } = {}) {
     this.executablePath = executablePath;
     this.queryImpl = queryImpl;
+    this.environment = environment;
   }
 
   start(options) {
@@ -182,6 +184,7 @@ export class ClaudeAdapter {
             })();
             query = queryImpl({ prompt, options: {
               cwd: options.cwd,
+              env: this.environment(),
               ...(options.nativeSessionId ? { resume: options.nativeSessionId } : {}),
               ...(options.model ? { model: options.model } : {}),
               pathToClaudeCodeExecutable: this.executablePath,

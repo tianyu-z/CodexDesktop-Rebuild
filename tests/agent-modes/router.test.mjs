@@ -126,3 +126,15 @@ test('a failed unacknowledged Codex start keeps Claude history for retry', async
   await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'retry' }] });
   assert.match(f.calls.filter(call => call.method === 'turn/start').at(-1).params.input[0].text, /IMPORTANT CLAUDE FACT/);
 });
+
+test('cancelling a pending Claude permission resolves the exact frontend request once', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  const { turn } = await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'request a tool' }] });
+  await tick();
+  const pending = f.runs[0].options.onPermission({ name: 'Bash', input: { command: 'echo fixture' }, id: 'tool-permission', signal: new AbortController().signal });
+  const request = f.events.find(event => event.method === 'item/commandExecution/requestApproval');
+  await f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: turn.id });
+  assert.equal((await pending).decision, 'decline');
+  assert.deepEqual(f.events.filter(event => event.method === 'serverRequest/resolved').map(event => event.params), [{ threadId: 'thread-1', requestId: request.id }]);
+  assert.equal(f.router.respond({ id: request.id, result: { decision: 'accept' } }), false);
+});

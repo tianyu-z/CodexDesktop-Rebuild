@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 /** Dedicated native transport: IDs from the client, gateway, and server never collide. */
 export class NativeClient {
   constructor({ command, args, env, onNotification, onRequest, onExit, stderr = process.stderr }) {
-    this.pending = new Map(); this.serverRequests = new Map(); this.closed = false;
+    this.pending = new Map(); this.serverRequests = new Map(); this.serverRequestIds = new Map(); this.closed = false;
     this.child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
     this.child.stderr.pipe(stderr, { end: false });
     this.child.stdin.on('error', error => this.fail(error));
@@ -34,6 +34,7 @@ export class NativeClient {
       if (message.method && message.id !== undefined) {
         const id = `native-request:${randomUUID()}`;
         this.serverRequests.set(id, message.id);
+        this.serverRequestIds.set(message.id, id);
         onRequest({ ...message, id });
       } else if (message.id !== undefined) {
         const pending = this.pending.get(message.id);
@@ -41,7 +42,17 @@ export class NativeClient {
         this.pending.delete(message.id);
         if (message.error) pending.reject(Object.assign(new Error(message.error.message), { code: message.error.code, data: message.error.data }));
         else pending.resolve(message.result);
-      } else onNotification(message);
+      } else {
+        if (message.method === 'serverRequest/resolved') {
+          const nativeId = message.params?.requestId;
+          const requestId = this.serverRequestIds.get(nativeId);
+          if (requestId !== undefined) {
+            this.serverRequestIds.delete(nativeId); this.serverRequests.delete(requestId);
+            message = { ...message, params: { ...message.params, requestId } };
+          }
+        }
+        onNotification(message);
+      }
     });
   }
   send(message) {
@@ -61,7 +72,7 @@ export class NativeClient {
     this.send({ ...message, id }); return true;
   }
   notify(message) { this.send(message); }
-  fail(error) { for (const pending of this.pending.values()) pending.reject(error); this.pending.clear(); }
+  fail(error) { for (const pending of this.pending.values()) pending.reject(error); this.pending.clear(); this.serverRequests.clear(); this.serverRequestIds.clear(); }
   async close() {
     if (this.closed) return this.done;
     this.child.stdin.end();

@@ -25,7 +25,7 @@ function scripted(events, observed = {}) {
 }
 function startWith(queryImpl, extra = {}) {
   const events = [];
-  const adapter = new ClaudeAdapter({ executablePath: executable, queryImpl });
+  const adapter = new ClaudeAdapter({ executablePath: executable, queryImpl, environment: () => ({}) });
   const run = adapter.start({ prompt: 'Hello', cwd, onEvent: (event) => events.push(event), onPermission: async () => ({ decision: 'decline' }), ...extra });
   return { adapter, run, events };
 }
@@ -363,7 +363,7 @@ test('finishes after the direct child exits when its descendant holds inherited 
 test('separate runs retain their own events, permissions, and signal listeners', async () => {
   const externalSignal = new AbortController();
   const observed = {};
-  const adapter = new ClaudeAdapter({ executablePath: executable, queryImpl: scripted([init, result()], observed) });
+  const adapter = new ClaudeAdapter({ executablePath: executable, queryImpl: scripted([init, result()], observed), environment: () => ({}) });
   const left = [], right = [];
   const runs = [left, right].map((events) => adapter.start({ prompt: 'Hello', cwd, onEvent: (event) => events.push(event), signal: externalSignal.signal }));
   await Promise.all(runs.map((run) => run.done));
@@ -373,4 +373,17 @@ test('separate runs retain their own events, permissions, and signal listeners',
   externalSignal.abort();
   await runs[0].interrupt();
   assert.equal((await runs[0].done).status, 'completed');
+});
+
+test('resolves connection environment separately for each SDK run without altering permission defaults', async () => {
+  const observed = {};
+  let revision = 0;
+  const adapter = new ClaudeAdapter({ executablePath: executable, queryImpl: scripted([init, result()], observed), environment: () => ({ ANTHROPIC_FOUNDRY_API_KEY: `fixture-${++revision}`, CLAUDE_CODE_USE_FOUNDRY: '1' }) });
+  const options = { prompt: 'Hello', cwd, onEvent() {} };
+  await adapter.start(options).done;
+  assert.equal(observed.request.options.env.ANTHROPIC_FOUNDRY_API_KEY, 'fixture-1');
+  await adapter.start(options).done;
+  assert.equal(observed.request.options.env.ANTHROPIC_FOUNDRY_API_KEY, 'fixture-2');
+  assert.equal(observed.request.options.permissionMode, 'default');
+  assert.equal(observed.request.options.allowDangerouslySkipPermissions, undefined);
 });

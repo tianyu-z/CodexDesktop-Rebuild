@@ -9,14 +9,16 @@
 3. 一轮执行结束或中断完成后，可以在同一会话切换引擎。公开消息和工具结果会作为明确标注的历史资料交给接手引擎；两者分别恢复自己的原生会话。
 4. **Codex + Claude Code** 显示为禁用。本版本不会并行启动两种引擎。
 
-Claude 需要在这台 Mac 登录。首次使用前在终端运行：
+Claude 默认沿用这台 Mac 的 VS Code Insiders 插件连接配置：
 
-```sh
-claude auth login
-claude auth status
+```text
+~/Library/Application Support/Code - Insiders/User/settings.json
+claudeCode.environmentVariables
 ```
 
-登录或 API 配置由 Claude Code 自己管理，补丁不复制凭据。若出现 `Not logged in · Please run /login`，完成登录后可在原会话重试。错误会保留在历史里，模式选择器会恢复可用。
+已实际验证配置中的 Foundry 代理和 API Key 可用，**无需额外执行 `claude auth login`**。每次开始 Claude 轮次时读取原文件，兼容 JSONC 注释和尾随逗号；密钥不复制到源码、安装包或应用配置中。已有进程级提供方/认证环境变量优先使用，作为一组保留，避免把一个提供方的密钥与另一个端点混合。若编辑器连接配置不存在，Claude 自己的原生认证继续可用。
+
+只共享连接参数、模型别名和所需的实验性协议开关；不导入编辑器的跳过权限选项、MCP 凭据、执行路径或启动参数。独立终端里不带这些环境变量的 `claude auth status` 可能仍显示未登录，这不代表 Foundry 连接不可用。
 
 Claude 使用自己的用户、项目、本地配置和工具权限策略。Codex 的权限选项仍只适用于 Codex。额外审批通过现有工具卡片显示，每次允许只授权当前工具请求；中断会取消该次运行的挂起审批。
 
@@ -41,6 +43,7 @@ Claude 使用自己的用户、项目、本地配置和工具权限策略。Code
 - `router.mjs`：引擎选择、线程历史合并、通知、权限归属与生命周期。
 - `store.mjs` / `handoff.mjs`：原子持久化、每引擎已接收序号、公开上下文交接。
 - `claude-adapter.mjs` / `claude-events.mjs`：官方 SDK 与事件转换。
+- `claude-environment.mjs`：按轮次读取 VS Code Insiders 的连接环境，不持久化凭据。
 - `scripts/patch-agent-modes.js` / `scripts/assets/agent-modes-ui.js`：版本绑定的前端补丁与独立界面逻辑。
 - `scripts/build-agent-modes-preview.js`：复制应用、打包 ASAR、更新完整性哈希、签名并验证。
 
@@ -74,11 +77,12 @@ node scripts/build-agent-modes-preview.js
 
 ```sh
 node tests/agent-modes/live-smoke.mjs
-# 需要 Claude 登录，会实际调用两种模型：
+# 使用现有连接配置，会实际调用两种模型：
 node tests/agent-modes/live-smoke.mjs --claude
+node tests/agent-modes/live-permissions.mjs
 ```
 
-当前验证：100 项自动化测试通过，覆盖流式事件、真实 SDK 边界契约、审批归属、退出清理、异步响应竞态、重启、分页、模式重试和补丁幂等。真实 Codex 往返、网关重启与分页已通过；预览版实际验证了错误结束后控件恢复、原会话切换到 Codex、回复引擎标记，以及应用重启后的混合历史和模式恢复；真实 Claude SDK 已验证未登录错误能够显示。**Claude 的成功推理、真实文件工具、真实允许/拒绝审批及跨引擎事实回忆仍待本机登录后验收**，模拟测试不能替代这些验收。
+当前验证：111 项自动化测试通过，覆盖流式事件、SDK 契约、配置隔离、审批归属、取消通知、退出清理、异步响应竞态、重启、分页、模式重试和补丁幂等。真实 Foundry Claude 推理成功，更新后的安装版界面返回 `CLAUDE_DESKTOP_OK`，该轮只有 Claude 执行；同一会话 Codex → Claude → Codex 的双向事实回忆、文件读取、网关重启和历史分页通过。真实 Bash 权限允许后写入成功，拒绝后没有写入，取消待审批任务后未写入且拥有的 Claude 进程退出。预览版界面已验证错误结束后控件恢复、原会话切换到 Codex、回复引擎标记，以及应用重启后的混合历史和模式恢复。
 
 ## 安装与回退
 
@@ -88,7 +92,7 @@ node tests/agent-modes/live-smoke.mjs --claude
 /Users/tianyu.zhang/.codex/backups/agent-modes/2026-09-27T10-18-48-024Z/chatgpt-dev.app
 ```
 
-安装包和备份的 ASAR 哈希已核对，已安装应用的签名校验通过。安装记录保存在工作目录 `.artifacts/engine-install-manifest.json`，包含备份位置、安装时间和 ASAR 哈希。
+安装包和备份的 ASAR 哈希已核对，已安装应用的签名校验通过。连接配置更新版已于 2026-09-27 重新安装，上一版另有备份，原应用备份仍保留。安装记录保存在工作目录 `.artifacts/engine-install-manifest.json`，包含备份位置、安装时间和 ASAR 哈希。
 
 回退时先退出 `chatgpt-dev`，将当前应用移到另一个保留位置，再把记录中的原应用备份复制回 `/Applications/chatgpt-dev.app`。保留 `engine-conversations` 数据目录；回退后原版界面不会显示 Claude 的附加历史，再次安装补丁后可恢复。回退不要求删除或改写原生 Codex 历史。
 

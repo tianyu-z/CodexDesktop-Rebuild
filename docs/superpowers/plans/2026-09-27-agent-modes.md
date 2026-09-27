@@ -24,7 +24,7 @@ Files: `runtime/agent-modes/package.json`, `.gitignore`, test fixtures under `te
 - [x] Generate the installed Codex schema with `'/Applications/chatgpt-dev.app/Contents/Resources/codex' app-server generate-json-schema --out .artifacts/codex-schema`.
 - [x] Inspect thread/turn, history pagination, approval, and item event shapes. Capture only necessary representative fixtures, excluding account data.
 - [x] Pin the compatible SDK dependency and install with optional bundled executables omitted; use the verified existing Claude binary through `pathToClaudeCodeExecutable`.
-- [ ] Verify SDK initialization, model discovery, and native session IDs without modifying user settings.
+- [x] Verify SDK initialization and native session IDs without modifying user settings; model aliases are exposed, Haiku is exercised through real Foundry calls.
 
 Runtime dependency declaration:
 
@@ -107,9 +107,9 @@ Files: `scripts/patch-agent-modes.js`, `scripts/assets/agent-modes-ui.js`, `scri
 Files: `tests/agent-modes/live-smoke.mjs`, `docs/agent-modes.md`, updated implementation checklist.
 
 - [x] Run `node --test tests/agent-modes/*.test.mjs` and `git diff --check`.
-- [ ] In a disposable workspace, run a real Codex turn, switch to Claude, ask it to recall an explicit test fact and inspect a file, then switch back to Codex and verify the Claude contribution is available.
-- [ ] Check real Claude approval allow/deny and cancellation; verify denied operations do not occur and no worker remains active after interruption.
-- [x] Restart the gateway/app and verify mixed history and selected mode restoration; native Claude successful-session restoration remains covered by fixtures pending login.
+- [x] In a disposable workspace, run a real Codex turn, switch to Claude, ask it to recall an explicit test fact and inspect a file, then switch back to Codex and verify the Claude contribution is available.
+- [x] Check real Claude approval allow/deny and cancellation; verify denied operations do not occur and no worker remains active after interruption.
+- [x] Restart the gateway/app and verify mixed history and selected mode restoration; native Claude session bindings are durable and consecutive real Claude calls resume the same session.
 - [x] Verify the packaged application's startup and UI paths. Use available application automation for native UI inspection; report a concrete permission limitation if it prevents visual validation.
 - [x] Obtain independent final spec and code reviews, resolve findings, and re-run affected checks.
 - [x] Preserve a recoverable backup before updating the user-requested development app. Document installation, rollback, current limitations and the reserved Both-mode extension boundary.
@@ -129,3 +129,15 @@ All design requirements map to Tasks 2–6. Native engine execution is separate 
 - Remaining real Claude acceptance is blocked by `claude auth status --json` reporting `loggedIn:false, authMethod:none`. SDK invocation returns `Not logged in`. No successful Claude inference, real file-tool permission behavior, or two-way model recall is claimed from fixtures. The user was asked to complete `claude auth login`; no credentials or configuration were altered.
 - The packaged app was restarted; both Claude errors, the Codex reply, source labels, and Only Codex selection restored correctly. The disposable UI conversation was archived.
 - Installed `/Applications/chatgpt-dev.app` after preserving the original at `/Users/tianyu.zhang/.codex/backups/agent-modes/2026-09-27T10-18-48-024Z/chatgpt-dev.app`; backup and installed ASAR hashes verified, installed signature verified.
+
+
+## Foundry connection follow-up (2026-09-27)
+
+- User identified VS Code Insiders `claudeCode.environmentVariables` as the working connection source. The earlier bare-shell `loggedIn:false` observation did not account for the plugin-only Foundry provider environment.
+- Added per-run read-only JSONC connection loading, with explicit process-provider precedence and a restricted connection/model allowlist. No credential values were copied into source, logs, or application resources, and editor permission/MCP settings were not imported.
+- Real direct Claude returned `CLAUDE_FOUNDRY_OK`; full two-way mixed-engine/file/restart smoke passed (`.artifacts/live/smoke-6sr9S0/report.json`).
+- Actual Claude allow/deny/cancellation and owned-process exit checks passed (`.artifacts/live/permissions-TfdGWa/report.json`).
+- Corrected missing approval-resolution notifications and native resolution ID mapping, including responses-before-resolution. Independent review approved; 111/111 automated tests pass (`.artifacts/agent-modes-tests-foundry.log`).
+- These results supersede the earlier login blocker. No additional Claude OAuth login is needed for this configured provider.
+- The final real permission run additionally verified exactly one correctly remapped `serverRequest/resolved` notification per approval and empty pending-request maps after cancellation.
+- Updated installed application returned `CLAUDE_DESKTOP_OK` in its real GUI; exactly one completed Claude turn, no Codex inference, idle state and a bound native Claude session were verified (`.artifacts/live/foundry-ui-validation.json`).
