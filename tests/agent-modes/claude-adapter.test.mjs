@@ -57,6 +57,39 @@ test('start synchronously returns a run and preserves native session, cwd, model
   assert.deepEqual(events.at(-1), { type: 'result', ...summary });
 });
 
+test('read roles retain native auth and preset while disabling mutating tools, MCP, and hooks', async () => {
+  const observed = {};
+  const schema = { type: 'object', properties: { summary: { type: 'string' } } };
+  const { run } = startWith(scripted([init, result()], observed), { access: 'read', instructions: 'Review the patch.', outputSchema: schema });
+  await run.done;
+  const options = observed.request.options;
+  assert.deepEqual(options.systemPrompt, { type: 'preset', preset: 'claude_code', append: 'Review the patch.' });
+  assert.deepEqual(options.tools, ['Read', 'Grep', 'Glob']);
+  assert.deepEqual(options.mcpServers, {});
+  assert.equal(options.strictMcpConfig, true);
+  assert.deepEqual(options.settings, { disableAllHooks: true });
+  assert.deepEqual(options.outputFormat, { type: 'json_schema', schema });
+  assert.equal(options.allowedTools, undefined);
+});
+
+test('read role mutation is denied before user approval, including surprising native tools', async () => {
+  let approvals = 0;
+  const answers = {};
+  const queryImpl = request => {
+    const iterator = (async function* () {
+      for (const name of ['Write', 'Bash', 'Agent', 'mcp__server__write', 'Read', 'StructuredOutput']) answers[name] = await request.options.canUseTool(name, {}, { toolUseID: name, signal: new AbortController().signal });
+      yield result();
+    })();
+    iterator.close = () => {};
+    return iterator;
+  };
+  await startWith(queryImpl, { access: 'read', outputSchema: { type: 'object' }, onPermission: async () => { approvals++; return { decision: 'accept' }; } }).run.done;
+  for (const name of ['Write', 'Bash', 'Agent', 'mcp__server__write']) assert.equal(answers[name].behavior, 'deny');
+  assert.equal(answers.Read.behavior, 'allow');
+  assert.equal(answers.StructuredOutput.behavior, 'allow');
+  assert.equal(approvals, 2, 'read tools still respect configured permission checks');
+});
+
 test('streaming input contains precisely the prompt and remains open through interactive permissions', async () => {
   const observed = {};
   const promptRead = deferred();

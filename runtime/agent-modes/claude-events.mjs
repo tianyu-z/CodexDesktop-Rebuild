@@ -27,8 +27,11 @@ export class ClaudeEventNormalizer {
       this.seen.add(envelope.uuid);
     }
     const scope = identifier(envelope.parent_tool_use_id) ? envelope.parent_tool_use_id : null;
-    if (scope === null && identifier(envelope.session_id) && envelope.session_id !== this.nativeSessionId) {
+    const model = envelope.type === 'assistant' ? envelope.message?.model : envelope.type === 'system' && envelope.subtype === 'init' ? envelope.model : envelope.type === 'stream_event' ? envelope.event?.message?.model : undefined;
+    if (scope === null && identifier(model) && model !== '<synthetic>') this.actualModel = model;
+    if (scope === null && identifier(envelope.session_id) && (envelope.session_id !== this.nativeSessionId || !this.sessionReported)) {
       this.nativeSessionId = envelope.session_id;
+      this.sessionReported = true;
       this.onEvent({ type: 'session', sessionId: this.nativeSessionId });
     }
     if (envelope.type === 'stream_event') this.consumePartial(envelope.event, scope);
@@ -42,7 +45,9 @@ export class ClaudeEventNormalizer {
       this.finish();
       const successful = envelope.subtype === 'success' && envelope.is_error === false;
       if (successful) this.acknowledgeInput(scope);
-      const result = { nativeSessionId: this.nativeSessionId, status: successful ? 'completed' : 'failed' };
+      const result = { nativeSessionId: this.nativeSessionId, status: successful ? 'completed' : 'failed', text: typeof envelope.result === 'string' ? envelope.result : this.text };
+      if (this.actualModel) result.actualModel = this.actualModel;
+      if (envelope.structured_output !== undefined) result.structuredOutput = structuredClone(envelope.structured_output);
       if (!successful) {
         const errors = Array.isArray(envelope.errors) ? envelope.errors.filter(identifier) : [];
         result.error = errors.join('\n') || this.error || (identifier(envelope.result) ? envelope.result : `Claude execution failed (${envelope.subtype || 'unknown result'}).`);
@@ -193,5 +198,9 @@ export class ClaudeEventNormalizer {
 
   finish() {
     for (const message of this.messages.values()) for (const block of message.blocks.values()) this.completeText(block);
+  }
+
+  get text() {
+    return [...this.messages.values()].filter(message => message.scope === null).flatMap(message => [...message.blocks.values()].filter(block => block.type === 'text').map(block => block.text)).join('\n');
   }
 }

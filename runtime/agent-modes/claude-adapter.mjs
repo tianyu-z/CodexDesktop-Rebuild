@@ -114,6 +114,9 @@ export class ClaudeAdapter {
       let onAbort;
       try {
         if (permission.signal.aborted) return deny('Permission request interrupted.', true);
+        // tools restricts the offered native tools; this is a second, fail-closed
+        // gate if a future SDK or configured integration presents another tool.
+        if (options.access === 'read' && !['Read', 'Grep', 'Glob', ...(options.outputSchema ? ['StructuredOutput'] : [])].includes(name)) return deny('This role has read-only access.');
         if (typeof options.onPermission !== 'function' || typeof request.toolUseID !== 'string') return deny('No permission handler is available.');
         const aborted = new Promise((resolve) => {
           onAbort = () => resolve(deny('Permission request interrupted.', true));
@@ -208,7 +211,11 @@ export class ClaudeAdapter {
               ...(options.model ? { model: options.model } : {}),
               pathToClaudeCodeExecutable: this.executablePath,
               settingSources: ['user', 'project', 'local'],
-              systemPrompt: { type: 'preset', preset: 'claude_code' },
+              systemPrompt: { type: 'preset', preset: 'claude_code', ...(options.instructions ? { append: options.instructions } : {}) },
+              ...(options.outputSchema ? { outputFormat: { type: 'json_schema', schema: options.outputSchema } } : {}),
+              // Native tool restriction plus hooks/MCP isolation, not an OS
+              // sandbox: externally managed hooks can have stronger precedence.
+              ...(options.access === 'read' ? { tools: ['Read', 'Grep', 'Glob'], mcpServers: {}, strictMcpConfig: true, settings: { disableAllHooks: true } } : {}),
               permissionMode: 'default',
               includePartialMessages: true,
               abortController: sdkAbort,
@@ -233,6 +240,8 @@ export class ClaudeAdapter {
       }
       if (interrupted) summary = { nativeSessionId: normalizer.nativeSessionId, status: 'interrupted', ...(summary?.usage ? { usage: summary.usage } : {}), ...(cleanupFailure ? { error: cleanupFailure } : {}) };
       else if (failure || !summary) summary = { nativeSessionId: normalizer.nativeSessionId, status: 'failed', error: failure || normalizer.error || 'Claude stream ended without a terminal result.' };
+      summary.text ??= normalizer.text;
+      if (normalizer.actualModel) summary.actualModel ??= normalizer.actualModel;
       settled = true;
       try { options.onEvent({ type: 'result', ...summary }); } catch { /* completion remains available through done */ }
       return summary;

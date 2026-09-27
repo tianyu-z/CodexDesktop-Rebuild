@@ -19,6 +19,33 @@ function startText(normalizer, id, index = 0, parent = null) {
   normalizer.consume(stream({ type: 'content_block_start', index, content_block: text('') }, parent));
 }
 
+test('role results retain public text, structured output, and actual main model evidence', () => {
+  const { normalizer } = fixture();
+  normalizer.consume({ type: 'system', subtype: 'init', session_id: session, model: 'claude-native-resolved' });
+  normalizer.consume(assistant('main', [text('Report'), { type: 'thinking', thinking: 'secret', signature: 'opaque' }]));
+  normalizer.consume(assistant('child', [text('Child')], { parent_tool_use_id: 'child-tool' }));
+  const result = normalizer.consume({ type: 'result', subtype: 'success', is_error: false, structured_output: { verdict: 'pass' } });
+  assert.equal(result.text, 'Report');
+  assert.equal(result.actualModel, 'claude-sonnet-4-6');
+  assert.deepEqual(result.structuredOutput, { verdict: 'pass' });
+  assert.equal(JSON.stringify(result).includes('secret'), false);
+});
+
+test('terminal text can arrive without assistant blocks and unknown actual model stays absent', () => {
+  const { normalizer } = fixture();
+  const result = normalizer.consume({ type: 'result', subtype: 'success', is_error: false, result: 'Final only' });
+  assert.equal(result.text, 'Final only');
+  assert.equal(result.actualModel, undefined);
+});
+
+test('resumed main session still emits its native identity once for role ownership', () => {
+  const { normalizer, events } = fixture();
+  normalizer.nativeSessionId = session;
+  normalizer.consume({ type: 'system', subtype: 'init', session_id: session });
+  normalizer.consume({ type: 'result', subtype: 'success', is_error: false, session_id: session });
+  assert.deepEqual(events.filter(e => e.type === 'session'), [{ type: 'session', sessionId: session }]);
+});
+
 test('acknowledges main model input once at the first real text delta', () => {
   const { events, normalizer } = fixture();
   normalizer.consume({ type: 'system', subtype: 'init', session_id: session });
