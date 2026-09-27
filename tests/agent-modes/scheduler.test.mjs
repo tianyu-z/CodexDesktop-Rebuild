@@ -41,6 +41,30 @@ async function finishRemaining(run, runner) {
   return await run.done;
 }
 
+test('write workflows finish preparation before any planner or sibling native run', async () => {
+  const t = clone(BUILTIN_TEMPLATES.find(row => row.id === 'polly'));
+  const runner = harness(), gate = deferred(); let prepared = false;
+  const run = new WorkflowScheduler({ runner, operationsFactory: () => ({
+    async prepare() { await gate.promise; prepared = true; },
+  }) }).start(options({ template: t }));
+  await tick(); await tick(); assert.equal(runner.calls.length, 0);
+  gate.resolve(); await until(() => runner.calls.length === 1);
+  assert.equal(prepared, true); assert.equal(runner.calls[0].roleId, 'planner');
+  await run.interrupt();
+});
+
+test('preparation failure starts no native roles, while read-only workflows require no workspace provider', async () => {
+  const t = template(); t.roles.c.access = 'write';
+  const runner = harness(), failed = new WorkflowScheduler({ runner, operationsFactory: () => ({
+    prepare() { throw new Error('NOT_GIT: existing repository required'); },
+  }) }).start(options({ template: t }));
+  assert.match((await failed.done).error, /NOT_GIT/); assert.equal(runner.calls.length, 0);
+  const readRunner = harness(), readRun = new WorkflowScheduler({ runner: readRunner,
+    operationsFactory() { throw new Error('Read-only workflow must not initialize Git'); },
+  }).start(options());
+  assert.equal((await finishRemaining(readRun, readRunner)).status, 'completed');
+});
+
 test('inputs label full public results and permit only exact reference keys', () => {
   const result = { id: 'r', engine: 'codex', roleId: 'answer', requestedModel: 'specific', text: 'Original', usage: { total: 7 }, structuredOutput: { fact: 4 } };
   const values = new Map([['request', 'USER UNIQUE'], ['history', [{ text: 'HISTORY UNIQUE' }]], ['source', result]]);
@@ -163,8 +187,9 @@ test('operation hooks share the same role budget and cannot broaden read access'
 
 test('reusable sessions are role/workspace scoped, serialized and acknowledged only through supplied sequence', async () => {
   const t = template(); t.roles.c.session = 'reuse'; t.roles.a.session = 'reuse';
+  t.steps[0].inputs.push('history');
   t.steps.splice(1, 0, { id: 'second', type: 'run', role: 'c', inputs: ['request'] });
-  const runner = harness(), events = [], selected = options({ template: t, throughSeq: 9 });
+  const runner = harness(), events = [], selected = options({ template: t, throughSeq: 9, history: [{ seq: 9, text: 'New public history' }] });
   const key = roleBindingKey({ template: t, roleId: 'c', cwd: selected.cwd });
   selected.bindings = { [key]: { engine: 'codex', sessionId: 'existing-c', consumedSeq: 4 } };
   const run = new WorkflowScheduler({ runner, onEvent: e => events.push(e) }).start(selected);
@@ -338,4 +363,88 @@ test('real store accepts every synchronous snapshot and retains one visible user
   const record = store.get('chat'); assert.equal(record.turns.length, 1); assert.equal(record.turns[0].turn.items.filter(i => i.type === 'userMessage').length, 1);
   assert.deepEqual(record.turns[0].runs.map(r => r.status), ['completed', 'failed', 'completed', 'completed']);
   assert.equal(record.turns[0].workflow.events.length, run.snapshot().events.length);
+});
+
+test('permission callback rejection stops sibling work even when native catches and declines the request', async () => {
+  const runner = harness();
+  const run = new WorkflowScheduler({ runner, onPermission: async () => { throw new Error('Approval persistence failed'); } }).start(options());
+  await until(() => runner.calls.length === 2);
+  await runner.calls[0].permission().catch(() => ({ decision: 'decline' }));
+  await until(() => run.snapshot().status === 'failed');
+  const result = await run.done;
+  assert.match(result.error, /Approval persistence failed/); assert.equal(runner.active, 0); assert.equal(runner.calls.length, 2);
+});
+
+test('a request-only acknowledgement cannot consume history needed by a later run of the same reusable role', async () => {
+  const t = template(); t.roles.c.session = 'reuse';
+  t.steps.splice(1, 0, { id: 'prior', type: 'run', role: 'c', dependsOn: ['left'], inputs: ['history'] });
+  const runner = harness(), key = roleBindingKey({ template: t, roleId: 'c', cwd: '/tmp/non-git' });
+  const run = new WorkflowScheduler({ runner }).start(options({ template: t, throughSeq: 1, history: [{ seq: 1, text: 'UNREAD PUBLIC HISTORY' }] }));
+  await until(() => runner.calls.length === 2); const request = runner.calls.find(call => call.engine === 'codex');
+  request.emit({ type: 'session', sessionId: 'reused' }); request.emit({ type: 'input-acknowledged' });
+  assert.equal(run.snapshot().bindings[key].consumedSeq, 0);
+  request.complete({ nativeSessionId: 'reused' }); await until(() => runner.calls.length >= 3);
+  const history = runner.calls.find(call => call.stepId === 'prior'); assert.match(history.prompt, /UNREAD PUBLIC HISTORY/);
+  history.emit({ type: 'input-acknowledged' }); assert.equal(run.snapshot().bindings[key].consumedSeq, 1);
+  const descriptors = Object.values(run.snapshot().invocations);
+  assert.equal(descriptors.find(d => d.stepId === 'left').acknowledgedHistorySeq, undefined);
+  assert.equal(descriptors.find(d => d.stepId === 'prior').acknowledgedHistorySeq, 1);
+  assert.equal((await finishRemaining(run, runner)).status, 'completed');
+});
+
+test('history acknowledgement is bounded by the supplied cursor and frozen represented history', async () => {
+  const t = template(); t.roles.c.session = 'reuse'; t.steps[0].inputs = ['history'];
+  const runner = harness(), key = roleBindingKey({ template: t, roleId: 'c', cwd: '/tmp/non-git' });
+  const run = new WorkflowScheduler({ runner }).start(options({ template: t, throughSeq: 8, history: [{ seq: 3, text: 'Represented history' }, { seq: 10, text: 'Beyond supplied cursor' }] }));
+  await until(() => runner.calls.length === 2); runner.calls[0].emit({ type: 'session', sessionId: 'history-session' }); runner.calls[0].emit({ type: 'input-acknowledged' });
+  assert.equal(run.snapshot().bindings[key].consumedSeq, 3);
+  assert.equal((await finishRemaining(run, runner)).status, 'completed');
+});
+
+test('verbatim operation prompts cannot acknowledge the shared history cursor without explicit inputValues', async () => {
+  const t = template(); t.roles.c = { ...t.roles.c, access: 'write', session: 'reuse' }; const runner = harness();
+  const run = new WorkflowScheduler({ runner, operationsFactory: context => ({ run(step, frame) { return context.invoke({ roleId: step.role, stepId: frame.path, prompt: 'Only this task', cwd: '/tmp/isolated' }); } }) })
+    .start(options({ template: t, throughSeq: 7, history: [{ seq: 7, text: 'Undelivered context' }] }));
+  await until(() => runner.calls.length === 2); const task = runner.calls.find(call => call.engine === 'codex');
+  task.emit({ type: 'session', sessionId: 'task-session' }); task.emit({ type: 'input-acknowledged' });
+  const key = roleBindingKey({ template: t, roleId: 'c', cwd: '/tmp/isolated' }); assert.equal(run.snapshot().bindings[key].consumedSeq, 0);
+  assert.equal((await finishRemaining(run, runner)).status, 'completed');
+});
+
+test('explicit resume reconstructs a crash boundary after completed roles without replaying those roles', async () => {
+  const runner = harness(); let boundary;
+  const first = new WorkflowScheduler({ runner }).start(options({ onSnapshot(snapshot) {
+    if (!boundary && snapshot.runs.length === 2 && snapshot.runs.every(run => run.status === 'completed')) boundary = snapshot;
+  } }));
+  await until(() => runner.calls.length === 2); runner.calls[0].complete({ text: 'Completed left' }); runner.calls[1].complete({ text: 'Completed right' });
+  await until(() => boundary !== undefined); await first.interrupt();
+  assert.equal(boundary.outputs, undefined);
+  const suspendedRunner = harness(), suspended = new WorkflowScheduler({ runner: suspendedRunner }).start(options({ previousSnapshot: boundary }));
+  await tick(); assert.equal(suspendedRunner.calls.length, 0); assert.equal(suspended.snapshot().status, 'blocked'); await suspended.interrupt();
+  const nextRunner = harness(), resumed = new WorkflowScheduler({ runner: nextRunner }).start(options({ previousSnapshot: boundary, resume: true }));
+  await until(() => nextRunner.calls.length === 1); assert.equal(nextRunner.calls[0].stepId, 'finish');
+  assert.match(nextRunner.calls[0].prompt, /Completed left/); assert.match(nextRunner.calls[0].prompt, /Completed right/);
+  nextRunner.calls[0].complete({ text: 'Resumed synthesis' });
+  const result = await resumed.done; assert.equal(result.status, 'completed'); assert.equal(result.outputs.final.text, 'Resumed synthesis');
+  assert.equal(result.runs.length, 3); assert.deepEqual(result.runs.slice(0, 2), boundary.runs);
+});
+
+test('explicit resume retries preparation after a zero-role operation failure', async () => {
+  const t = template(); t.roles.c.access = 'write'; t.steps[1].dependsOn = ['left'];
+  const runner = harness(), first = new WorkflowScheduler({ runner, operationsFactory: () => { throw new Error('Preparation unavailable'); } }).start(options({ template: t }));
+  const previousSnapshot = await first.done; assert.equal(previousSnapshot.status, 'failed'); assert.equal(previousSnapshot.runs.length, 0); assert.equal(runner.calls.length, 0);
+  const nextRunner = harness(), resumed = new WorkflowScheduler({ runner: nextRunner, operationsFactory: context => ({ run(step, frame) {
+    return context.invoke({ roleId: step.role, stepId: frame.path, round: frame.round, prompt: 'Prepared task', cwd: '/tmp/isolated' });
+  } }) }).start(options({ previousSnapshot, resume: true }));
+  await until(() => nextRunner.calls.length === 1); assert.equal(nextRunner.calls[0].stepId, 'left');
+  assert.equal((await finishRemaining(resumed, nextRunner)).status, 'completed');
+});
+
+test('resume without a chosen retry rejects unsuccessful roles before callbacks or native work', async () => {
+  const runner = harness(), first = new WorkflowScheduler({ runner }).start(options());
+  await until(() => runner.calls.length === 2); runner.calls[0].complete(); runner.calls[1].complete({ status: 'failed', error: 'Choose this retry' });
+  await until(() => first.snapshot().status === 'blocked'); const previousSnapshot = first.snapshot(); await first.interrupt();
+  let snapshots = 0;
+  const nextRunner = harness(); assert.throws(() => new WorkflowScheduler({ runner: nextRunner }).start(options({ previousSnapshot, resume: true, onSnapshot() { snapshots++; } })), /retryRunId|explicit.*retry/i);
+  assert.equal(snapshots, 0); assert.equal(nextRunner.calls.length, 0);
 });

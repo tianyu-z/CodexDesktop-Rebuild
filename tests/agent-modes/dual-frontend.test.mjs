@@ -374,3 +374,139 @@ test('both keeps the actual native model picker when the upstream width gate hid
   assert.equal(codex.props.children[1], false);
   assert.equal(nodes(codex).includes(bothNativeModelPicker), false);
 });
+
+test('retry controls track latest eligible scheduler attempts and keep earlier output readable', async t => {
+  const { WorkflowScheduler } = await import('../../runtime/agent-modes/orchestration/scheduler.mjs');
+  const { BUILTIN_TEMPLATES } = await import('../../runtime/agent-modes/templates/builtins.mjs');
+  const calls = [], { api } = setup();
+  const runner = { start(options) { let finish; const done = new Promise(resolve => { finish = resolve; }); calls.push({ ...options, finish }); return { done, interrupt: async () => { finish({ status: 'interrupted', text: 'partial' }); return done; } }; } };
+  const handle = new WorkflowScheduler({ runner }).start({ runId: 'workflow', template: BUILTIN_TEMPLATES.find(template => template.id === 'debby'), parameters: { rounds: 0 }, models: { codex: 'gpt-selected', claude: 'claude-selected' }, cwd: '/tmp', input: 'Compare' });
+  t.after(() => handle.interrupt());
+  const until = async predicate => { for (let count = 0; count < 80; count++) { if (predicate()) return; await tick(); } assert.fail('Scheduler did not settle'); };
+  await until(() => calls.length === 2);
+  calls[0].finish({ status: 'failed', text: 'Original failed answer', error: 'Try again' });
+  calls[1].finish({ status: 'completed', text: 'Other answer' });
+  await until(() => handle.snapshot().status === 'blocked');
+  const failedId = handle.snapshot().runs.find(run => run.status === 'failed').id;
+  api.registerManager({ getHostId: () => 'local', sendRequest: async () => { const state = handle.snapshot(); return { workflows: [{ turnId: 't', status: state.status, runs: state.runs, state }] }; } });
+  const view = ui(api, 'SourceBadge', { threadId: 'chat', hostId: 'local', turnId: 't', raw: { cdxEngineSource: 'both' } });
+  await api.refreshRuns('chat', 'local', 't');
+  assert.ok(find(view.render(), `Retry run ${failedId}`));
+  assert.equal(handle.retry(failedId), true);
+  await until(() => calls.length === 3);
+  calls[2].finish({ status: 'completed', text: 'Recovered answer' });
+  await until(() => calls.length === 4);
+  await api.refreshRuns('chat', 'local', 't');
+  assert.equal(handle.retry(failedId), false);
+  assert.equal(find(view.render(), `Retry run ${failedId}`), undefined);
+  assert.match(words(view.render()), /Original failed answer/);
+  calls[3].finish({ status: 'failed', text: 'Summary failed', error: 'Summary retry needed' });
+  await until(() => handle.snapshot().status === 'blocked');
+  await api.refreshRuns('chat', 'local', 't');
+  const summaryId = handle.snapshot().runs.find(run => run.roleId === 'moderator').id;
+  assert.ok(find(view.render(), `Retry run ${summaryId}`));
+  assert.equal(find(view.render(), `Retry run ${failedId}`), undefined);
+});
+
+test('both passes a scoped live native selection guard that includes host busy atoms', () => {
+  const { api, scope } = setup(), manager = { getHostId: () => 'local' };
+  api.setDraftSelection(scope, selection());
+  const native = { type: 'actual-native-picker', props: { conversationId: undefined } };
+  const props = selectorProps(scope, manager, { bothNativeModelPicker: native, useAtom: () => true });
+  const tree = ui(api, 'Selector', props).render();
+  const picker = nodes(tree).find(node => node.type === 'actual-native-picker');
+  assert.equal(picker.props.cdxEngineSelectionContext.scope, scope);
+  assert.equal(api.permitsNativeModelSelection(picker.props), false);
+  ui(api, 'Selector', { ...props, useAtom: () => false }).render();
+  assert.equal(api.permitsNativeModelSelection(picker.props), true);
+});
+
+test('recoverable workflows with no unfinished latest role expose explicit Continue', async () => {
+  const completed = { id: 'completed', roleId: 'answer', stepId: 'answer', round: 0, attempt: 2, status: 'completed', engine: 'codex', text: 'Preserved answer' };
+  for (const [status, runs, expected] of [
+    ['interrupted', [], true], ['failed', [completed], true],
+    ['interrupted', [{ ...completed, id: 'old', attempt: 1, status: 'failed' }, completed], true],
+    ['interrupted', [{ ...completed, status: 'interrupted' }], false], ['completed', [completed], false], ['running', [], false],
+  ]) {
+    const { api } = setup(), calls = [];
+    api.registerManager({ getHostId: () => 'local', sendRequest: async (method, params) => {
+      calls.push({ method, params: plain(params) });
+      return method === 'engine/runs/read' ? { workflows: [{ turnId: 't', status, runs }] } : {};
+    } });
+    await api.refreshRuns('chat', 'local', 't');
+    const tree = ui(api, 'SourceBadge', { threadId: 'chat', hostId: 'local', turnId: 't', raw: { cdxEngineSource: 'both' } }).render();
+    const resume = button(tree, 'Continue workflow');
+    assert.equal(Boolean(resume), expected, `${status}: ${JSON.stringify(runs)}`);
+    if (resume) {
+      await resume.props.onClick();
+      assert.deepEqual(calls.find(call => call.method === 'engine/runs/retry').params, { threadId: 'chat', turnId: 't' });
+    }
+  }
+});
+
+test('authoritatively older workflows keep outputs but hide retry and continuation actions', async () => {
+  for (const runs of [[], [{ id: 'failed', engine: 'codex', roleId: 'answer', stepId: 'answer', attempt: 1, status: 'failed', text: 'Retained old output' }]]) {
+    const { api } = setup();
+    api.registerManager({ getHostId: () => 'local', sendRequest: async () => ({ workflows: [{ turnId: 'old', status: 'failed', isLatestTurn: false, runs }] }) });
+    await api.refreshRuns('chat', 'local', 'old');
+    const tree = ui(api, 'SourceBadge', { threadId: 'chat', hostId: 'local', turnId: 'old', raw: { cdxEngineSource: 'both' } }).render();
+    assert.equal(button(tree, 'Continue workflow'), undefined);
+    assert.equal(find(tree, 'Retry run failed'), undefined);
+    if (runs.length) assert.match(words(tree), /Retained old output/);
+  }
+});
+
+test('a new turn acknowledgment immediately removes cached older workflow recovery controls', async () => {
+  for (const runs of [[], [{ id: 'failed', engine: 'codex', roleId: 'answer', stepId: 'answer', attempt: 1, status: 'failed', text: 'Old evidence' }]]) {
+    const { api } = setup();
+    const manager = { getHostId: () => 'local', sendRequest: async (_method, params) => ({ workflows: [{ turnId: params.turnId, isLatestTurn: true, status: params.turnId === 'old' ? 'interrupted' : 'running', runs: params.turnId === 'old' ? runs : [] }] }) };
+    api.registerManager(manager); await api.refreshRuns('chat', 'local', 'old');
+    const view = ui(api, 'SourceBadge', { threadId: 'chat', hostId: 'local', turnId: 'old', raw: { cdxEngineSource: 'both' } });
+    assert.ok(button(view.render(), 'Continue workflow') || find(view.render(), 'Retry run failed'));
+    api.observe(manager, 'turn/start', { threadId: 'chat' }, {}); // No acknowledgment yet.
+    assert.equal(api.getSnapshot(null, 'chat').workflows.old.isLatestTurn, true);
+    api.observe(manager, 'turn/start', { threadId: 'chat', engineMode: 'codex' }, { turn: { id: 'new' } });
+    assert.equal(api.getSnapshot(null, 'chat').workflows.old.isLatestTurn, false);
+    assert.equal(button(view.render(), 'Continue workflow'), undefined);
+    assert.equal(find(view.render(), 'Retry run failed'), undefined);
+    await api.refreshRuns('chat', 'local', 'new');
+    assert.deepEqual(Object.values(api.getSnapshot(null, 'chat').workflows).filter(workflow => workflow.isLatestTurn).map(workflow => workflow.turnId), ['new']);
+    if (runs.length) assert.match(words(view.render()), /Old evidence/);
+  }
+});
+
+test('an authoritative latest workflow read invalidates older cached eligibility without an acknowledgment', async () => {
+  const { api } = setup();
+  api.registerManager({ getHostId: () => 'local', sendRequest: async (_method, params) => ({ workflows: [{ turnId: params.turnId, isLatestTurn: true, status: 'interrupted', runs: [] }] }) });
+  await api.refreshRuns('chat', 'local', 'old');
+  await api.refreshRuns('chat', 'local', 'new');
+  assert.equal(api.getSnapshot(null, 'chat').workflows.old.isLatestTurn, false);
+  assert.equal(api.getSnapshot(null, 'chat').workflows.new.isLatestTurn, true);
+});
+
+test('an old in-flight workflow read cannot restore recovery after a newer acknowledged turn', async () => {
+  const { api } = setup(); let oldReads = 0, resolveOld;
+  const oldWorkflow = { turnId: 'old', isLatestTurn: true, status: 'interrupted', runs: [] };
+  const manager = { getHostId: () => 'local', sendRequest: async (_method, params) => {
+    if (params.turnId === 'old') { oldReads++; return oldReads === 1 ? { workflows: [oldWorkflow] } : new Promise(resolve => { resolveOld = resolve; }); }
+    return { workflows: [{ turnId: 'new', isLatestTurn: true, status: 'running', runs: [] }] };
+  } };
+  api.registerManager(manager); await api.refreshRuns('chat', 'local', 'old');
+  const stale = api.refreshRuns('chat', 'local', 'old'); await tick();
+  api.observe(manager, 'turn/start', { threadId: 'chat', engineMode: 'both' }, { turn: { id: 'new' } });
+  await api.refreshRuns('chat', 'local', 'new');
+  resolveOld({ workflows: [oldWorkflow] }); await stale;
+  assert.equal(api.getSnapshot(null, 'chat').workflows.old.isLatestTurn, false);
+  assert.equal(api.getSnapshot(null, 'chat').workflows.new.isLatestTurn, true);
+});
+
+test('newer-started authoritative workflow reads win when their responses arrive out of order', async () => {
+  const { api } = setup(), responses = new Map();
+  api.registerManager({ getHostId: () => 'local', sendRequest: (_method, params) => new Promise(resolve => { responses.set(params.turnId, resolve); }) });
+  const old = api.refreshRuns('chat', 'local', 'old');
+  const latest = api.refreshRuns('chat', 'local', 'new'); await tick();
+  responses.get('new')({ workflows: [{ turnId: 'new', isLatestTurn: true, status: 'running', runs: [] }] }); await latest;
+  responses.get('old')({ workflows: [{ turnId: 'old', isLatestTurn: true, status: 'interrupted', runs: [] }] }); await old;
+  assert.equal(api.getSnapshot(null, 'chat').workflows.old.isLatestTurn, false);
+  assert.equal(api.getSnapshot(null, 'chat').workflows.new.isLatestTurn, true);
+});

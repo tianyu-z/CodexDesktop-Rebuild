@@ -15,7 +15,7 @@
   const copy = value => JSON.parse(JSON.stringify(value));
   const defaultTemplate = () => ({ id: 'polly', revision: 1, parameters: {} });
   function fresh() {
-    return { snapshot: { engineMode: 'codex', models: { codex: null, claude: 'default' }, template: defaultTemplate(), bothAvailable: false, busy: false, pending: false, loading: false, available: null, error: null, turnEngines: {}, workflows: {}, runsError: null, runActions: {} }, listeners: new Set(), revision: 0, hydrated: false, creationIntent: null, read: null, sourcesRead: null, runsRead: new Map() };
+    return { snapshot: { engineMode: 'codex', models: { codex: null, claude: 'default' }, template: defaultTemplate(), bothAvailable: false, busy: false, pending: false, loading: false, available: null, error: null, turnEngines: {}, workflows: {}, runsError: null, runActions: {} }, listeners: new Set(), revision: 0, hydrated: false, creationIntent: null, read: null, sourcesRead: null, runsRead: new Map(), workflowReadOrder: 0, latestTurnOrder: 0, latestTurnId: null };
   }
   function record(scope, threadId, hostId = 'local') {
     if (threadId != null) {
@@ -33,6 +33,11 @@
     if (JSON.stringify(next) === JSON.stringify(row.snapshot)) return;
     row.snapshot = next;
     for (const listener of row.listeners) listener();
+  }
+  function latestWorkflowFlags(row, workflows, turnId, order) {
+    if (order != null && order >= row.latestTurnOrder) { row.latestTurnId = turnId; row.latestTurnOrder = order; }
+    if (!row.latestTurnOrder) return workflows;
+    return Object.fromEntries(Object.entries(workflows).map(([id, workflow]) => [id, id === row.latestTurnId ? workflow : { ...workflow, isLatestTurn: false }]));
   }
   function validModelId(value) { return typeof value === 'string' && MODEL_ID.exec(value)?.[0] === value; }
   function displayText(value, limit = 512) { return typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, limit) : ''; }
@@ -194,6 +199,8 @@
     // Reads are applied by their caller with a revision check. An old in-flight read
     // must never undo a newly acknowledged selection.
     if (method === 'engine/mode/set') { row.creationIntent = null; row.revision++; applyState(row, response); }
+    const acknowledgedTurnId = method === 'turn/start' ? response?.turn?.id ?? response?.turn?.turnId : null;
+    if (acknowledgedTurnId) update(row, { workflows: latestWorkflowFlags(row, row.snapshot.workflows, acknowledgedTurnId, ++row.workflowReadOrder) });
     const intent = row.creationIntent;
     if (method === 'turn/start' && response?.turn && intent && params.engineMode === intent.engineMode
       && (intent.clientUserMessageId == null || params.clientUserMessageId === intent.clientUserMessageId)) {
@@ -285,6 +292,12 @@
   function useRecord(React, row) {
     return React.useSyncExternalStore(listener => { row.listeners.add(listener); return () => row.listeners.delete(listener); }, () => row.snapshot, () => row.snapshot);
   }
+  function permitsNativeModelSelection(props) {
+    const context = props?.cdxEngineSelectionContext;
+    if (!context || !local(context.hostId)) return true;
+    const row = record(context.scope, context.threadId, context.hostId);
+    return row.snapshot.engineMode !== 'both' || !(row.nativeControlsBlocked || row.snapshot.busy || row.snapshot.pending || row.snapshot.loading || row.snapshot.available === false);
+  }
   const selectStyle = { color: 'inherit', background: 'transparent', border: '1px solid var(--border, #8885)', borderRadius: 6, fontSize: 12, padding: '3px 5px', maxWidth: 160, cursor: 'pointer' };
   function Selector(props) {
     const { React, jsx, scope, threadId, nativeModelPicker, bothNativeModelPicker } = props;
@@ -313,6 +326,9 @@
     const bothAvailable = local(hostId) && (catalog.loadedAt != null ? catalog.bothAvailable === true : state.bothAvailable === true);
     const reason = !local(hostId) ? 'Claude Code is available for local chats only' : connectionError ?? state.error ?? (busy ? 'Wait for the current turn and approvals to finish' : 'Choose the engine for this chat');
     const mode = local(hostId) ? state.engineMode : 'codex';
+    // Native app-wide commands outlive individual button events. Their guard
+    // reads this chat's current state, including the composer's native busy atoms.
+    row.nativeControlsBlocked = mode === 'both' && disabled;
     const change = selection => { changeSelection({ scope, threadId, hostId, manager }, selection).catch(() => {}); };
     const modePicker = jsx.jsxs('select', {
       'aria-label': 'Chat engine', 'data-testid': 'chat-engine-selector', value: mode, disabled, title: reason, style: selectStyle,
@@ -328,7 +344,8 @@
       onPointerDown: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       children: modelOptions(catalog, state.models.claude ?? 'default').map(model => jsx.jsx('option', { value: model.value, title: modelTitle(model), children: modelLabel(model) }, model.value)),
     }) : nativeModelPicker;
-    const modelPicker = mode === 'both' ? jsx.jsxs('span', { style: { display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0 }, children: [jsx.jsxs('fieldset', { 'aria-label': 'Codex model controls', disabled, style: { border: 0, margin: 0, padding: 0, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 4, ...(disabled ? { pointerEvents: 'none', opacity: 0.6 } : {}) }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Codex model' }), bothNativeModelPicker ?? nativeModelPicker] }), jsx.jsxs('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Claude model' }), claudePicker] })] }) : claudePicker;
+    const dualNativePicker = bothNativeModelPicker?.type ? jsx.jsx(bothNativeModelPicker.type, { ...bothNativeModelPicker.props, cdxEngineSelectionContext: { scope, threadId, hostId } }) : bothNativeModelPicker ?? nativeModelPicker;
+    const modelPicker = mode === 'both' ? jsx.jsxs('span', { style: { display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0 }, children: [jsx.jsxs('fieldset', { 'aria-label': 'Codex model controls', disabled, style: { border: 0, margin: 0, padding: 0, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 4, ...(disabled ? { pointerEvents: 'none', opacity: 0.6 } : {}) }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Codex model' }), dualNativePicker] }), jsx.jsxs('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Claude model' }), claudePicker] })] }) : claudePicker;
     const refreshModels = (mode === 'claude' || mode === 'both' || catalog.modelListError) && local(hostId) ? jsx.jsx('button', { type: 'button', 'aria-label': 'Refresh Claude models', title: 'Refresh models', disabled: !manager || catalog.loading, style: { ...selectStyle, border: 'none', padding: '2px 4px' }, onClick: () => refreshCapabilities(manager, { hostId, threadId, cwd, force: true }), children: '↻' }) : null;
     const errorStyle = { fontSize: 11, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
     const modelError = local(hostId) && catalog.modelListError ? jsx.jsx('span', { role: 'status', title: catalog.modelListError, style: errorStyle, children: `Model discovery: ${catalog.modelListError}` }) : null;
@@ -483,13 +500,18 @@
     if (!local(hostId) || !manager || !threadId) return;
     const row = record(null, threadId, hostId), readKey = turnId ?? '*';
     if (row.runsRead.has(readKey)) return row.runsRead.get(readKey);
+    const readOrder = ++row.workflowReadOrder;
     const pending = (async () => {
       await Promise.resolve(); // Ensure finally clears an already-published request.
       try {
         const response = await manager.sendRequest('engine/runs/read', { threadId, ...(turnId ? { turnId } : {}) });
-        const workflows = { ...row.snapshot.workflows };
-        for (const workflow of response?.workflows ?? []) workflows[workflow.turnId] = copy(workflow);
-        update(row, { workflows, runsError: null });
+        const returned = response?.workflows ?? [], workflows = { ...row.snapshot.workflows };
+        for (const workflow of returned) workflows[workflow.turnId] = copy(workflow);
+        const latest = returned.find(workflow => workflow.isLatestTurn === true);
+        // A turn acknowledgment is newer evidence than every read already in flight.
+        // Later-started reads can discover a new turn from another window.
+        const lostLatest = returned.some(workflow => workflow.turnId === row.latestTurnId && workflow.isLatestTurn === false);
+        update(row, { workflows: latestWorkflowFlags(row, workflows, latest?.turnId ?? null, latest || lostLatest ? readOrder : undefined), runsError: null });
       } catch (error) { update(row, { runsError: error.message ?? String(error) }); }
       finally { row.runsRead.delete(readKey); }
     })();
@@ -524,6 +546,13 @@
     const label = source === 'both' ? 'Codex + Claude Code' : source === 'claude' ? 'Claude Code' : 'Codex';
     const workflow = state.workflows[turnId], runs = workflow?.runs ?? [];
     const blocked = ['blocked', 'failed', 'needs_attention'].includes(workflow?.status);
+    const roleKey = run => JSON.stringify([run.stepId, run.roleId, run.round ?? 0]);
+    const latestRuns = new Map();
+    for (const run of runs) if (!latestRuns.has(roleKey(run)) || (latestRuns.get(roleKey(run)).attempt ?? 1) < (run.attempt ?? 1)) latestRuns.set(roleKey(run), run);
+    const canRetry = run => workflow?.isLatestTurn !== false && ['blocked', 'failed', 'interrupted'].includes(workflow?.status)
+      && ['failed', 'interrupted', 'cancelled', 'blocked'].includes(run.status) && latestRuns.get(roleKey(run))?.id === run.id
+      && (!workflow.state?.invocations || Object.hasOwn(workflow.state.invocations, roleKey(run)));
+    const canContinue = workflow?.isLatestTurn !== false && ['failed', 'interrupted'].includes(workflow?.status) && [...latestRuns.values()].every(run => run.status === 'completed');
     const interactive = local(hostId) && managers.has(hostId);
     const actionButton = (label, aria, runId, method) => jsx.jsx('button', { type: 'button', 'aria-label': aria, style: selectStyle, disabled: !interactive || Boolean(state.runActions[`${turnId}:${runId ?? '*'}`]), onClick: () => runAction(threadId, hostId, turnId, runId, method), children: label });
     const errorText = error => typeof error === 'string' ? error : error?.message ?? (error ? JSON.stringify(error) : '');
@@ -531,7 +560,8 @@
       jsx.jsx('span', { style: { opacity: 0.65 }, children: label }),
       source === 'both' ? jsx.jsxs('details', { style: { marginTop: 4, border: '1px solid #8884', borderRadius: 6, padding: 6 }, children: [
         jsx.jsx('summary', { style: { cursor: 'pointer' }, children: `Workflow runs · ${workflow?.status ?? 'loading'} · ${runs.length} runs` }),
-        blocked ? jsx.jsxs('div', { role: 'status', style: { margin: '8px 0' }, children: ['Dependent work is blocked. Retry a failed run or end the turn to keep the partial results. ', actionButton('End turn', 'End workflow turn', null, 'turn/interrupt')] }) : null,
+        canContinue ? jsx.jsxs('div', { role: 'status', style: { margin: '8px 0' }, children: ['Continue this workflow from its saved results. ', actionButton('Continue workflow', 'Continue workflow', null, 'engine/runs/retry')] }) : null,
+        blocked && !canContinue ? jsx.jsxs('div', { role: 'status', style: { margin: '8px 0' }, children: ['Dependent work is blocked. Retry a failed run or end the turn to keep the partial results. ', actionButton('End turn', 'End workflow turn', null, 'turn/interrupt')] }) : null,
         ...runs.map(run => jsx.jsxs('details', { 'data-cdx-run-id': run.id, style: { margin: '6px 0', padding: 6, border: '1px solid #8884', borderRadius: 4 }, children: [
           jsx.jsx('summary', { style: { cursor: 'pointer', overflowWrap: 'anywhere' }, children: `${run.roleId ?? 'Role'} · ${run.stepId ?? run.taskId ?? run.id} · ${run.engine === 'claude' ? 'Claude Code' : run.engine === 'codex' ? 'Codex' : run.engine} · ${run.status}${run.round != null ? ` · round ${run.round}` : ''}${run.attempt != null ? ` · attempt ${run.attempt}` : ''}` }),
           jsx.jsx('div', { style: { overflowWrap: 'anywhere' }, children: `Requested model: ${run.requestedModel ?? 'engine default'}` }),
@@ -541,7 +571,7 @@
           run.text ? jsx.jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 360, overflow: 'auto', userSelect: 'text' }, children: run.text }) : null,
           run.error ? jsx.jsx('div', { role: 'alert', style: { overflowWrap: 'anywhere' }, children: errorText(run.error) }) : null,
           ['queued', 'running', 'awaitingApproval'].includes(run.status) ? actionButton('Stop run', `Stop run ${run.id}`, run.id, 'engine/runs/interrupt') : null,
-          ['failed', 'interrupted', 'cancelled', 'blocked'].includes(run.status) ? actionButton('Retry run', `Retry run ${run.id}`, run.id, 'engine/runs/retry') : null,
+          canRetry(run) ? actionButton('Retry run', `Retry run ${run.id}`, run.id, 'engine/runs/retry') : null,
         ] }, run.id)),
         state.runsError ? jsx.jsx('div', { role: 'alert', children: state.runsError }) : null,
       ] }) : null,
@@ -549,7 +579,7 @@
   }
   globalThis.__cdxEngineModes = {
     Selector, SourceBadge, TemplateControls, TemplateManager, refreshTemplates, refreshRuns, capture, requestFields, turnRequestFields, registerManager, noteStarted, observe,
-    permitsNativeMetadata, sourceFor, setDraftSelection, changeSelection, refreshThread, refreshCapabilities,
+    permitsNativeMetadata, permitsNativeModelSelection, sourceFor, setDraftSelection, changeSelection, refreshThread, refreshCapabilities,
     getCapabilities: (manager, context) => catalogRecord(manager, context).snapshot,
     getSnapshot: (scope, threadId, hostId) => record(scope, threadId, hostId).snapshot,
   };

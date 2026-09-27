@@ -112,7 +112,39 @@ const PREVIEW_UPGRADES = [
   ['scoped composer controls', 'HV.FooterInlineControls,{ref:x,children:[V,(0,H2.jsx)(globalThis.__cdxEngineModes.Selector,{React:V2,jsx:H2,scope:u,threadId:f,hostId:a,getHost:(e,t)=>e.get(Rk,t),getManager:zg,useAtom:ss,busyAtom:yk,nativeModelPicker:H}),r,U]}'],
   ['prepared turn wire request', 'Ce={threadId:t,clientUserMessageId:r,...globalThis.__cdxEngineModes.requestFields(o),additionalContext:i,input:o.input,'],
 ];
+const NATIVE_PICKER_PATCHES = [
+  ['native picker guard context',
+    'function fNc(e){let t=(0,_Nc.c)(167),',
+    'function fNc(e){let __cdxPickerProps=e;let t=(0,_Nc.c)(167),'],
+  ['native model selection guard',
+    'Ie=function(e,t){return(w?.selectModelAndReasoningEffort??x)',
+    'Ie=function(e,t){if(!globalThis.__cdxEngineModes.permitsNativeModelSelection(__cdxPickerProps))return;return(w?.selectModelAndReasoningEffort??x)'],
+  ['native model reset guard',
+    'function Le(e,t){return w==null?S(e,t):w.setModelAndReasoningEffort(e,t)}',
+    'function Le(e,t){if(!globalThis.__cdxEngineModes.permitsNativeModelSelection(__cdxPickerProps))return;return w==null?S(e,t):w.setModelAndReasoningEffort(e,t)}'],
+  ['native service tier guard',
+    'let{serviceTierSettings:L,setServiceTier:R}=NZ(n),z;',
+    'let{serviceTierSettings:L,setServiceTier:__cdxSetServiceTier}=NZ(n),R=(...__cdxArgs)=>{if(globalThis.__cdxEngineModes.permitsNativeModelSelection(__cdxPickerProps))return __cdxSetServiceTier(...__cdxArgs)},z;'],
+  ['native toggleFastMode command gate',
+    '_$(`composer.toggleFastMode`,He,We)',
+    '_$(`composer.toggleFastMode`,He,{...We,enabled:We.enabled&&globalThis.__cdxEngineModes.permitsNativeModelSelection(__cdxPickerProps)})'],
+  ['native increaseReasoningEffort command gate',
+    '_$(`composer.increaseReasoningEffort`,Ge,Ke)',
+    '_$(`composer.increaseReasoningEffort`,Ge,{...Ke,enabled:Ke.enabled&&globalThis.__cdxEngineModes.permitsNativeModelSelection(__cdxPickerProps)})'],
+  ['native decreaseReasoningEffort command gate',
+    '_$(`composer.decreaseReasoningEffort`,qe,Je)',
+    '_$(`composer.decreaseReasoningEffort`,qe,{...Je,enabled:Je.enabled&&globalThis.__cdxEngineModes.permitsNativeModelSelection(__cdxPickerProps)})'],
+  ['native cycleReasoningEffort command gate',
+    '_$(`composer.cycleReasoningEffort`,Ye,Xe)',
+    '_$(`composer.cycleReasoningEffort`,Ye,{...Xe,enabled:Xe.enabled&&globalThis.__cdxEngineModes.permitsNativeModelSelection(__cdxPickerProps)})'],
+];
+function patchNativePicker(source) {
+  for (const [name, before, after] of NATIVE_PICKER_PATCHES) source = replaceExactOnce(source, before, after, name);
+  return source;
+}
+
 function patchAppBundle(source) {
+  source = patchNativePicker(source);
   for (const [name, previous] of PREVIEW_UPGRADES) {
     const count = occurrences(source, previous);
     if (count === 0) continue;
@@ -158,7 +190,7 @@ function main(args = process.argv.slice(2)) {
   }
   console.log('[done] agent-modes renderer');
 }
-module.exports = { replaceExactOnce, patchAppBundle, patchTurnBundle, patchAssets };
+module.exports = { replaceExactOnce, patchAppBundle, patchNativePicker, patchTurnBundle, patchAssets };
 if (require.main === module) {
   try { main(); } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

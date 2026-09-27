@@ -72,7 +72,8 @@ export class WorkflowRouter {
   }
   read(id, turnId) {
     const chat = this.store.get(id);
-    return { workflows: (chat?.turns ?? []).filter(row => row.workflow && (!turnId || row.turn.id === turnId)).map(row => ({ turnId: row.turn.id, workflowId: row.workflow.id, status: row.workflow.status, config: row.workflow.config, runs: row.runs, state: row.workflow.state })) };
+    const latestTurnId = chat?.turns.at(-1)?.turn.id;
+    return { workflows: (chat?.turns ?? []).filter(row => row.workflow && (!turnId || row.turn.id === turnId)).map(row => ({ turnId: row.turn.id, isLatestTurn: row.turn.id === latestTurnId, workflowId: row.workflow.id, status: row.workflow.status, config: row.workflow.config, runs: row.runs, state: row.workflow.state })) };
   }
   start(id, params) {
     this.router.assertOpen();
@@ -212,17 +213,25 @@ export class WorkflowRouter {
   }
   async retry(id, turnId, roleId) {
     const chat = this.store.get(id), row = chat?.turns.find(row => row.turn.id === turnId && row.workflow);
+    if (!row) throw new Error('Workflow turn ownership mismatch.');
+    const latest = new Map();
+    const key = child => JSON.stringify([child.stepId, child.roleId, child.round]);
+    for (const run of row.runs) if ((latest.get(key(run))?.attempt ?? 0) < run.attempt) latest.set(key(run), run);
     const child = row?.runs.find(run => run.id === roleId);
-    if (!child || !['failed', 'interrupted', 'cancelled', 'blocked'].includes(child.status)) throw new Error('Only an unsuccessful owned role can be retried.');
+    if (roleId !== undefined && (!child || !['failed', 'interrupted', 'cancelled', 'blocked'].includes(child.status) || latest.get(key(child))?.id !== roleId)) throw new Error('Only the latest unsuccessful owned role can be retried.');
+    if (roleId === undefined && [...latest.values()].some(run => run.status !== 'completed')) throw new Error('Choose an unsuccessful role to retry before continuing the workflow.');
     const active = this.active.get(row.workflow.id);
     if (active) {
-      if (!active.handle || active.handle.retry(roleId) === false) throw new Error('This role attempt is not waiting for retry.');
+      if (roleId === undefined || !active.handle || active.handle.retry(roleId) === false) throw new Error('This role attempt is not waiting for retry.');
       return {};
     }
     this.assertAvailable();
     this.store.resumeWorkflow(id, row.workflow.id);
-    const previousSnapshot = { ...row.workflow.state, runs: row.runs };
-    this.launch(id, row.workflow.id, this.store.workflowRecord(id, row.workflow.id).row.turn, row.workflow.config, { previousSnapshot, retryRunId: roleId });
+    // Stop/materialization failure can precede the scheduler's first snapshot.
+    // Resume that zero-role workflow from its frozen config, without inventing
+    // an incomplete recovery snapshot that lacks the scheduler ID and caches.
+    const recovery = row.workflow.state ? { previousSnapshot: { ...row.workflow.state, runs: row.runs } } : {};
+    this.launch(id, row.workflow.id, this.store.workflowRecord(id, row.workflow.id).row.turn, row.workflow.config, { ...recovery, ...(roleId === undefined ? { resume: true } : { retryRunId: roleId }) });
     return {};
   }
   async close() { await Promise.all([...this.active.values()].map(run => this.interrupt(run.threadId, run.turn.id))); }

@@ -89,6 +89,7 @@ test('interleaved role events persist before notification with exact source on h
   assert.equal(row.workflow.events.length, 2);
   const result = await f.router.request('engine/runs/read', { threadId: 'chat', turnId: turn.id });
   assert.equal(result.workflows[0].runs.length, 2);
+  assert.equal(result.workflows[0].isLatestTurn, true);
   const history = await f.router.request('thread/read', { threadId: 'chat', includeTurns: true });
   assert.equal(history.thread.turns[0].items[1].cdxEngineSource, 'codex');
 });
@@ -112,6 +113,17 @@ test('role stop and whole-turn stop are correctly scoped and preserve stored par
   assert.deepEqual(w.interrupted, ['codex-run', 'whole']);
   assert.equal(f.store.get('chat').activeTurn, null);
   assert.equal(f.store.get('chat').turns[0].turn.status, 'interrupted');
+});
+
+test('run APIs reject a non-local host before reading or mutating a local workflow', async t => {
+  const f = fixture(t), { turn } = await started(f), w = f.workflows[0];
+  w.state.runs = roles(); w.publish();
+  const count = f.calls.length;
+  for (const method of ['engine/runs/read', 'engine/runs/interrupt', 'engine/runs/retry']) {
+    await assert.rejects(f.router.request(method, { hostId: 'remote-ssh:fixture', threadId: 'chat', turnId: turn.id, runId: 'codex-run' }), /local/i);
+  }
+  assert.deepEqual(w.interrupted, []); assert.deepEqual(w.retried, []);
+  assert.equal(f.calls.length, count); assert.equal(f.store.get('chat').activeTurn.turnId, turn.id);
 });
 
 test('native approval results route only to the correct workflow role', async t => {
@@ -202,4 +214,43 @@ test('a failed native role keeps its sibling and retries inside the same public 
   assert.equal(row.runs.length, 6); assert.equal(row.runs[1].status, 'failed');
   assert.equal(row.turn.items.filter(item => item.type === 'userMessage').length, 1);
   assert.equal(launched.filter(options => options.stepId === 'answers.codex').length, 1);
+});
+
+test('explicit workflow continuation resumes between roles without requiring a failed attempt', async t => {
+  const f = fixture(t), { turn } = await started(f), w = f.workflows[0];
+  w.state.runs = [{ ...roles()[0], status: 'completed', text: 'kept' }]; w.publish(); w.finish('interrupted'); await tick();
+  await f.router.request('engine/runs/retry', { threadId: 'chat', turnId: turn.id }); await tick();
+  assert.equal(f.workflows[1].options.resume, true);
+  assert.equal(f.workflows[1].options.previousSnapshot.runs[0].text, 'kept');
+  assert.equal(f.store.get('chat').turns.length, 1);
+});
+
+test('workflow reads mark historical turns ineligible after a newer public turn', async t => {
+  const f = fixture(t), { turn } = await started(f), first = f.workflows[0];
+  first.finish('interrupted'); await tick();
+  const next = await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'text', text: 'New request' }] });
+  await tick();
+  const result = await f.router.request('engine/runs/read', { threadId: 'chat' });
+  assert.deepEqual(result.workflows.map(row => [row.turnId, row.isLatestTurn]), [[turn.id, false], [next.turn.id, true]]);
+  const historical = await f.router.request('engine/runs/read', { threadId: 'chat', turnId: turn.id });
+  assert.equal(historical.workflows[0].isLatestTurn, false);
+});
+
+test('continuing after immediate stop starts the frozen workflow when no scheduler snapshot exists yet', async t => {
+  const { WorkflowScheduler } = await import('../../runtime/agent-modes/orchestration/scheduler.mjs');
+  const f = fixture(t), calls = [];
+  f.router.workflow.factory = callbacks => new WorkflowScheduler({ ...callbacks, runner: { start(options) {
+    calls.push(options); const done = Promise.resolve({ status: 'completed', text: 'result' });
+    return { done, interrupt: () => done };
+  } } });
+  await f.router.request('thread/start', { ...selected, cwd: f.dir });
+  const { turn } = await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'text', text: 'Start and stop immediately' }] });
+  await f.router.request('turn/interrupt', { threadId: 'chat', turnId: turn.id });
+  assert.equal(f.store.get('chat').turns[0].workflow.state, null); assert.equal(calls.length, 0);
+  await f.router.request('engine/runs/retry', { threadId: 'chat', turnId: turn.id });
+  for (let i = 0; i < 100 && f.store.get('chat').activeTurn; i++) await tick();
+  const row = f.store.get('chat').turns[0];
+  assert.equal(row.turn.status, 'completed', row.turn.error?.message);
+  assert.equal(calls.length, 5); assert.equal(f.store.get('chat').turns.length, 1);
+  assert.ok(calls.filter(call => call.engine === 'claude').every(call => call.model === selected.engineModels.claude));
 });

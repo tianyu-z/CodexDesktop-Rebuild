@@ -13,6 +13,10 @@ const resultFields = new Set(['id', 'engine', 'roleId', 'stepId', 'attempt', 'ro
 const stoppedError = () => new Error('Workflow interrupted.');
 const roleKey = ({ stepId, roleId, round = 0 }) => JSON.stringify([stepId, roleId, round]);
 const bound = (value, parameters) => typeof value === 'number' ? value : parameters[value.parameter];
+const needsWorkspace = (steps, template, parameters) => steps.some(step =>
+  step.type === 'executeTasks' || (step.type === 'run' && template.roles[step.role].access === 'write') ||
+  (step.type === 'parallel' && needsWorkspace(step.steps, template, parameters)) ||
+  (step.type === 'repeat' && bound(step.count, parameters) > 0 && needsWorkspace(step.steps, template, parameters)));
 
 /** Stable across turns, distinct across revisions, roles, workspaces and task purposes. */
 export function roleBindingKey({ template, roleId, cwd, purpose = 'default' }) {
@@ -78,6 +82,8 @@ class WorkflowExecution {
       if (run.status === 'completed') this.state.cache.roles[roleKey(run)] ??= clone(run);
     }
     for (const run of this.latestRuns()) if (run.status !== 'completed') this.blockers.add(run.id);
+    if (previous && supplied.resume === true && supplied.retryRunId === undefined && this.blockers.size) throw new Error('An unsuccessful role requires an explicit retryRunId before this workflow can resume.');
+    if (previous && supplied.resume === true && !this.blockers.size) this.activated = true;
     this.handle = { done: this.completed.promise, interrupt: id => this.interrupt(id), retry: id => this.retry(id), snapshot: () => clone(this.state) };
     this.abortListener = () => { this.stop(); };
     supplied.signal?.addEventListener('abort', this.abortListener, { once: true });
@@ -86,6 +92,7 @@ class WorkflowExecution {
     if (supplied.signal?.aborted) this.stop();
     if (!previous) this.activation.resolve();
     else if (supplied.retryRunId !== undefined && !this.retry(supplied.retryRunId)) this.fatal(new Error('The saved role run is not retryable.'));
+    else if (supplied.resume === true) this.activation.resolve();
     // The returned handle is available to stop before native scheduling starts.
     void Promise.resolve().then(() => this.execute());
   }
@@ -129,6 +136,10 @@ class WorkflowExecution {
     let error;
     try {
       await this.activation.promise; this.alive(); this.activated = true;
+      if (needsWorkspace(this.options.template.steps, this.options.template, this.options.parameters)) {
+        const operations = await this.operations(); this.alive();
+        await operations?.prepare?.(); this.alive();
+      }
       const globals = new Map([['request', this.options.input], ['history', this.options.history]]);
       for (const [key, value] of Object.entries(this.options.parameters)) globals.set(`parameters.${key}`, value);
       const results = await this.scope(this.options.template.steps, '', globals, 0);
@@ -231,6 +242,7 @@ class WorkflowExecution {
       if (typeof this.owner.operationsFactory !== 'function') throw new Error('Isolated workspace operations are unavailable for this template.');
       this.operationPromise = Promise.resolve(this.owner.operationsFactory({ invoke: descriptor => this.invoke(descriptor), options: this.options,
         workspaces: this.owner.workspaces, signal: this.controller.signal,
+        fail: error => { this.executionError ??= errorText(error); this.stop(); },
         checkpoint: (key, value) => { this.alive(); if (typeof key !== 'string' || !key || ['__proto__', 'constructor', 'prototype'].includes(key)) throw new TypeError('Invalid checkpoint key.'); this.state.checkpoints[key] = clone(value); this.notify(); },
         getCheckpoint: key => clone(this.state.checkpoints[key]), notifySnapshot: () => this.notify(),
       }));
@@ -273,7 +285,14 @@ class WorkflowExecution {
           const consumedSeq = this.state.bindings[bindingKey]?.consumedSeq ?? 0;
           values.history = values.history.filter(row => !Number.isSafeInteger(row?.seq) || row.seq > consumedSeq);
         }
-        descriptor = frozen({ ...proposed, ...(values ? { prompt: renderInputs(Object.keys(values), ref => values[ref]), inputValues: values } : {}) });
+        let acknowledgedHistorySeq;
+        if (Array.isArray(values?.history) && Number.isSafeInteger(this.options.throughSeq) && this.options.throughSeq >= 0) {
+          for (const row of values.history) {
+            if (Number.isSafeInteger(row?.seq) && row.seq >= 0 && row.seq <= this.options.throughSeq) acknowledgedHistorySeq = Math.max(acknowledgedHistorySeq ?? 0, row.seq);
+          }
+        }
+        descriptor = frozen({ ...proposed, ...(values ? { prompt: renderInputs(Object.keys(values), ref => values[ref]), inputValues: values } : {}),
+          ...(acknowledgedHistorySeq === undefined ? {} : { acknowledgedHistorySeq }) });
         this.state.invocations[key] = clone(descriptor); this.notify();
       }
       return await this.invokeUntilSuccess(key, frozen(descriptor), input.validateResult);
@@ -380,9 +399,9 @@ class WorkflowExecution {
       this.state.bindings[key] = { ...value, engine: run.engine, sessionId: event.sessionId, consumedSeq: value?.consumedSeq ?? 0 };
     }
     if (event.type === 'input-acknowledged') active.acknowledged = true;
-    if (active.acknowledged && Number.isSafeInteger(this.options.throughSeq) && this.options.throughSeq >= 0) {
+    if (active.acknowledged && Number.isSafeInteger(descriptor.acknowledgedHistorySeq) && descriptor.acknowledgedHistorySeq >= 0) {
       const { value } = this.binding(descriptor);
-      if (value?.sessionId) value.consumedSeq = Math.max(value.consumedSeq ?? 0, this.options.throughSeq);
+      if (value?.sessionId) value.consumedSeq = Math.max(value.consumedSeq ?? 0, descriptor.acknowledgedHistorySeq);
     }
     if (event.type === 'text-delta' && typeof event.delta === 'string') run.text = (run.text ?? '') + event.delta;
     this.emit(run, event);
@@ -408,6 +427,11 @@ class WorkflowExecution {
         return this.owner.onPermission?.({ ...request, runId: run.id, engine: run.engine, roleId: run.roleId, stepId: run.stepId,
           attempt: run.attempt, round: run.round, cwd: run.cwd, signal: controller.signal });
       })]);
+    } catch (error) {
+      // Native harnesses may catch a handler error and continue after denying
+      // one request. A failed approval callback must stop the whole workflow.
+      this.fatal(error);
+      return undefined;
     } finally {
       active.permissions.delete(controller); active.controller.signal.removeEventListener('abort', abort); request.signal?.removeEventListener('abort', abort);
       if (run.status === 'awaitingApproval' && !active.permissions.size) { run.status = 'running'; this.notify(); }

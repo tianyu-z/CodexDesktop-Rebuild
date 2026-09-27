@@ -113,6 +113,7 @@ export class EngineRouter {
     if (id && this.workflow.internal.has(id)) throw new Error('Internal workflow sessions are not public chats.');
     if (method.startsWith('engine/templates/')) return this.workflow.templateRequest(method, params);
     if (method.startsWith('engine/runs/')) {
+      this.workflow.assertAvailable(params);
       if (!this.store.get(id)) await this.hydrate(id);
       if (method === 'engine/runs/read') return this.workflow.read(id, params.turnId);
       if (method === 'engine/runs/interrupt') return this.workflow.interrupt(id, params.turnId, params.runId);

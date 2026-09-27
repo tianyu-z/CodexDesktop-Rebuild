@@ -8,6 +8,15 @@ const { patchAppBundle, patchTurnBundle, replaceExactOnce } = require('../../scr
 
 // Deliberately literal upstream seams: a renamed binding must fail a build.
 const appFixture = [
+  'function fNc(e){let t=(0,_Nc.c)(167),',
+  'Ie=function(e,t){return(w?.selectModelAndReasoningEffort??x)',
+  'function Le(e,t){return w==null?S(e,t):w.setModelAndReasoningEffort(e,t)}',
+  'let{serviceTierSettings:L,setServiceTier:R}=NZ(n),z;',
+  '_$(`composer.toggleFastMode`,He,We)',
+  '_$(`composer.increaseReasoningEffort`,Ge,Ke)',
+  '_$(`composer.decreaseReasoningEffort`,qe,Je)',
+  '_$(`composer.cycleReasoningEffort`,Ye,Xe)',
+
   'H=!P&&(0,H2.jsx)(`span`,{ref:S,children:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:F,permissionsCwdOverride:i,permissionsHostId:a})})',
   'async sendRequest(e,t,n){return this.requestClient.sendRequest(e,t,n)}',
   'HV.FooterInlineControls,{ref:x,children:[V,H,r,U]}',
@@ -206,4 +215,54 @@ test('dual footer assembles a native picker independently of the width-gated sin
   const nativeContract = 'H=!P&&(0,H2.jsx)(`span`,{ref:S,children:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:F,permissionsCwdOverride:i,permissionsHostId:a})})';
   assert.ok(patched.includes(nativeContract), 'Only-mode width policy must remain unchanged');
   assert.throws(() => patchAppBundle(appFixture.replace(nativeContract, nativeContract.replace('fNc', 'changedNativePicker'))), /native model picker contract/);
+});
+
+function nativePickerProbe() {
+  const changes = [], commands = new Map(), cache = Array(167).fill(Symbol.for('react.memo_cache_sentinel'));
+  const noop = () => {}, context = {
+    console, _Nc: { c: () => cache }, Q: {}, yNc: 'menu', Xj: 'flags', Uu: {}, WO: 'localModel', Sk: 'mode', DU: 'host', kMc: 'runtime', nG: 'hotkey',
+    us: () => ({ get: () => 0, set: noop }), Y: key => key === 'flags' ? { data: { ultraEffortEnabled: false } } : 'simple', JX: () => false,
+    EP: () => ({ hostId: 'local', cwd: '/project' }), ss: key => key === 'runtime' ? 'idle' : false, LA: () => ({ authMethod: 'apiKey' }),
+    WU: () => ({ focus: noop }), tZ: () => false, Jb: () => 'default',
+    cNc: () => ({ modelSettings: { model: 'gpt', reasoningEffort: 'low', isLoading: false }, selectComposerModelAndReasoningEffort: (...args) => changes.push(['select', ...args.slice(0, 2)]), setModelAndReasoningEffort: (...args) => changes.push(['reset', ...args]) }),
+    IMc: () => null, kU: () => ({ data: { models: [] }, status: 'success' }), gNc: () => false, hNc: () => false,
+    NZ: () => ({ serviceTierSettings: { selectedServiceTier: 'standard', availableOptions: [{ value: 'standard' }, { value: 'fast', iconKind: 'fast' }] }, setServiceTier: (...args) => changes.push(['tier', ...args]) }),
+    Wys: () => ({ isServiceTierAllowed: true }), ssc: () => ({ isOpen: false, setIsOpen: noop, triggerRef: {}, onTriggerBlur: noop, onTriggerPointerDown: noop, onTriggerPointerLeave: noop, handleSelectAndClose: noop }),
+    tJa: () => true, aAc: () => ['low', 'high'], Lic: () => [], oAc: effort => effort, mNc: noop, Pic: () => [], Ric: () => null, Fic: () => null, dsc: () => [],
+    $Mc: noop, HG: () => ({ model: 'gpt' }), pNc: option => option.iconKind === 'fast', CEr: () => false, gEr: () => false,
+    vNc: { useRef: value => ({ current: value }) }, sAc: () => 'high', cAc: () => 'high',
+    _$: (name, callback, options) => commands.set(name, { callback, options }),
+  };
+  vm.createContext(context);
+  vm.runInContext(readFileSync(new URL('../../scripts/assets/agent-modes-ui.js', import.meta.url), 'utf8'), context);
+  const nativeSource = readFileSync(new URL('./fixtures/native-model-picker.js', import.meta.url), 'utf8');
+  const patch = require('../../scripts/patch-agent-modes.js').patchNativePicker ?? (text => text);
+  vm.runInContext(patch(nativeSource), context);
+  return { api: context.__cdxEngineModes, render: props => context.fNc(props), changes, commands };
+}
+
+test('busy Both chats disable actual native model shortcuts and reject cached selection callbacks', () => {
+  const { api, render, changes, commands } = nativePickerProbe(), manager = { getHostId: () => 'local' };
+  const context = { threadId: 'busy', hostId: 'local' }, props = { conversationId: 'busy', cdxEngineSelectionContext: context };
+  api.observe(manager, 'engine/mode/set', { threadId: 'busy' }, { engineMode: 'both', models: {}, busy: false });
+  const idle = render(props), cachedCommands = [...commands.values()].map(command => command.callback);
+  assert.equal(commands.get('composer.increaseReasoningEffort').options.enabled, true);
+  commands.get('composer.increaseReasoningEffort').callback();
+  assert.deepEqual(changes[0], ['select', 'gpt', 'high']);
+  changes.length = 0;
+  api.observe(manager, 'engine/mode/set', { threadId: 'busy' }, { engineMode: 'both', models: {}, busy: true });
+  render(props);
+  for (const name of ['composer.increaseReasoningEffort', 'composer.decreaseReasoningEffort', 'composer.cycleReasoningEffort', 'composer.toggleFastMode']) assert.equal(commands.get(name).options.enabled, false, name);
+  for (const callback of cachedCommands) callback();
+  idle.select('other', 'high'); idle.reset('other', 'high'); idle.selectTier('fast');
+  assert.deepEqual(changes, []);
+  api.observe(manager, 'engine/mode/set', { threadId: 'other' }, { engineMode: 'both', models: {}, busy: false });
+  render({ conversationId: 'other', cdxEngineSelectionContext: { threadId: 'other', hostId: 'local' } });
+  assert.equal(commands.get('composer.toggleFastMode').options.enabled, true);
+  commands.get('composer.toggleFastMode').callback();
+  assert.equal(changes.length, 1);
+  changes.length = 0;
+  render({ conversationId: 'busy' }); // Ordinary native instances retain their behavior.
+  commands.get('composer.increaseReasoningEffort').callback();
+  assert.equal(changes.length, 1);
 });
