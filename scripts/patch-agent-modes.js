@@ -28,7 +28,7 @@ const APP_PATCHES = [
     'async sendRequest(e,t,n){globalThis.__cdxEngineModes.registerManager(this);let __cdxEngineResponse=await this.requestClient.sendRequest(e,t,n);globalThis.__cdxEngineModes.observe(this,e,t,__cdxEngineResponse);return __cdxEngineResponse}'],
   ['scoped composer controls',
     'HV.FooterInlineControls,{ref:x,children:[V,H,r,U]}',
-    'HV.FooterInlineControls,{ref:x,children:[V,(0,H2.jsx)(globalThis.__cdxEngineModes.Selector,{React:V2,jsx:H2,scope:u,threadId:f,hostId:a,getHost:(e,t)=>e.get(Rk,t),getManager:zg,useAtom:ss,busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H}),r,U]}'],
+    'HV.FooterInlineControls,{ref:x,children:[V,(0,H2.jsx)(globalThis.__cdxEngineModes.Selector,{React:V2,jsx:H2,scope:u,threadId:f,hostId:a,cwd:i,getHost:(e,t)=>e.get(Rk,t),getManager:zg,useAtom:ss,busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H}),r,U]}'],
   // The upstream compiler memo does not depend on the composer scope. Rebuild
   // this one footer element so navigating between two drafts cannot retain the
   // previous scope in the selector's props; the selector owns its subscriptions.
@@ -97,6 +97,7 @@ const APP_PATCHES = [
 // Earlier development previews used these exact replacements. Upgrade only
 // recognized output so patchAssets can safely reuse a previously patched copy.
 const PREVIEW_UPGRADES = [
+  ['scoped composer controls', 'HV.FooterInlineControls,{ref:x,children:[V,(0,H2.jsx)(globalThis.__cdxEngineModes.Selector,{React:V2,jsx:H2,scope:u,threadId:f,hostId:a,getHost:(e,t)=>e.get(Rk,t),getManager:zg,useAtom:ss,busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H}),r,U]}'],
   ['scoped composer controls', 'HV.FooterInlineControls,{ref:x,children:[V,(0,H2.jsx)(globalThis.__cdxEngineModes.Selector,{React:V2,jsx:H2,scope:u,threadId:f,hostId:a,getHost:(e,t)=>e.get(Rk,t),getManager:zg,useAtom:ss,busyAtom:yk,nativeModelPicker:H}),r,U]}'],
   ['prepared turn wire request', 'Ce={threadId:t,clientUserMessageId:r,...globalThis.__cdxEngineModes.requestFields(o),additionalContext:i,input:o.input,'],
 ];

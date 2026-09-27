@@ -5,7 +5,7 @@
 ## 使用
 
 1. 新建或打开本地会话，在输入框旁选择 **Only Codex** 或 **Only Claude Code**。
-2. Claude 模型可选 Default、Sonnet、Opus、Haiku，使用本机 Claude Code 提供的模型别名。Default 沿用 Claude 的配置。
+2. Claude 模型列表从本机 Claude Code 动态读取，直接选择具体版本，例如 Opus 4.8、4.6、5、5.5；Default 沿用 Claude 的配置。模型栏旁的刷新按钮可重新读取目录。
 3. 一轮执行结束或中断完成后，可以在同一会话切换引擎。公开消息和工具结果会作为明确标注的历史资料交给接手引擎；两者分别恢复自己的原生会话。
 4. **Codex + Claude Code** 显示为禁用。本版本不会并行启动两种引擎。
 
@@ -37,6 +37,23 @@ Claude 使用自己的用户、项目、本地配置和工具权限策略。Code
 
 切换不转移隐藏推理。长历史按有界输入传递，并提供本地完整公开历史文件的引用。Claude 的通用工具卡片保留实际输入和输出；补丁不会从工具名称猜测或伪造文件 diff。
 
+## Claude 模型列表
+
+Claude 下拉列表通过当前安装的 Claude Code / 官方 Agent SDK 的 `supportedModels()` 读取，使用同一连接配置；已有聊天按其工作目录读取。列表加载不会发送聊天提示词或调用模型推理。前端和运行时短暂缓存结果，点击模型栏旁的刷新按钮可重新读取。
+
+具体版本使用列表返回的原始 ID，不转换成 `opus` 等浮动别名。例如本机在 2026-09-27 返回且已成功调用的版本：
+
+| 版本 | 模型 ID |
+| --- | --- |
+| Opus 4.8 | `claude-opus-4-8` |
+| Opus 4.6 | `claude-opus-4-6` |
+| Opus 5 | `claude-opus-5` |
+| Opus 5.5 | `claude-opus-5-5` |
+
+界面显示具体版本，选项提示中保留准确 ID 和说明。`Default` 跟随 Claude 的默认设置，历史会话保存的别名保持原样；需要固定版本时选择对应的具体版本。列表加载失败会显示错误并允许刷新，不会偷偷改变已保存的模型选择。列表是 Claude Code 对当前配置报告的模型选项；其他账号或提供方的实际访问权限可能不同。
+
+初版只显示四个固定别名，这属于模型发现未接完整的缺陷；当前修复使用动态列表，并允许保存原始的具体模型 ID。
+
 ## 维护入口
 
 - `runtime/agent-modes/gateway.mjs`：本地 JSONL 入口，普通 CLI 命令转交原 Codex。
@@ -44,6 +61,7 @@ Claude 使用自己的用户、项目、本地配置和工具权限策略。Code
 - `store.mjs` / `handoff.mjs`：原子持久化、每引擎已接收序号、公开上下文交接。
 - `claude-adapter.mjs` / `claude-events.mjs`：官方 SDK 与事件转换。
 - `claude-environment.mjs`：按轮次读取 VS Code Insiders 的连接环境，不持久化凭据。
+- `claude-models.mjs`：读取原生模型目录，处理刷新、缓存和查询进程退出。
 - `scripts/patch-agent-modes.js` / `scripts/assets/agent-modes-ui.js`：版本绑定的前端补丁与独立界面逻辑。
 - `scripts/build-agent-modes-preview.js`：复制应用、打包 ASAR、更新完整性哈希、签名并验证。
 
@@ -82,7 +100,9 @@ node tests/agent-modes/live-smoke.mjs --claude
 node tests/agent-modes/live-permissions.mjs
 ```
 
-当前验证：111 项自动化测试通过，覆盖流式事件、SDK 契约、配置隔离、审批归属、取消通知、退出清理、异步响应竞态、重启、分页、模式重试和补丁幂等。真实 Foundry Claude 推理成功，更新后的安装版界面返回 `CLAUDE_DESKTOP_OK`，该轮只有 Claude 执行；同一会话 Codex → Claude → Codex 的双向事实回忆、文件读取、网关重启和历史分页通过。真实 Bash 权限允许后写入成功，拒绝后没有写入，取消待审批任务后未写入且拥有的 Claude 进程退出。预览版界面已验证错误结束后控件恢复、原会话切换到 Codex、回复引擎标记，以及应用重启后的混合历史和模式恢复。
+当前验证：147 项自动化测试通过，覆盖流式事件、SDK 契约、配置隔离、审批归属、取消通知、退出清理、异步响应竞态、重启、分页、模式重试、动态模型目录、RPC 代理边界和补丁幂等。真实 Foundry Claude 推理成功，连接配置安装版界面返回 `CLAUDE_DESKTOP_OK`，该轮只有 Claude 执行；同一会话 Codex → Claude → Codex 的双向事实回忆、文件读取、网关重启和历史分页通过。真实 Bash 权限允许后写入成功，拒绝后没有写入，取消待审批任务后未写入且拥有的 Claude 进程退出。预览版界面已验证错误结束后控件恢复、原会话切换到 Codex、回复引擎标记，以及应用重启后的混合历史和模式恢复。
+
+动态模型修复的预览版已实际加载 17 个选项，逐一选中 Opus 4.8、4.6、5、5.5；Opus 5.5 在界面返回 `MODEL_PICKER_OPUS55_OK`，后台只有一个已完成的 Claude 轮次，保存的模型为 `claude-opus-5-5`。刷新窗口后选择仍保持。四个具体 ID 也分别通过真实推理验证，返回的实际使用模型与请求一致。一次性界面测试会话已归档。证据保存在 `.artifacts/model-picker-gui.json`、`.artifacts/explicit-model-live.json` 和 `.artifacts/agent-modes-tests-model-picker.log`。
 
 ## 安装与回退
 
@@ -93,6 +113,8 @@ node tests/agent-modes/live-permissions.mjs
 ```
 
 安装包和备份的 ASAR 哈希已核对，已安装应用的签名校验通过。连接配置更新版已于 2026-09-27 重新安装，上一版另有备份，原应用备份仍保留。安装记录保存在工作目录 `.artifacts/engine-install-manifest.json`，包含备份位置、安装时间和 ASAR 哈希。
+
+动态模型修复包已构建为 `.artifacts/chatgpt-dev-engines.app`，签名验证通过；ASAR SHA-256 为 `b32ea490ea4f8b4e252374a2638c8d344b2d2bab0216ecd59c1fb3826fc903f5`。当前安装版另有运行中的任务，因此尚未替换或重启。待安装记录及旧版备份位置见 `.artifacts/model-picker-install-pending.json`。
 
 回退时先退出 `chatgpt-dev`，将当前应用移到另一个保留位置，再把记录中的原应用备份复制回 `/Applications/chatgpt-dev.app`。保留 `engine-conversations` 数据目录；回退后原版界面不会显示 Claude 的附加历史，再次安装补丁后可恢复。回退不要求删除或改写原生 Codex 历史。
 

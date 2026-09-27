@@ -67,6 +67,13 @@ test('app patch rejects every missing or duplicate upstream seam', () => {
   }
 });
 
+test('model discovery receives the composer project directory, including upgraded patches', () => {
+  const patched = patchAppBundle(appFixture);
+  assert.match(patched, /Selector,\{React:V2,jsx:H2,scope:u,threadId:f,hostId:a,cwd:i,/);
+  const previous = patched.replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:');
+  assert.equal(patchAppBundle(previous), patched);
+});
+
 test('source badge patch is idempotent and bound to the rendered turn identity', () => {
   const patched = patchTurnBundle(turnFixture);
   assert.match(patched, /threadId:a,hostId:s,turnId:u.turnId,raw:u/);
@@ -141,7 +148,7 @@ test('existing-chat retry wire reconstruction carries retained first-turn creati
 
 test('known development preview patches upgrade exactly once without re-extraction', () => {
   const current = patchAppBundle(appFixture);
-  const previous = current.replace('busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H', 'busyAtom:yk,nativeModelPicker:H').replace('turnRequestFields(e,t,o,r)', 'requestFields(o)');
+  const previous = current.replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:').replace('busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H', 'busyAtom:yk,nativeModelPicker:H').replace('turnRequestFields(e,t,o,r)', 'requestFields(o)');
   assert.equal(patchAppBundle(previous), current);
   const oldSelector = previous.split('\n').find(line => line.startsWith('HV.FooterInlineControls'));
   assert.throws(() => patchAppBundle(previous + '\n' + oldSelector), /expected one previous match/);

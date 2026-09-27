@@ -1,11 +1,13 @@
 /* Shared renderer helper. React is supplied by the host bundle after its factories initialize. */
 (() => {
   if (globalThis.__cdxEngineModes) return;
-  const CLAUDE_MODELS = ['default', 'sonnet', 'opus', 'haiku'];
+  const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,255}$/;
+  const MODEL_CACHE_TTL = 60_000;
+  const modelCatalogs = new WeakMap();
+  const disconnectedCatalog = newCatalog();
   const drafts = new WeakMap();
   const threads = new Map();
   const managers = new Map();
-  let capabilities;
   const key = (threadId, hostId) => `${hostId ?? 'local'}\0${threadId}`;
   const local = hostId => hostId == null || hostId === 'local';
   function fresh() {
@@ -28,9 +30,85 @@
     row.snapshot = next;
     for (const listener of row.listeners) listener();
   }
+  function validModelId(value) { return typeof value === 'string' && MODEL_ID.exec(value)?.[0] === value; }
+  function displayText(value, limit = 512) { return typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, limit) : ''; }
+  function newCatalog() {
+    return { snapshot: { claudeModels: [], modelListError: null, engines: null, loading: false, loadedAt: null }, listeners: new Set(), revision: 0, promise: null };
+  }
+  function catalogRecord(manager, { threadId, cwd } = {}) {
+    if (!manager || !['object', 'function'].includes(typeof manager)) return disconnectedCatalog;
+    let contexts = modelCatalogs.get(manager);
+    if (!contexts) { contexts = new Map(); modelCatalogs.set(manager, contexts); }
+    const contextKey = JSON.stringify([threadId ?? null, cwd ?? null]);
+    if (!contexts.has(contextKey)) contexts.set(contextKey, newCatalog());
+    return contexts.get(contextKey);
+  }
+  function normalizeModels(models) {
+    const result = [], seen = new Set();
+    for (const raw of Array.isArray(models) ? models : []) {
+      const model = typeof raw === 'string' ? { value: raw } : raw;
+      if (!validModelId(model?.value) || seen.has(model.value)) continue;
+      seen.add(model.value);
+      result.push({ value: model.value, displayName: displayText(model.displayName, 128) || model.value, description: displayText(model.description), ...(validModelId(model.resolvedModel) ? { resolvedModel: model.resolvedModel } : {}) });
+    }
+    return result;
+  }
+  async function refreshCapabilities(manager, { hostId = 'local', threadId, cwd, force = false } = {}) {
+    const row = catalogRecord(manager, { threadId, cwd });
+    if (!manager || !local(hostId)) return row.snapshot;
+    if (!force && row.promise) return row.promise;
+    if (!force && row.snapshot.loadedAt != null && !row.snapshot.modelListError && Date.now() - row.snapshot.loadedAt < MODEL_CACHE_TTL) return row.snapshot;
+    const revision = ++row.revision;
+    update(row, { loading: true });
+    let settled = false;
+    const pending = (async () => {
+      try {
+        const response = await manager.sendRequest('engine/capabilities', { ...(threadId != null ? { threadId } : {}), ...(cwd != null ? { cwd } : {}), ...(force ? { refresh: true } : {}) });
+        if (row.revision !== revision) return row.snapshot;
+        const models = normalizeModels(response?.claudeModels), error = displayText(response?.modelListError) || null;
+        update(row, { claudeModels: error && models.length === 0 ? row.snapshot.claudeModels : models, modelListError: error, engines: Array.isArray(response?.engines) ? response.engines.filter(value => typeof value === 'string') : row.snapshot.engines, loadedAt: Date.now() });
+      } catch (error) {
+        if (row.revision === revision) update(row, { modelListError: displayText(error?.message ?? String(error)) || 'Unable to discover Claude Code models', loadedAt: Date.now() });
+      } finally {
+        settled = true;
+        if (row.revision === revision) { row.promise = null; update(row, { loading: false }); }
+      }
+      return row.snapshot;
+    })();
+    if (!settled && row.revision === revision) row.promise = pending;
+    return pending;
+  }
+  function modelOptions(catalog, current) {
+    const models = catalog.claudeModels;
+    const options = [models.find(model => model.value === 'default') ?? { value: 'default', displayName: 'Claude default', description: 'Use the default model configured for Claude Code.' }, ...models.filter(model => model.value !== 'default')];
+    if (typeof current === 'string' && current.length > 0 && !options.some(model => model.value === current)) {
+      options.push({ value: current, displayName: ['opus', 'sonnet', 'haiku'].includes(current) ? 'Saved alias' : 'Saved model', description: 'Your saved selection is unchanged. This model was not returned by the latest discovery.' });
+    }
+    return options;
+  }
+  function nativeModelName(identity) {
+    const match = /^claude-([a-z]+(?:-[a-z]+)*)-(\d{1,3})(?:-(\d{1,3}))?(?:-(\d{8}))?$/i.exec(identity.replace(/\[1m\]$/i, ''));
+    if (!match) return null;
+    const family = match[1].split('-').map(word => word[0].toUpperCase() + word.slice(1)).join(' ');
+    return `${family} ${match[2]}${match[3] ? `.${match[3]}` : ''}${match[4] ? ` (${match[4]})` : ''}`;
+  }
+  function modelLabel(model) {
+    const identity = model.resolvedModel ?? model.value;
+    const nativeName = nativeModelName(identity);
+    if (model.value === 'default') return nativeName ? `Default · ${nativeName}` : 'Claude default';
+    if (nativeName) {
+      const context = /\[1m\]$/i.test(identity) || /\[1m\]$/i.test(model.value) ? ' (1M context)' : '';
+      const alias = model.resolvedModel && model.value !== model.resolvedModel ? ' (alias)' : '';
+      return `${nativeName}${context}${alias}`;
+    }
+    return model.displayName && model.displayName !== identity ? `${model.displayName} — ${identity}` : identity;
+  }
+  function modelTitle(model) {
+    return `${model.description ? `${model.description}\n` : ''}Model ID: ${model.value}${model.resolvedModel && model.resolvedModel !== model.value ? `\nResolves to: ${model.resolvedModel}` : ''}`;
+  }
   function validate(selection) {
     if (!['codex', 'claude'].includes(selection.engineMode)) throw Error('Codex + Claude Code is not available yet');
-    if (selection.engineMode === 'claude' && selection.engineModel != null && !CLAUDE_MODELS.includes(selection.engineModel)) throw Error('Unsupported Claude Code model');
+    if (selection.engineMode === 'claude' && selection.engineModel != null && !validModelId(selection.engineModel)) throw Error('Invalid Claude Code model identifier');
   }
   function applyState(row, state) {
     const values = { loading: false, available: true, error: null };
@@ -79,8 +157,7 @@
     if (state.engineMode === 'claude') return { engineMode: 'claude', engineModel: state.models.claude ?? 'default', skipAutoTitleGeneration: true };
     return { engineMode: 'codex' };
   }
-  function registerManager(manager) {
-    const hostId = manager?.getHostId?.() ?? 'local';
+  function registerManager(manager, hostId = manager?.getHostId?.() ?? 'local') {
     if (manager && managers.get(hostId) !== manager) managers.set(hostId, manager);
   }
   function noteStarted(manager, threadId, options) {
@@ -118,7 +195,7 @@
   }
   async function refreshThread(scope, threadId, hostId, manager) {
     if (!local(hostId) || threadId == null) return;
-    registerManager(manager);
+    registerManager(manager, hostId);
     const row = record(scope, threadId, hostId);
     if (row.read) return row.read;
     const revision = row.revision;
@@ -196,38 +273,48 @@
   function Selector(props) {
     const { React, jsx, scope, threadId, nativeModelPicker } = props;
     const hostId = props.hostId ?? props.getHost(scope, threadId) ?? 'local';
+    const cwd = threadId == null ? props.cwd : undefined;
     const row = record(scope, threadId, hostId), state = useRecord(React, row);
     const inProgress = props.useAtom(props.busyAtom, threadId);
     const runtimeStatus = props.useAtom(props.runtimeStatusAtom, threadId);
     const requests = props.useAtom(props.requestsAtom, threadId);
     let manager, connectionError;
-    try { manager = props.getManager(scope, hostId); registerManager(manager); } catch (error) { connectionError = error.message; }
+    // forHost() returns a callable RPC proxy, including an asynchronous getHostId.
+    // The composer already knows its host; do not query that proxy during render.
+    try { manager = props.getManager(scope, hostId); registerManager(manager, hostId); } catch (error) { connectionError = error.message; }
+    const catalog = useRecord(React, catalogRecord(manager, { threadId, cwd }));
     React.useEffect(() => {
       if (!local(hostId) || !manager) return;
-      let cancelled = false;
-      if (!capabilities) capabilities = manager.sendRequest('engine/capabilities', {}).catch(error => { capabilities = null; throw error; });
-      capabilities.then(() => { if (!cancelled) update(row, { available: true }); }, error => { if (!cancelled) update(row, { available: false, error: error.message }); });
+      refreshCapabilities(manager, { hostId, threadId, cwd });
       if (threadId != null) refreshThread(scope, threadId, hostId, manager);
       const interval = threadId == null ? null : setInterval(() => refreshThread(scope, threadId, hostId, manager), 2000);
-      return () => { cancelled = true; if (interval != null) clearInterval(interval); };
-    }, [row, manager, hostId, threadId, scope]);
+      return () => { if (interval != null) clearInterval(interval); };
+    }, [row, manager, hostId, threadId, cwd, scope]);
     const busy = Boolean(inProgress || state.busy || state.pending || requests?.length || runtimeStatus?.type === 'active');
-    const unavailable = !local(hostId) || !manager || state.available !== true;
+    const unavailable = !local(hostId) || !manager || state.available === false;
     const disabled = busy || state.loading || unavailable;
+    const claudeAvailable = state.available === true || catalog.engines?.includes('claude') === true;
     const reason = !local(hostId) ? 'Claude Code is available for local chats only' : connectionError ?? state.error ?? (busy ? 'Wait for the current turn and approvals to finish' : 'Choose the engine for this chat');
     const mode = local(hostId) ? state.engineMode : 'codex';
     const change = selection => { changeSelection({ scope, threadId, hostId, manager }, selection).catch(() => {}); };
     const modePicker = jsx.jsxs('select', {
       'aria-label': 'Chat engine', 'data-testid': 'chat-engine-selector', value: mode, disabled, title: reason, style: selectStyle,
       onChange: event => change({ engineMode: event.target.value }),
-      children: [jsx.jsx('option', { value: 'codex', children: 'Only Codex' }), jsx.jsx('option', { value: 'claude', disabled: !local(hostId), children: 'Only Claude Code' }), jsx.jsx('option', { value: 'both', disabled: true, children: 'Codex + Claude Code (coming later)' })],
+      onFocus: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
+      onPointerDown: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
+      children: [jsx.jsx('option', { value: 'codex', children: 'Only Codex' }), jsx.jsx('option', { value: 'claude', disabled: !local(hostId) || !claudeAvailable, children: 'Only Claude Code' }), jsx.jsx('option', { value: 'both', disabled: true, children: 'Codex + Claude Code (coming later)' })],
     });
     const modelPicker = mode === 'claude' ? jsx.jsx('select', {
-      'aria-label': 'Claude Code model', 'data-testid': 'claude-model-selector', value: state.models.claude ?? 'default', disabled, title: 'Claude Code uses its own project/user permissions and per-tool approvals. The Codex permission selector applies only to Codex.', style: selectStyle,
+      'aria-label': 'Claude Code model', 'data-testid': 'claude-model-selector', value: state.models.claude ?? 'default', disabled: disabled || !claudeAvailable, title: 'Claude Code uses its own project/user permissions and per-tool approvals. The Codex permission selector applies only to Codex.', style: { ...selectStyle, maxWidth: 220 },
       onChange: event => change({ engineMode: 'claude', engineModel: event.target.value }),
-      children: CLAUDE_MODELS.map(model => jsx.jsx('option', { value: model, children: model === 'default' ? 'Claude default' : `Claude ${model[0].toUpperCase()}${model.slice(1)}` }, model)),
+      onFocus: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
+      onPointerDown: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
+      children: modelOptions(catalog, state.models.claude ?? 'default').map(model => jsx.jsx('option', { value: model.value, title: modelTitle(model), children: modelLabel(model) }, model.value)),
     }) : nativeModelPicker;
-    return jsx.jsxs('span', { className: 'flex min-w-0 items-center gap-1', 'data-cdx-engine-controls': true, children: [modePicker, modelPicker, state.error && local(hostId) ? jsx.jsx('span', { role: 'alert', title: state.error, style: { fontSize: 11, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: state.error }) : null] });
+    const refreshModels = (mode === 'claude' || catalog.modelListError) && local(hostId) ? jsx.jsx('button', { type: 'button', 'aria-label': 'Refresh Claude models', title: 'Refresh models', disabled: !manager || catalog.loading, style: { ...selectStyle, border: 'none', padding: '2px 4px' }, onClick: () => refreshCapabilities(manager, { hostId, threadId, cwd, force: true }), children: '↻' }) : null;
+    const errorStyle = { fontSize: 11, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+    const modelError = local(hostId) && catalog.modelListError ? jsx.jsx('span', { role: 'status', title: catalog.modelListError, style: errorStyle, children: `Model discovery: ${catalog.modelListError}` }) : null;
+    return jsx.jsxs('span', { className: 'flex min-w-0 items-center gap-1', 'data-cdx-engine-controls': true, children: [modePicker, modelPicker, refreshModels, modelError, state.error && local(hostId) ? jsx.jsx('span', { role: 'alert', title: state.error, style: errorStyle, children: state.error }) : null] });
   }
   function SourceBadge({ React, jsx, threadId, hostId, turnId, raw }) {
     const row = record(null, threadId, hostId);
@@ -239,7 +326,8 @@
   }
   globalThis.__cdxEngineModes = {
     Selector, SourceBadge, capture, requestFields, turnRequestFields, registerManager, noteStarted, observe,
-    permitsNativeMetadata, sourceFor, setDraftSelection, changeSelection, refreshThread,
+    permitsNativeMetadata, sourceFor, setDraftSelection, changeSelection, refreshThread, refreshCapabilities,
+    getCapabilities: (manager, context) => catalogRecord(manager, context).snapshot,
     getSnapshot: (scope, threadId, hostId) => record(scope, threadId, hostId).snapshot,
   };
 })();

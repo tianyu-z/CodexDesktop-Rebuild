@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { ClaudeEventNormalizer } from './claude-events.mjs';
 import { resolveClaudeEnvironment } from './claude-environment.mjs';
+import { ClaudeModelCatalog, assertClaudeModel } from './claude-models.mjs';
 
 const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const errorText = (error) => error instanceof Error ? error.message : String(error);
@@ -13,6 +14,17 @@ export class ClaudeAdapter {
     this.executablePath = executablePath;
     this.queryImpl = queryImpl;
     this.environment = environment;
+  }
+
+  async listModels(options) {
+    if (this.modelsClosed) throw new Error('Claude model catalog is closed.');
+    this.modelCatalog ??= new ClaudeModelCatalog({ executablePath: this.executablePath, environment: this.environment, queryImpl: this.queryImpl });
+    return await this.modelCatalog.list(options);
+  }
+
+  async close() {
+    this.modelsClosed = true;
+    await this.modelCatalog?.close();
   }
 
   start(options) {
@@ -174,6 +186,7 @@ export class ClaudeAdapter {
       try {
         if (!interrupted) {
           if (typeof options.prompt !== 'string' || typeof options.cwd !== 'string' || !options.cwd) throw new TypeError('Claude requires a prompt string and working directory.');
+          if (options.model !== undefined) assertClaudeModel(options.model);
           const queryImpl = this.queryImpl ?? (await import('@anthropic-ai/claude-agent-sdk')).query;
           if (!interrupted) {
             const prompt = (async function* () {

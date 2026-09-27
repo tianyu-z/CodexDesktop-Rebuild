@@ -3,6 +3,7 @@ import { writeFileSync, statSync, realpathSync } from 'node:fs';
 import { assertEngine } from './store.mjs';
 import { buildHandoff, inputText, publicHistory } from './handoff.mjs';
 import { page, presentItem, presentTurn, toolItem } from './codex-events.mjs';
+import { assertClaudeModel } from './claude-models.mjs';
 
 const now = () => Math.floor(Date.now() / 1000);
 const messageOf = error => error instanceof Error ? error.message : String(error);
@@ -24,7 +25,9 @@ export class EngineRouter {
   notify(method, params) { this.emit({ method, params }); }
   request(method, params = {}) {
     const id = params.threadId;
-    if (!id) return this.dispatch(method, params);
+    // Read-only catalog discovery can wait on a subprocess. It must not queue
+    // a user's interrupt or next submission behind that independent work.
+    if (!id || method === 'engine/capabilities') return this.dispatch(method, params);
     // Reserve submission before awaiting native I/O. Approval responses use the
     // separate response path and cannot deadlock behind a pending turn request.
     const previous = this.locks.get(id) ?? Promise.resolve();
@@ -105,7 +108,20 @@ export class EngineRouter {
   async dispatch(method, params) {
     this.assertOpen();
     const id = params.threadId;
-    if (method === 'engine/capabilities') return { engines: ['codex', 'claude'], bothAvailable: false, claudeModels: ['default', 'sonnet', 'opus', 'haiku'], localOnly: true };
+    if (method === 'engine/capabilities') {
+      let claudeModels = [], modelListError = null;
+      try {
+        let cwd = id ? this.store.get(id)?.cwd : params.cwd;
+        if (id && !cwd) cwd = (await this.native.request('thread/read', { threadId: id, includeTurns: false })).thread.cwd;
+        claudeModels = await this.adapter.listModels({ cwd, refresh: params.refresh === true });
+      } catch {
+        // Provider/native error text can contain credentials; keep it out of UI
+        // metadata, and let users continue with a saved model while retrying.
+        modelListError = 'Could not load Claude models. Refresh models to retry.';
+      }
+      return { engines: ['codex', 'claude'], bothAvailable: false, claudeModels, modelListError, localOnly: true };
+    }
+    if (params.engineModel !== undefined && (params.engineMode === 'claude' || (params.engineMode == null && id && this.store.get(id)?.mode === 'claude'))) assertClaudeModel(params.engineModel);
     if (method === 'engine/turns/read') { if (!this.store.get(id)) await this.hydrate(id); return { turns: this.state(id).turnEngines }; }
     if (method === 'engine/mode/read') { if (!this.store.get(id)) await this.hydrate(id); return this.state(id); }
     if (method === 'engine/mode/set') {
@@ -386,7 +402,12 @@ export class EngineRouter {
     this.emit(message);
   }
   async close() {
+    if (this.closing) return this.closing;
     this.closed = true;
-    await Promise.all([...this.runs.values()].map(async run => { run.controller.abort(); this.cancelApprovals(run.id); await run.adapterRun?.interrupt(); await run.done; }));
+    this.closing = Promise.all([
+      this.adapter.close?.(),
+      ...[...this.runs.values()].map(async run => { run.controller.abort(); this.cancelApprovals(run.id); await run.adapterRun?.interrupt(); await run.done; }),
+    ]);
+    await this.closing;
   }
 }

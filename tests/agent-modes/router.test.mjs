@@ -16,6 +16,60 @@ function fixture(t) {
   t.after(async()=>{await router.close();rmSync(dir,{recursive:true,force:true});});return {dir,thread,calls,events,runs,store,router};
 }
 async function start(f,engineMode='codex'){return f.router.request('thread/start',{cwd:f.dir,engineMode,model:'codex-model',agentMode:'guardian-approvals'});}
+test('capabilities discover exact models in the chat workspace and carry explicit refresh', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  const models = ['claude-opus-4-8', 'claude-opus-4-6', 'claude-opus-5', 'claude-opus-5-5'].map(value => ({ value, resolvedModel: value, displayName: value, description: 'From Claude Code' }));
+  let request;
+  f.router.adapter.listModels = async options => { request = options; return models; };
+  const result = await f.router.request('engine/capabilities', { threadId: 'thread-1', cwd: '/wrong-workspace', refresh: true });
+  assert.deepEqual(result.claudeModels, models);
+  assert.deepEqual(request, { cwd: f.dir, refresh: true });
+  assert.equal(result.modelListError, null);
+  assert.equal(f.runs.length, 0);
+  assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 0);
+});
+test('model discovery failure keeps engines available and does not expose provider errors', async t => {
+  const f = fixture(t);
+  f.router.adapter.listModels = async () => { throw Error('sensitive-provider-token'); };
+  const result = await f.router.request('engine/capabilities', {});
+  assert.deepEqual(result.engines, ['codex', 'claude']);
+  assert.deepEqual(result.claudeModels, []);
+  assert.match(result.modelListError, /refresh|retry/i);
+  assert.ok(!JSON.stringify(result).includes('sensitive-provider-token'));
+});
+test('exact Claude model identifiers reach the adapter without alias conversion', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  for (const model of ['claude-opus-4-8', 'claude-opus-4-6', 'claude-opus-5', 'claude-opus-5-5']) {
+    await f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: model });
+    await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] });
+    await tick();
+    const run = f.runs.at(-1); assert.equal(run.options.model, model);
+    run.finish({ status: 'completed', nativeSessionId: 'cc' }); await tick();
+  }
+});
+test('invalid Claude IDs are rejected before creating a native thread or changing selection', async t => {
+  const f = fixture(t);
+  await assert.rejects(f.router.request('thread/start', { cwd: f.dir, engineMode: 'claude', engineModel: '--dangerously-skip-permissions' }), /model/i);
+  assert.equal(f.calls.length, 0);
+  await start(f, 'claude');
+  await assert.rejects(f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'bad\nmodel' }), /model/i);
+  assert.equal(f.store.get('thread-1').models.claude, 'default');
+});
+test('router shutdown closes pending model discovery alongside active runs', async t => {
+  const f = fixture(t); let closed = 0;
+  f.router.adapter.close = async () => { closed++; };
+  await f.router.close(); assert.equal(closed, 1);
+});
+test('slow model discovery never blocks interrupting an active Claude turn', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  const { turn } = await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] }); await tick();
+  let release;
+  f.router.adapter.listModels = () => new Promise(resolve => { release = resolve; });
+  const catalog = f.router.request('engine/capabilities', { threadId: 'thread-1' }); await tick();
+  const interrupted = f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: turn.id });
+  try { await tick(); assert.equal(f.runs[0].options.signal.aborted, true); }
+  finally { release([]); await Promise.all([catalog, interrupted]); }
+});
 test('mode is scoped to thread; native parameters retain permission agentMode',async t=>{const f=fixture(t);await start(f,'claude');assert.equal(f.store.get('thread-1').mode,'claude');assert.equal(f.calls[0].params.agentMode,'guardian-approvals');assert.equal(f.calls[0].params.engineMode,undefined);assert.equal(f.calls[0].params.model,undefined);await assert.rejects(()=>f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'both'}),/not implemented/);assert.equal(f.store.get('thread-1').mode,'claude');});
 test('Claude start never starts Codex inference; completion persists before notification',async t=>{const f=fixture(t);await start(f,'claude');const {turn}=await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'hello'}],model:'wrong-codex-model'});await tick();assert.equal(f.runs.length,1);assert.equal(f.runs[0].options.model,undefined);assert.equal(f.runs[0].options.prompt,'hello');assert.equal(f.calls.filter(c=>c.method==='turn/start').length,0);await assert.rejects(()=>f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'codex'}),/active/);f.runs[0].options.onEvent({type:'session',sessionId:'claude-session'});f.runs[0].options.onEvent({type:'message-start',id:'text-1'});f.runs[0].options.onEvent({type:'text-delta',id:'text-1',delta:'answer'});f.runs[0].options.onEvent({type:'message-completed',id:'text-1',text:'answer'});f.runs[0].finish({status:'completed',nativeSessionId:'claude-session'});await tick();const record=new ConversationStore(f.dir).get('thread-1');assert.equal(record.turns[0].turn.id,turn.id);assert.equal(record.turns[0].turn.status,'completed');assert.equal(record.turns[0].turn.items[1].text,'answer');assert.equal(record.activeRun,null);assert.ok(f.events.some(e=>e.method==='turn/completed'));});
 test('mixed history survives read, resume, pagination and switching context both ways',async t=>{const f=fixture(t);await start(f);f.thread.turns=[{id:'old-codex',status:'completed',items:[{id:'a',type:'agentMessage',text:'codeword violet'}]}];await f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'claude'});const {turn}=await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'remember amber'}]});await tick();assert.match(f.runs[0].options.prompt,/violet/);f.runs[0].options.onEvent({type:'message-completed',id:'b',text:'amber stored'});f.runs[0].finish({status:'completed',nativeSessionId:'cc'});await tick();for(const method of ['thread/read','thread/resume']){const result=await f.router.request(method,{threadId:'thread-1',includeTurns:true});assert.deepEqual(result.thread.turns.map(x=>x.id),['old-codex',turn.id]);}const p1=await f.router.request('thread/turns/list',{threadId:'thread-1',limit:1,sortDirection:'asc'});const p2=await f.router.request('thread/turns/list',{threadId:'thread-1',limit:1,sortDirection:'asc',cursor:p1.nextCursor});assert.equal(p2.data[0].id,turn.id);const reverse=await f.router.request('thread/turns/list',{threadId:'thread-1',sortDirection:'desc',cursor:p2.backwardsCursor});assert.equal(reverse.data[0].id,turn.id);const items=await f.router.request('thread/items/list',{threadId:'thread-1',turnId:turn.id});assert.equal(items.data[1].item.text,'amber stored');await f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'codex'});await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'continue'}]});assert.equal(f.runs.length,1);assert.match(f.calls.find(c=>c.method==='turn/start').params.input[0].text,/amber stored/);});
