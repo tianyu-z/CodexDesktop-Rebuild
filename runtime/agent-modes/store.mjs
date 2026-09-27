@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 const clone = value => structuredClone(value);
 const engines = new Set(['codex', 'claude']);
@@ -176,7 +177,7 @@ export class ConversationStore {
 
   finishRun(id, runId) {
     const value = this.require(id);
-    if (value.activeRun?.id !== runId) throw new Error('Run ownership mismatch.');
+    if (value.activeRun?.id !== runId || !engines.has(value.activeRun.engine)) throw new Error('Run ownership mismatch.');
     value.activeRun = null;
     this.save(value);
   }
@@ -238,12 +239,16 @@ export class ConversationStore {
     if (!Number.isSafeInteger(run.attempt) || run.attempt < 1 || !Number.isSafeInteger(run.round) || run.round < 0 || !runStates.has(run.status)) throw new Error('Invalid role run attempt, round or state.');
     const expectedModel = row.workflow.config.models[run.engine];
     if (run.requestedModel != null && expectedModel != null && run.requestedModel !== expectedModel) throw new Error('Run model ownership mismatch.');
+    const role = row.workflow.config.template.roles?.[run.roleId];
+    if (role && role.engine !== run.engine) throw new Error('Role engine ownership mismatch.');
     const index = row.runs.findIndex(current => current.id === run.id);
+    const previousAttempts = row.runs.filter(previous => roleAttemptKey(previous) === roleAttemptKey(run));
+    if (previousAttempts.some(previous => previous.engine !== run.engine || previous.requestedModel !== run.requestedModel)) throw new Error('Retry engine/model ownership mismatch.');
     if (index < 0 && row.runs.some(previous => roleAttemptKey(previous) === roleAttemptKey(run) && previous.attempt >= run.attempt)) throw new Error('Duplicate or stale role attempt.');
     if (index >= 0) {
       const previous = row.runs[index];
       if (['engine', 'roleId', 'stepId', 'attempt', 'round', 'requestedModel'].some(key => previous[key] !== run[key])) throw new Error('Run ownership mismatch.');
-      if (terminalRuns.has(previous.status) && previous.status !== run.status) throw new Error('A settled run cannot change status; create a new attempt.');
+      if (terminalRuns.has(previous.status) && !isDeepStrictEqual(previous, run)) throw new Error('A settled run is immutable; create a new attempt.');
     }
     const snapshot = clone(run);
     if (index < 0) row.runs.push(snapshot); else row.runs[index] = snapshot;
@@ -275,7 +280,7 @@ export class ConversationStore {
     const value = this.require(id), previous = Object.hasOwn(value.roleBindings, key) ? value.roleBindings[key] : null;
     const engine = patch.engine ?? previous?.engine; assertEngine(engine);
     if (previous && engine !== previous.engine) throw new Error('Role binding engine ownership mismatch.');
-    if (patch.consumedSeq != null && (!Number.isInteger(patch.consumedSeq) || patch.consumedSeq < (previous?.consumedSeq ?? 0))) throw new Error('Context cursor must advance monotonically.');
+    if (Object.hasOwn(patch, 'consumedSeq') && (!Number.isSafeInteger(patch.consumedSeq) || patch.consumedSeq < (previous?.consumedSeq ?? 0))) throw new Error('Context cursor must advance monotonically.');
     value.roleBindings[key] = { consumedSeq: 0, ...previous, ...clone(patch), engine };
     this.save(value);
   }

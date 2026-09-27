@@ -58,3 +58,21 @@ test('public handoff preserves image references, web results and completed colla
   const text=buildHandoff(value,'claude').text;
   assert.match(text,/diagram.png/);assert.match(text,/pixels.*not transferred/);assert.match(text,/https:\/\/example.com/);assert.match(text,/public conclusion/);
 });
+
+test('dual handoff preserves role outcomes and partial failure attribution without private events', () => {
+  const c = conversation();
+  c.turns.push({ seq: 3, engine: 'both', workflow: { events: [{ type: 'reasoning', text: 'private-dual-reasoning' }] }, runs: [
+    { id: 'c', engine: 'codex', roleId: 'answer', stepId: 'answers.codex', round: 0, attempt: 1, status: 'completed', requestedModel: 'codex-x', text: 'Codex public answer' },
+    { id: 'a', engine: 'claude', roleId: 'answer', stepId: 'answers.claude', round: 0, attempt: 1, status: 'failed', requestedModel: 'claude-y', text: 'Partial Claude answer' },
+  ], turn: { id: 'dual', status: 'failed', items: [
+    { type: 'userMessage', content: [{ type: 'text', text: 'Compare' }] },
+    { type: 'agentMessage', text: 'Codex public answer', cdxRunId: 'c', cdxEngineSource: 'codex', cdxRoleId: 'answer' },
+  ] } });
+  const h = buildHandoff(c, 'codex');
+  assert.match(h.text, /engine codex; role answer/);
+  assert.match(h.text, /answers.claude.*status failed/);
+  assert.match(h.text, /Partial Claude answer/);
+  assert.equal(h.text.split('Codex public answer').length, 2);
+  assert.doesNotMatch(h.text, /private-dual-reasoning/);
+  assert.equal(h.throughSeq, 3);
+});

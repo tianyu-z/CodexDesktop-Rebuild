@@ -179,3 +179,19 @@ test('model selections reject trailing whitespace before mutating the chat', () 
   assert.throws(() => store.beginWorkflow('chat', { id: 'bad', turn: inputTurn('bad'), config: invalid }), /model/i);
   assert.deepEqual(store.get('chat'), before);
 });
+
+test('nullable role cursors, cross-engine retries and legacy finish cannot break workflow ownership', () => {
+  const { store } = setup();
+  store.setRoleBinding('chat', 'role', { engine: 'codex', consumedSeq: 9 });
+  assert.throws(() => store.setRoleBinding('chat', 'role', { consumedSeq: null }), /cursor/i);
+  assert.equal(store.get('chat').roleBindings.role.consumedSeq, 9);
+  start(store);
+  const failed = { ...roleRun(), status: 'failed', text: 'retained', error: 'original' };
+  store.putWorkflowRun('chat', 'workflow', failed);
+  assert.throws(() => store.putWorkflowRun('chat', 'workflow', { ...failed, text: 'overwritten' }), /settled|immutable/i);
+  assert.doesNotThrow(() => store.putWorkflowRun('chat', 'workflow', failed));
+  assert.throws(() => store.putWorkflowRun('chat', 'workflow', { ...failed, id: 'wrong-engine', engine: 'claude', requestedModel: 'claude-selected', attempt: 2, status: 'running' }), /ownership/i);
+  assert.throws(() => store.finishRun('chat', 'workflow'), /ownership|workflow/i);
+  assert.equal(store.get('chat').activeTurn.id, 'workflow');
+  assert.equal(store.get('chat').turns[0].runs[0].text, 'retained');
+});

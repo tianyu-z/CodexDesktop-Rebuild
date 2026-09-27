@@ -36,8 +36,20 @@ function publicItem(item) {
 
 export function publicHistory(conversation, afterSeq = 0) {
   return conversation.turns.filter(row => row.seq > afterSeq).map(row => {
-    const items = row.turn.items.map(publicItem).filter(Boolean).join('\n\n');
-    return `[Turn ${row.seq}; engine ${row.engine}; status ${row.turn.status}]\n${items}`;
+    const items = row.turn.items.map(item => {
+      const text = publicItem(item);
+      if (!text || !item.cdxRunId) return text;
+      return `[Run ${item.cdxRunId}; engine ${item.cdxEngineSource}; role ${item.cdxRoleId}]\n${text}`;
+    }).filter(Boolean);
+    if (row.engine === 'both') for (const run of row.runs ?? []) {
+      const header = `[Run ${run.id}; engine ${run.engine}; role ${run.roleId}; step ${run.stepId}; round ${run.round}; attempt ${run.attempt}; status ${run.status}; requested model ${run.requestedModel ?? 'default'}; actual model ${run.actualModel ?? 'unknown'}]`;
+      // Only public outcomes belong in a handoff. Never serialize native event
+      // envelopes, private reasoning, settings, or internal session metadata.
+      const displayed = row.turn.items.some(item => item.cdxRunId === run.id && item.type === 'agentMessage' && item.text);
+      const outcome = !displayed ? run.text || (run.structuredOutput ? JSON.stringify(run.structuredOutput) : '') : '';
+      items.push(`${header}${outcome ? `\n${outcome}` : ''}`);
+    }
+    return `[Turn ${row.seq}; engine ${row.engine}; status ${row.turn.status}]\n${items.join('\n\n')}`;
   }).join('\n\n');
 }
 
