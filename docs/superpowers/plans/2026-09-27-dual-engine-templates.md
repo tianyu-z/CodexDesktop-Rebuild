@@ -158,6 +158,6 @@ Files: create `tests/agent-modes/live-dual.mjs`; update `docs/agent-modes.md` an
 
 ## Review and execution notes
 
-Use one implementation agent at a time for a bounded task, then independent spec and quality review. The controller may perform read-only capability research while a task is running. Reuse the active worktree and preserve the published previous version. Do not push unfinished implementation merely because previous-version publishing was authorized; current task is to make and verify the feature locally.
+Use independently scoped implementers, then independent spec and quality review. Tasks 2 (native runners) and 3 (Git workspaces) have no dependency on each other and own disjoint source/tests: execute them concurrently under dispatching-parallel-agents, with commits serialized by the controller. Do not begin dependent scheduler/router integration until their reviews pass. The controller may perform capability research while implementation runs. Reuse the active worktree and preserve the published previous version. Do not push unfinished implementation merely because previous-version publishing was authorized; current task is to make and verify the feature locally.
 
 All six tasks are necessary for the requested first release. The task is not complete when only the selector or Debby works.
