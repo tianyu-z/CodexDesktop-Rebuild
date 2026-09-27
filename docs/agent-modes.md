@@ -115,7 +115,7 @@ node tests/agent-modes/live-permissions.mjs
 
 最终源代码及包内 adapter 均已实际读取到上述完整目录；安装包与预览包的运行时文件逐个与源文件核对，签名严格校验通过。记录见 `.artifacts/provider-catalog-release-verification.json`，也记录了首次包内完整目录断言未通过、未改代码复查成功的情况。
 
-提供方目录这一增量尚未通过最新界面验收：尝试打开预览应用时，系统报告 Mac 已锁定且无法自动解锁。上述 17 选项的界面证据属于此前 SDK 版本，不能当作本次 30 选项的界面验收。当前安装版仍是连接配置更新版，尚未安装动态模型修复。
+2026-09-27 21:04 UTC 已将提供方目录修复安装到实际使用的 `/Applications/chatgpt-dev.app` 并重新启动。在本地 New project 10 的 Only Claude Code 模式中，实际下拉框显示 30 个不同的模型选项；Opus 4.5 和 Opus 5.5 均已通过实际选择验证，最后停留在 Opus 5.5。证据见 `.artifacts/installed-model-catalog-gui.json`。此前的锁屏阻塞已解除；上述 17 选项的证据仅属于早期 SDK 版本。
 
 ## 安装与回退
 
@@ -127,7 +127,7 @@ node tests/agent-modes/live-permissions.mjs
 
 安装包和备份的 ASAR 哈希已核对，已安装应用的签名校验通过。连接配置更新版已于 2026-09-27 重新安装，上一版另有备份，原应用备份仍保留。安装记录保存在工作目录 `.artifacts/engine-install-manifest.json`，包含备份位置、安装时间和 ASAR 哈希。
 
-动态模型修复包已构建为 `.artifacts/chatgpt-dev-engines.app`，签名验证通过；ASAR SHA-256 为 `b32ea490ea4f8b4e252374a2638c8d344b2d2bab0216ecd59c1fb3826fc903f5`。当前安装版另有运行中的任务，因此尚未替换或重启。待安装记录及旧版备份位置见 `.artifacts/model-picker-install-pending.json`。
+动态模型修复包 `.artifacts/chatgpt-dev-engines.app` 已完成安装；ASAR SHA-256 为 `b32ea490ea4f8b4e252374a2638c8d344b2d2bab0216ecd59c1fb3826fc903f5`，13 个运行时文件与验证包逐一一致，安装后的严格签名校验通过。本次替换前确认本地网关无活动轮次，旧应用和网关退出后才更换文件；实际旧应用完整保存在 `/Users/tianyu.zhang/.codex/backups/agent-modes/2026-09-27T21-03-02.342Z/chatgpt-dev.app`。安装及界面验收记录见 `.artifacts/engine-install-manifest.json`；`.artifacts/model-picker-install-pending.json` 的状态已更新为 `installed`。
 
 回退时先退出 `chatgpt-dev`，将当前应用移到另一个保留位置，再把记录中的原应用备份复制回 `/Applications/chatgpt-dev.app`。保留 `engine-conversations` 数据目录；回退后原版界面不会显示 Claude 的附加历史，再次安装补丁后可恢复。回退不要求删除或改写原生 Codex 历史。
 
