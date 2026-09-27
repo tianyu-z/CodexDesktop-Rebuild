@@ -39,7 +39,11 @@ Claude 使用自己的用户、项目、本地配置和工具权限策略。Code
 
 ## Claude 模型列表
 
-Claude 下拉列表通过当前安装的 Claude Code / 官方 Agent SDK 的 `supportedModels()` 读取，使用同一连接配置；已有聊天按其工作目录读取。列表加载不会发送聊天提示词或调用模型推理。前端和运行时短暂缓存结果，点击模型栏旁的刷新按钮可重新读取。
+Claude 下拉列表以当前提供方的 API 目录为准，使用同一连接配置；已有聊天按其工作目录读取。本机 Foundry 网关的目录位于 `/openai/v1/models`，其中同时包含多种模型，Claude 栏提取适用的 Claude 条目，不按 Opus / Sonnet 的已知版本建立白名单。标准 Anthropic 模型目录使用 `/v1/models`，保留该协议返回的合法自定义 ID。支持目录分页和按原始 ID 去重。
+
+目录请求保留提供方的自定义请求头，并通过 SDK 的 `resolveSettings()` 读取用户、项目、本地及受管设置的有效环境，按 CLI 的覆盖顺序应用；这些连接配置也参与缓存身份，修改项目提供方后不会复用另一提供方的目录。隔离的真实 CLI 实验已验证项目 endpoint/key 覆盖及只覆盖 endpoint 时保留原 key 的行为。直接 HTTP 目录使用静态环境配置，不额外调用凭据命令；SDK 元数据查询仍遵循 Claude 自己的初始化流程。SDK 的 `resolveSettings()` 不运行 `policyHelper`，依赖动态受管环境注入的场景尚未验证。
+
+官方 Agent SDK 的 `supportedModels()` 补充 Default、别名及上下文选项；API 目录成功时，不把 SDK 中 API 未报告的普通版本重新当作可用型号加入。API 不支持目录读取或请求失败时，可以回退到 SDK 选项，但会明确提示它可能不完整。列表加载不会发送聊天提示词或调用模型推理。前端和运行时短暂缓存结果，点击模型栏旁的刷新按钮可重新读取。
 
 具体版本使用列表返回的原始 ID，不转换成 `opus` 等浮动别名。例如本机在 2026-09-27 返回且已成功调用的版本：
 
@@ -50,9 +54,11 @@ Claude 下拉列表通过当前安装的 Claude Code / 官方 Agent SDK 的 `sup
 | Opus 5 | `claude-opus-5` |
 | Opus 5.5 | `claude-opus-5-5` |
 
-界面显示具体版本，选项提示中保留准确 ID 和说明。`Default` 跟随 Claude 的默认设置，历史会话保存的别名保持原样；需要固定版本时选择对应的具体版本。列表加载失败会显示错误并允许刷新，不会偷偷改变已保存的模型选择。列表是 Claude Code 对当前配置报告的模型选项；其他账号或提供方的实际访问权限可能不同。
+界面显示具体版本，选项提示中保留准确 ID 和说明。`Default` 跟随 Claude 的默认设置，历史会话保存的别名保持原样；需要固定版本时选择对应的具体版本。列表加载失败会显示错误并允许刷新，不会偷偷改变已保存的模型选择。
 
-初版只显示四个固定别名，这属于模型发现未接完整的缺陷；当前修复使用动态列表，并允许保存原始的具体模型 ID。
+2026-09-27 的 API 目录返回 459 条记录，其中有 22 个不同的 Claude ID，包含 SDK 原来漏掉的 Opus 4.5、日期版本和其他发布 ID。已用最小真实请求确认 Opus 4.5 可以调用；也发现目录报告的 `claude-haiku-4-5-2` 在 Anthropic 请求路径返回 404。因此，“API 报告的模型”不等于“已逐一验证当前账号可调用”：保留目录的原始型号和生命周期信息，不猜测删除或改写发布后缀，也不自动把失败请求切换为别的型号。目录元数据标记 `advertised`，不声称每个条目已经完成推理测试。
+
+初版只显示四个固定别名；第一次修复仅接入 SDK 的 17 个选项，仍不能保证覆盖 API 目录。本次进一步接入真实提供方目录，并允许保存原始的具体模型 ID。
 
 ## 维护入口
 
@@ -62,6 +68,7 @@ Claude 下拉列表通过当前安装的 Claude Code / 官方 Agent SDK 的 `sup
 - `claude-adapter.mjs` / `claude-events.mjs`：官方 SDK 与事件转换。
 - `claude-environment.mjs`：按轮次读取 VS Code Insiders 的连接环境，不持久化凭据。
 - `claude-models.mjs`：读取原生模型目录，处理刷新、缓存和查询进程退出。
+- `claude-provider-models.mjs`：读取提供方目录、分页、协议兼容筛选和目录来源说明；不跨域传递凭据。
 - `scripts/patch-agent-modes.js` / `scripts/assets/agent-modes-ui.js`：版本绑定的前端补丁与独立界面逻辑。
 - `scripts/build-agent-modes-preview.js`：复制应用、打包 ASAR、更新完整性哈希、签名并验证。
 
@@ -100,9 +107,15 @@ node tests/agent-modes/live-smoke.mjs --claude
 node tests/agent-modes/live-permissions.mjs
 ```
 
-当前验证：147 项自动化测试通过，覆盖流式事件、SDK 契约、配置隔离、审批归属、取消通知、退出清理、异步响应竞态、重启、分页、模式重试、动态模型目录、RPC 代理边界和补丁幂等。真实 Foundry Claude 推理成功，连接配置安装版界面返回 `CLAUDE_DESKTOP_OK`，该轮只有 Claude 执行；同一会话 Codex → Claude → Codex 的双向事实回忆、文件读取、网关重启和历史分页通过。真实 Bash 权限允许后写入成功，拒绝后没有写入，取消待审批任务后未写入且拥有的 Claude 进程退出。预览版界面已验证错误结束后控件恢复、原会话切换到 Codex、回复引擎标记，以及应用重启后的混合历史和模式恢复。
+当前验证：172 项自动化测试通过，覆盖流式事件、SDK 契约、配置隔离、审批归属、取消通知、退出清理、异步响应竞态、重启、分页、模式重试、提供方目录分页和凭据隔离、项目连接配置覆盖、自定义代理请求头、动态模型目录、RPC 代理边界和补丁幂等。真实 Foundry Claude 推理成功，连接配置安装版界面返回 `CLAUDE_DESKTOP_OK`，该轮只有 Claude 执行；同一会话 Codex → Claude → Codex 的双向事实回忆、文件读取、网关重启和历史分页通过。真实 Bash 权限允许后写入成功，拒绝后没有写入，取消待审批任务后未写入且拥有的 Claude 进程退出。预览版界面已验证错误结束后控件恢复、原会话切换到 Codex、回复引擎标记，以及应用重启后的混合历史和模式恢复。
 
 动态模型修复的预览版已实际加载 17 个选项，逐一选中 Opus 4.8、4.6、5、5.5；Opus 5.5 在界面返回 `MODEL_PICKER_OPUS55_OK`，后台只有一个已完成的 Claude 轮次，保存的模型为 `claude-opus-5-5`。刷新窗口后选择仍保持。四个具体 ID 也分别通过真实推理验证，返回的实际使用模型与请求一致。一次性界面测试会话已归档。证据保存在 `.artifacts/model-picker-gui.json`、`.artifacts/explicit-model-live.json` 和 `.artifacts/agent-modes-tests-model-picker.log`。
+
+进一步接入提供方目录后，真实 adapter 的 `listModelCatalog()` 返回 `source: provider-api+sdk`、`apiStatus: success`、22 个去重的 API 模型，合并为 30 个选项，且没有回退警告。证据保存在 `.artifacts/live-provider-adapter-catalog.json`、`.artifacts/provider-catalog-validation.json` 和 `.artifacts/agent-modes-tests-provider-catalog.log`。
+
+最终源代码及包内 adapter 均已实际读取到上述完整目录；安装包与预览包的运行时文件逐个与源文件核对，签名严格校验通过。记录见 `.artifacts/provider-catalog-release-verification.json`，也记录了首次包内完整目录断言未通过、未改代码复查成功的情况。
+
+提供方目录这一增量尚未通过最新界面验收：尝试打开预览应用时，系统报告 Mac 已锁定且无法自动解锁。上述 17 选项的界面证据属于此前 SDK 版本，不能当作本次 30 选项的界面验收。当前安装版仍是连接配置更新版，尚未安装动态模型修复。
 
 ## 安装与回退
 

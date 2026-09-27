@@ -45,6 +45,19 @@ test('explicit process provider config wins as a group, without mixing its key w
   }
 });
 
+test('alternate provider selectors preserve their environment without importing Foundry credentials', t => {
+  const { settingsPath } = fixture(t, foundry);
+  for (const flag of ['CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD', 'CLAUDE_CODE_USE_GATEWAY', 'CLAUDE_CODE_USE_ANTHROPIC_AWS', 'CLAUDE_CODE_USE_MANTLE']) {
+    const baseEnv = { [flag]: '1' };
+    assert.deepEqual(resolveClaudeEnvironment({ baseEnv, settingsPath }), baseEnv);
+  }
+});
+
+test('editor API custom headers are part of its connection configuration', t => {
+  const { settingsPath } = fixture(t, [...foundry, { name: 'ANTHROPIC_CUSTOM_HEADERS', value: 'X-User: fixture-user' }]);
+  assert.equal(resolveClaudeEnvironment({ baseEnv: {}, settingsPath }).ANTHROPIC_CUSTOM_HEADERS, 'X-User: fixture-user');
+});
+
 test('supports editor JSONC and imports only connection/model settings', t => {
   const { settingsPath, write } = fixture(t);
   write(`{

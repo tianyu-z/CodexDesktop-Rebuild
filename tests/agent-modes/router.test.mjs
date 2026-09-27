@@ -37,6 +37,18 @@ test('model discovery failure keeps engines available and does not expose provid
   assert.match(result.modelListError, /refresh|retry/i);
   assert.ok(!JSON.stringify(result).includes('sensitive-provider-token'));
 });
+test('capabilities expose provider catalog metadata and SDK fallback warning without breaking model arrays', async t => {
+  const f = fixture(t);
+  const models = [{ value: 'claude-fable-50', displayName: 'Future Claude', description: 'API advertised model; not individually verified.' }];
+  const metadata = { source: 'sdk-fallback', apiStatus: 'failed', provider: 'foundry', endpointPath: '/openai/v1/models', apiModelCount: 0, sdkModelCount: 1, advertised: true, warning: 'Provider API unavailable; SDK options may be incomplete.' };
+  let request;
+  f.router.adapter.listModelCatalog = async options => { request = options; return { models, ...metadata }; };
+  const result = await f.router.request('engine/capabilities', { cwd: f.dir, refresh: true });
+  assert.deepEqual(result.claudeModels, models);
+  assert.deepEqual(result.modelCatalog, metadata);
+  assert.equal(result.modelListError, metadata.warning);
+  assert.deepEqual(request, { cwd: f.dir, refresh: true });
+});
 test('exact Claude model identifiers reach the adapter without alias conversion', async t => {
   const f = fixture(t); await start(f, 'claude');
   for (const model of ['claude-opus-4-8', 'claude-opus-4-6', 'claude-opus-5', 'claude-opus-5-5']) {

@@ -109,17 +109,23 @@ export class EngineRouter {
     this.assertOpen();
     const id = params.threadId;
     if (method === 'engine/capabilities') {
-      let claudeModels = [], modelListError = null;
+      let claudeModels = [], modelListError = null, modelCatalog = null;
       try {
         let cwd = id ? this.store.get(id)?.cwd : params.cwd;
         if (id && !cwd) cwd = (await this.native.request('thread/read', { threadId: id, includeTurns: false })).thread.cwd;
-        claudeModels = await this.adapter.listModels({ cwd, refresh: params.refresh === true });
+        const options = { cwd, refresh: params.refresh === true };
+        if (typeof this.adapter.listModelCatalog === 'function') {
+          const { models, ...metadata } = await this.adapter.listModelCatalog(options);
+          claudeModels = models;
+          modelCatalog = metadata;
+          modelListError = metadata.warning ?? null;
+        } else claudeModels = await this.adapter.listModels(options);
       } catch {
         // Provider/native error text can contain credentials; keep it out of UI
         // metadata, and let users continue with a saved model while retrying.
         modelListError = 'Could not load Claude models. Refresh models to retry.';
       }
-      return { engines: ['codex', 'claude'], bothAvailable: false, claudeModels, modelListError, localOnly: true };
+      return { engines: ['codex', 'claude'], bothAvailable: false, claudeModels, modelListError, modelCatalog, localOnly: true };
     }
     if (params.engineModel !== undefined && (params.engineMode === 'claude' || (params.engineMode == null && id && this.store.get(id)?.mode === 'claude'))) assertClaudeModel(params.engineModel);
     if (method === 'engine/turns/read') { if (!this.store.get(id)) await this.hydrate(id); return { turns: this.state(id).turnEngines }; }

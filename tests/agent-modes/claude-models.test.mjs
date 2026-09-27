@@ -14,8 +14,182 @@ const rows = [
   ...['claude-opus-4-8', 'claude-opus-4-6', 'claude-sonnet-5', 'claude-sonnet-5-5', 'vendor/future-9.1:build+v2@[1m]'].map((value) => ({ value, displayName: value, description: '' })),
 ];
 function catalog(queryImpl, options = {}) {
-  return new ClaudeModelCatalog({ executablePath: '/fixture/claude', environment: () => ({ FIXTURE_PROVIDER: 'one' }), queryImpl, ...options });
+  return new ClaudeModelCatalog({ executablePath: '/fixture/claude', environment: () => ({ FIXTURE_PROVIDER: 'one' }), resolveSettingsImpl: async () => ({ effective: {} }), fetchImpl: async () => { throw new Error('No provider API fixture'); }, queryImpl, ...options });
 }
+
+const foundry = { CLAUDE_CODE_USE_FOUNDRY: '1', ANTHROPIC_FOUNDRY_BASE_URL: 'https://fixture.test/anthropic', ANTHROPIC_FOUNDRY_API_KEY: 'fixture-key' };
+
+test('API discovery follows effective project settings and invalidates cache when those settings change', async () => {
+  let projectEnv = { ANTHROPIC_FOUNDRY_BASE_URL: 'https://project.test/anthropic', ANTHROPIC_FOUNDRY_API_KEY: 'project-key' };
+  const requests = [];
+  const sdkRequests = {};
+  const models = catalog(metadataQuery(rows, sdkRequests), {
+    environment: () => foundry,
+    resolveSettingsImpl: async options => {
+      assert.equal(options.cwd, '/fixture/project');
+      assert.deepEqual(options.settingSources, ['user', 'project', 'local']);
+      return { effective: { env: projectEnv } };
+    },
+    fetchImpl: async (url, options) => { requests.push({ url, headers: options.headers }); return Response.json({ data: [{ id: 'claude-project-model' }] }); },
+  });
+  await models.listCatalog({ cwd: '/fixture/project' });
+  assert.equal(requests[0].url, 'https://project.test/openai/v1/models');
+  assert.equal(requests[0].headers['api-key'], 'project-key');
+  projectEnv = { ANTHROPIC_FOUNDRY_BASE_URL: 'https://second-project.test/anthropic' };
+  await models.listCatalog({ cwd: '/fixture/project' });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].url, 'https://second-project.test/openai/v1/models');
+  assert.equal(requests[1].headers['api-key'], 'fixture-key');
+  assert.deepEqual(sdkRequests.request.options.env, foundry);
+  await models.close();
+});
+
+test('unresolved settings fail safely without querying a potentially different provider', async () => {
+  let requests = 0;
+  const models = catalog(metadataQuery(rows), {
+    environment: () => foundry,
+    resolveSettingsImpl: async () => { throw new Error('fixture-secret from settings'); },
+    fetchImpl: async () => { requests += 1; return Response.json({ data: [] }); },
+  });
+  await assert.rejects(models.listCatalog(), error => /settings/i.test(error.message) && !error.message.includes('fixture-secret'));
+  assert.equal(requests, 0);
+  await models.close();
+});
+
+test('settings resolution times out before launching model discovery', async () => {
+  let launches = 0;
+  const models = catalog(() => { launches += 1; }, { timeoutMs: 20, resolveSettingsImpl: () => new Promise(() => {}) });
+  const pending = models.listCatalog().then(() => 'resolved', () => 'rejected');
+  const outcome = await Promise.race([pending, delay(100).then(() => 'still-pending')]);
+  await models.close();
+  assert.equal(outcome, 'rejected');
+  assert.equal(launches, 0);
+});
+
+test('close cancels pending settings resolution and prevents late discovery', async () => {
+  const settings = deferred();
+  let launches = 0;
+  const models = catalog(() => { launches += 1; }, { resolveSettingsImpl: () => settings.promise });
+  const pending = models.listCatalog().then(() => 'resolved', () => 'rejected');
+  await delay(0);
+  await models.close();
+  const outcome = await Promise.race([pending, delay(50).then(() => 'still-pending')]);
+  settings.resolve({ effective: {} });
+  await delay(0);
+  assert.equal(outcome, 'rejected');
+  assert.equal(launches, 0);
+});
+
+test('provider API models merge with SDK aliases/context options and expose advertised source metadata', async () => {
+  const sdk = [rows[0], { value: 'default', displayName: 'Default', description: 'Native default' }, { value: 'opus[1m]', resolvedModel: 'claude-opus-4-8', displayName: 'Opus 1M', description: 'Context option' }, rows[1]];
+  const models = catalog(metadataQuery(sdk), { environment: () => foundry, fetchImpl: async () => Response.json({ data: [{ id: 'claude-opus-4-8' }, { id: 'claude-opus-4-5', lifecycle_status: 'deprecated' }, { id: 'claude-haiku-4-5-2' }, { id: 'claude-future-family-90' }, { id: 'gpt-99' }] }) });
+  const result = await models.listCatalog();
+  assert.deepEqual(result.models.map(row => row.value), ['opus', 'default', 'opus[1m]', 'claude-opus-4-8', 'claude-opus-4-5', 'claude-haiku-4-5-2', 'claude-future-family-90']);
+  assert.equal(result.source, 'provider-api+sdk');
+  assert.equal(result.apiStatus, 'success');
+  assert.equal(result.provider, 'foundry');
+  assert.equal(result.endpointPath, '/openai/v1/models');
+  assert.equal(result.apiModelCount, 4);
+  assert.equal(result.sdkModelCount, 4);
+  assert.equal(result.advertised, true);
+  assert.equal(result.warning, null);
+  assert.match(result.models.find(row => row.value === 'claude-opus-4-5').description, /deprecated/);
+  assert.deepEqual(await models.list(), result.models);
+  await models.close();
+});
+
+test('API errors and unsupported providers preserve SDK fallback with an explicit incompleteness warning', async () => {
+  for (const env of [foundry, { CLAUDE_CODE_USE_BEDROCK: '1' }]) {
+    const models = catalog(metadataQuery(rows), { environment: () => env, fetchImpl: async () => { throw new Error('fixture-key must not be exposed'); } });
+    const result = await models.listCatalog();
+    assert.deepEqual(result.models, rows);
+    assert.equal(result.source, 'sdk-fallback');
+    assert.equal(result.apiStatus, env === foundry ? 'failed' : 'unsupported');
+    assert.match(result.warning, /SDK|incomplete/i);
+    assert.ok(!JSON.stringify(result).includes('fixture-key'));
+    await models.close();
+  }
+});
+
+test('successful API catalog controls concrete IDs while SDK adds aliases and mapped context options', async () => {
+  const sdk = [
+    { value: 'default', resolvedModel: 'claude-sdk-default', description: 'Native default' },
+    { value: 'opus', resolvedModel: 'claude-sdk-default' },
+    { value: 'claude-api-model', resolvedModel: 'claude-api-model', supportsEffort: true },
+    { value: 'claude-api-model[1m]', resolvedModel: 'claude-api-model[1m]' },
+    { value: 'custom[1m]', resolvedModel: 'claude-api-model[1m]' },
+    { value: 'claude-sdk-only', resolvedModel: 'claude-sdk-only' },
+    { value: 'claude-sdk-only[1m]', resolvedModel: 'claude-sdk-only[1m]' },
+    { value: 'opus[1m]', resolvedModel: 'claude-sdk-default[1m]' },
+  ];
+  const models = catalog(metadataQuery(sdk), { environment: () => foundry, fetchImpl: async () => Response.json({ data: [{ id: 'claude-api-model', lifecycle_status: 'deprecated' }] }) });
+  const result = await models.listCatalog();
+  assert.deepEqual(result.models.map(row => row.value), ['default', 'opus', 'claude-api-model', 'claude-api-model[1m]', 'custom[1m]']);
+  assert.equal(result.models[2].supportsEffort, true);
+  assert.match(result.models[2].description, /deprecated/);
+  assert.match(result.models[2].description, /not individually verified/);
+  assert.equal(result.apiModelCount, 1);
+  assert.equal(result.sdkModelCount, sdk.length);
+  await models.close();
+});
+
+test('SDK completion does not cancel an API request still reading the catalog', async () => {
+  const pending = deferred();
+  let apiSignal;
+  const models = catalog(metadataQuery(rows), { environment: () => foundry, fetchImpl: async (_url, { signal }) => {
+    apiSignal = signal;
+    await pending.promise;
+    signal.throwIfAborted();
+    return Response.json({ data: [{ id: 'claude-opus-4-5' }] });
+  } });
+  const request = models.listCatalog();
+  await delay(10);
+  assert.equal(apiSignal.aborted, false);
+  pending.resolve();
+  assert.equal((await request).apiStatus, 'success');
+  await models.close();
+});
+
+test('successful provider catalog remains available when SDK option discovery fails', async () => {
+  const models = catalog(metadataQuery(() => { throw new Error('SDK unavailable'); }), { environment: () => foundry, fetchImpl: async () => Response.json({ data: [{ id: 'claude-opus-4-5' }] }) });
+  const result = await models.listCatalog();
+  assert.equal(result.source, 'provider-api');
+  assert.equal(result.models[0].value, 'claude-opus-4-5');
+  assert.match(result.warning, /SDK/i);
+  await models.close();
+});
+
+test('provider timeout cancels HTTP work and returns explicit SDK fallback', async () => {
+  let apiSignal;
+  const models = catalog(metadataQuery(rows), { timeoutMs: 25, environment: () => foundry, fetchImpl: async (_url, { signal }) => {
+    apiSignal = signal;
+    return await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } });
+  const result = await models.listCatalog();
+  assert.equal(apiSignal.aborted, true);
+  assert.equal(result.apiStatus, 'failed');
+  assert.deepEqual(result.models, rows);
+  assert.match(result.warning, /incomplete/i);
+  await models.close();
+});
+
+test('catalog close cancels provider HTTP and SDK discovery together', async () => {
+  const apiStarted = deferred();
+  let apiSignal;
+  let sdkSignal;
+  const models = catalog(metadataQuery(request => { sdkSignal = request.options.abortController.signal; return new Promise(() => {}); }), { environment: () => foundry, fetchImpl: async (_url, { signal }) => {
+    apiSignal = signal;
+    apiStarted.resolve();
+    return await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } });
+  const request = models.listCatalog();
+  const rejected = assert.rejects(request, /closed/);
+  await apiStarted.promise;
+  await models.close();
+  await rejected;
+  assert.equal(apiSignal.aborted, true);
+  assert.equal(sdkSignal.aborted, true);
+});
 function metadataQuery(models = rows, observed = {}) {
   return (request) => {
     observed.calls = (observed.calls ?? 0) + 1;
@@ -261,7 +435,7 @@ test('close reports failure if its captured process cannot be terminated', async
 
 test('adapter exposes lazy model discovery and rejects invalid explicit models before startup', async () => {
   const observed = {};
-  const adapter = new ClaudeAdapter({ executablePath: '/fixture/claude', environment: () => ({ FIXTURE_PROVIDER: 'adapter' }), queryImpl: metadataQuery(rows, observed) });
+  const adapter = new ClaudeAdapter({ executablePath: '/fixture/claude', environment: () => ({ FIXTURE_PROVIDER: 'adapter' }), resolveSettingsImpl: async () => ({ effective: {} }), queryImpl: metadataQuery(rows, observed) });
   assert.equal(observed.calls, undefined);
   assert.deepEqual(await adapter.listModels({ cwd: '/adapter' }), rows);
   assert.equal(observed.request.options.env.FIXTURE_PROVIDER, 'adapter');

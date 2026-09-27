@@ -4,6 +4,7 @@ import { realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { resolveClaudeEnvironment } from './claude-environment.mjs';
+import { discoverProviderModels, providerCatalogInfo } from './claude-provider-models.mjs';
 
 const modelPattern = /^[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,255}$/;
 const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -35,6 +36,28 @@ function normalizeModels(value) {
     models.push(model);
   }
   return models;
+}
+
+function mergeModels(sdkModels, apiModels) {
+  const api = new Map(apiModels.map(model => [model.value, model]));
+  const merged = new Map();
+  const contextBase = value => value?.replace(/\[[^\]]+\]$/, '');
+  for (const model of sdkModels) {
+    const advertised = api.get(model.value);
+    const isContext = contextBase(model.value) !== model.value;
+    const isAlias = model.value === 'default' || (
+      model.resolvedModel && model.resolvedModel !== model.value &&
+      /^[A-Za-z][A-Za-z_-]*$/.test(model.value) && !/^claude(?:[-_]|$)/i.test(model.value)
+    );
+    const mappedContext = isContext && (api.has(contextBase(model.value)) || api.has(contextBase(model.resolvedModel)));
+    if (!advertised && !isAlias && !mappedContext) continue;
+    merged.set(model.value, advertised ? {
+      ...advertised, ...model,
+      description: [model.description, advertised.description].filter(Boolean).join(' '),
+    } : model);
+  }
+  for (const model of apiModels) if (!merged.has(model.value)) merged.set(model.value, model);
+  return [...merged.values()];
 }
 
 function discoveryIdentity(cwd, executablePath, env) {
@@ -114,44 +137,158 @@ class MetadataChild {
   }
 }
 
-/** Read model metadata through the SDK without submitting a model prompt. */
+/** Read provider catalogs and SDK options without submitting a model prompt. */
 export class ClaudeModelCatalog {
-  constructor({ executablePath = join(homedir(), '.local', 'bin', 'claude'), environment = resolveClaudeEnvironment, queryImpl, timeoutMs = 12000, cacheTtlMs = 60000 } = {}) {
+  constructor({ executablePath = join(homedir(), '.local', 'bin', 'claude'), environment = resolveClaudeEnvironment, queryImpl, resolveSettingsImpl, fetchImpl = globalThis.fetch, timeoutMs = 12000, cacheTtlMs = 60000 } = {}) {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isFinite(cacheTtlMs) || cacheTtlMs < 0) throw new TypeError('Invalid Claude model discovery timeout or cache duration.');
     this.executablePath = executablePath;
     this.environment = environment;
     this.queryImpl = queryImpl;
+    this.resolveSettingsImpl = resolveSettingsImpl;
+    this.fetchImpl = fetchImpl;
     this.timeoutMs = timeoutMs;
     this.cacheTtlMs = cacheTtlMs;
     this.cache = new Map();
     this.inFlight = new Map();
+    this.settingsInFlight = new Set();
     this.closed = false;
   }
 
-  async list({ cwd = homedir(), refresh = false } = {}) {
+  async list(options) {
+    return (await this.listCatalog(options)).models;
+  }
+
+  async listCatalog({ cwd = homedir(), refresh = false } = {}) {
     if (this.closed) throw new Error('Claude model catalog is closed.');
     if (typeof cwd !== 'string' || !cwd || cwd.includes('\0')) throw new TypeError('Invalid Claude model discovery working directory.');
     const directory = resolve(cwd);
     const resolvedEnv = this.environment();
     if (!record(resolvedEnv)) throw new TypeError('Claude environment must be an object.');
     const env = { ...resolvedEnv };
-    const key = discoveryIdentity(directory, this.executablePath, env);
+    let providerEnv;
+    try {
+      const settings = await this.settingsFor(directory);
+      const settingsEnv = settings.effective.env ?? {};
+      if (!record(settingsEnv) || Object.values(settingsEnv).some(value => typeof value !== 'string')) throw new Error('Invalid settings environment.');
+      // The CLI applies its settings cascade after options.env. Use that same
+      // effective environment for HTTP discovery, while letting the SDK load
+      // its settings normally. Include overrides in the cache identity.
+      providerEnv = { ...env, ...settingsEnv };
+    } catch {
+      if (this.closed) throw new Error('Claude model catalog is closed.');
+      throw new Error('Could not resolve Claude settings for model discovery.');
+    }
+    if (this.closed) throw new Error('Claude model catalog is closed.');
+    const key = discoveryIdentity(directory, this.executablePath, providerEnv);
     const now = Date.now();
     for (const [entryKey, entry] of this.cache) if (entry.expires <= now) this.cache.delete(entryKey);
     if (this.inFlight.has(key)) return structuredClone(await this.inFlight.get(key).promise);
-    if (!refresh && this.cache.has(key)) return structuredClone(this.cache.get(key).models);
+    if (!refresh && this.cache.has(key)) return structuredClone(this.cache.get(key).catalog);
     this.cache.delete(key);
     const probe = { controller: new AbortController() };
-    probe.promise = Promise.resolve().then(() => this.probe(directory, env, probe.controller)).then((models) => {
+    probe.promise = Promise.resolve().then(() => this.probe(directory, env, probe.controller, providerEnv)).then((catalog) => {
       if (this.closed) throw new Error('Claude model catalog is closed.');
-      this.cache.set(key, { models, expires: Date.now() + this.cacheTtlMs });
-      return models;
+      this.cache.set(key, { catalog, expires: Date.now() + this.cacheTtlMs });
+      return catalog;
     }).finally(() => this.inFlight.delete(key));
     this.inFlight.set(key, probe);
     return structuredClone(await probe.promise);
   }
 
-  async probe(cwd, env, controller) {
+  async settingsFor(cwd) {
+    const entry = { controller: new AbortController() };
+    const { signal } = entry.controller;
+    let abortListener;
+    const aborted = new Promise((_, reject) => {
+      abortListener = () => reject(signal.reason);
+      signal.addEventListener('abort', abortListener, { once: true });
+    });
+    const timeout = setTimeout(() => entry.controller.abort(new Error('Claude settings discovery timed out.')), this.timeoutMs);
+    // The SDK settings API has no cancellation argument. Bound our wait and
+    // discard late results, so close/timeout cannot launch a later probe.
+    entry.promise = Promise.race([
+      Promise.resolve().then(async () => {
+        const resolveSettings = this.resolveSettingsImpl ?? (await import('@anthropic-ai/claude-agent-sdk')).resolveSettings;
+        signal.throwIfAborted();
+        return await resolveSettings({ cwd, settingSources: ['user', 'project', 'local'] });
+      }),
+      aborted,
+    ]);
+    this.settingsInFlight.add(entry);
+    try { return await entry.promise; }
+    finally {
+      clearTimeout(timeout);
+      signal.removeEventListener('abort', abortListener);
+      this.settingsInFlight.delete(entry);
+    }
+  }
+
+  async probe(cwd, env, controller, providerEnv) {
+    controller.signal.throwIfAborted();
+    // SDK cleanup aborts its own controller. Independent controllers prevent
+    // that cleanup from cancelling a provider request that is still reading.
+    const sdkController = new AbortController();
+    const apiController = new AbortController();
+    const abort = () => {
+      sdkController.abort(controller.signal.reason);
+      apiController.abort(controller.signal.reason);
+    };
+    controller.signal.addEventListener('abort', abort, { once: true });
+    try {
+      const [sdk, api] = await Promise.allSettled([
+        this.probeSdk(cwd, env, sdkController),
+        this.probeProvider(providerEnv, apiController),
+      ]);
+      // A provider result must never hide failure to reclaim our SDK child.
+      if (sdk.status === 'rejected' && sdk.reason?.code === 'CLAUDE_MODEL_PROCESS_EXIT_FAILED') throw sdk.reason;
+      controller.signal.throwIfAborted();
+      const provider = api.status === 'fulfilled' ? api.value : {
+        ...providerCatalogInfo(providerEnv), models: [], apiStatus: 'failed',
+      };
+      const apiSuccess = provider.apiStatus === 'success';
+      if (!apiSuccess && sdk.status === 'rejected') throw sdk.reason;
+      const sdkModels = sdk.status === 'fulfilled' ? sdk.value : [];
+      return {
+        models: apiSuccess ? mergeModels(sdkModels, provider.models) : sdkModels,
+        source: apiSuccess ? (sdk.status === 'fulfilled' ? 'provider-api+sdk' : 'provider-api') : 'sdk-fallback',
+        apiStatus: provider.apiStatus,
+        provider: provider.provider,
+        endpointPath: provider.endpointPath,
+        apiModelCount: provider.models.length,
+        sdkModelCount: sdkModels.length,
+        advertised: true,
+        warning: !apiSuccess
+          ? provider.apiStatus === 'unsupported'
+            ? 'Provider API model discovery is unsupported for this configuration; SDK options may be incomplete.'
+            : 'Provider API model catalog is unavailable; SDK options may be incomplete.'
+          : sdk.status === 'rejected'
+            ? 'Claude SDK options are unavailable; showing provider-advertised models only.'
+            : null,
+      };
+    } finally { controller.signal.removeEventListener('abort', abort); }
+  }
+
+  async probeProvider(env, controller) {
+    let abortListener;
+    const timeout = setTimeout(() => controller.abort(new Error('Provider model catalog timed out.')), this.timeoutMs);
+    try {
+      controller.signal.throwIfAborted();
+      const aborted = new Promise((_, reject) => {
+        abortListener = () => reject(controller.signal.reason);
+        controller.signal.addEventListener('abort', abortListener, { once: true });
+      });
+      return await Promise.race([
+        discoverProviderModels({ env, signal: controller.signal, fetchImpl: this.fetchImpl }),
+        aborted,
+      ]);
+    } finally {
+      clearTimeout(timeout);
+      if (abortListener) controller.signal.removeEventListener('abort', abortListener);
+      controller.abort(new Error('Provider model discovery finished.'));
+    }
+  }
+
+  async probeSdk(cwd, env, controller) {
     let query;
     let releaseInput;
     let abortListener;
@@ -207,9 +344,11 @@ export class ClaudeModelCatalog {
   async close() {
     this.closed = true;
     this.cache.clear();
+    const settings = [...this.settingsInFlight];
+    for (const entry of settings) entry.controller.abort(new Error('Claude model catalog is closed.'));
     const probes = [...this.inFlight.values()];
     for (const probe of probes) probe.controller.abort(new Error('Claude model catalog is closed.'));
-    const results = await Promise.allSettled(probes.map((probe) => probe.promise));
+    const results = await Promise.allSettled([...settings.map(entry => entry.promise), ...probes.map(probe => probe.promise)]);
     const cleanupFailure = results.find((result) => result.status === 'rejected' && result.reason?.code === 'CLAUDE_MODEL_PROCESS_EXIT_FAILED');
     if (cleanupFailure) throw cleanupFailure.reason;
   }

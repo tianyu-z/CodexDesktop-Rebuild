@@ -10,16 +10,22 @@ const errorText = (error) => error instanceof Error ? error.message : String(err
 
 /** One isolated SDK query per run; native Claude persists the resumable session. */
 export class ClaudeAdapter {
-  constructor({ executablePath = join(homedir(), '.local', 'bin', 'claude'), queryImpl, environment = resolveClaudeEnvironment } = {}) {
+  constructor({ executablePath = join(homedir(), '.local', 'bin', 'claude'), queryImpl, environment = resolveClaudeEnvironment, resolveSettingsImpl, fetchImpl = globalThis.fetch } = {}) {
     this.executablePath = executablePath;
     this.queryImpl = queryImpl;
     this.environment = environment;
+    this.resolveSettingsImpl = resolveSettingsImpl;
+    this.fetchImpl = fetchImpl;
   }
 
   async listModels(options) {
+    return (await this.listModelCatalog(options)).models;
+  }
+
+  async listModelCatalog(options) {
     if (this.modelsClosed) throw new Error('Claude model catalog is closed.');
-    this.modelCatalog ??= new ClaudeModelCatalog({ executablePath: this.executablePath, environment: this.environment, queryImpl: this.queryImpl });
-    return await this.modelCatalog.list(options);
+    this.modelCatalog ??= new ClaudeModelCatalog({ executablePath: this.executablePath, environment: this.environment, queryImpl: this.queryImpl, resolveSettingsImpl: this.resolveSettingsImpl, fetchImpl: this.fetchImpl });
+    return await this.modelCatalog.listCatalog(options);
   }
 
   async close() {
