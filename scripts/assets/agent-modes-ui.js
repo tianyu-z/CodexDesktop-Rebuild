@@ -10,8 +10,10 @@
   const managers = new Map();
   const key = (threadId, hostId) => `${hostId ?? 'local'}\0${threadId}`;
   const local = hostId => hostId == null || hostId === 'local';
+  const copy = value => JSON.parse(JSON.stringify(value));
+  const defaultTemplate = () => ({ id: 'polly', revision: 1, parameters: {} });
   function fresh() {
-    return { snapshot: { engineMode: 'codex', models: { codex: null, claude: 'default' }, busy: false, pending: false, loading: false, available: null, error: null, turnEngines: {} }, listeners: new Set(), revision: 0, hydrated: false, creationIntent: null, read: null, sourcesRead: null };
+    return { snapshot: { engineMode: 'codex', models: { codex: null, claude: 'default' }, template: defaultTemplate(), bothAvailable: false, busy: false, pending: false, loading: false, available: null, error: null, turnEngines: {} }, listeners: new Set(), revision: 0, hydrated: false, creationIntent: null, read: null, sourcesRead: null };
   }
   function record(scope, threadId, hostId = 'local') {
     if (threadId != null) {
@@ -33,7 +35,7 @@
   function validModelId(value) { return typeof value === 'string' && MODEL_ID.exec(value)?.[0] === value; }
   function displayText(value, limit = 512) { return typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, limit) : ''; }
   function newCatalog() {
-    return { snapshot: { claudeModels: [], modelListError: null, engines: null, loading: false, loadedAt: null }, listeners: new Set(), revision: 0, promise: null };
+    return { snapshot: { claudeModels: [], modelListError: null, engines: null, bothAvailable: false, loading: false, loadedAt: null }, listeners: new Set(), revision: 0, promise: null };
   }
   function catalogRecord(manager, { threadId, cwd } = {}) {
     if (!manager || !['object', 'function'].includes(typeof manager)) return disconnectedCatalog;
@@ -66,7 +68,7 @@
         const response = await manager.sendRequest('engine/capabilities', { ...(threadId != null ? { threadId } : {}), ...(cwd != null ? { cwd } : {}), ...(force ? { refresh: true } : {}) });
         if (row.revision !== revision) return row.snapshot;
         const models = normalizeModels(response?.claudeModels), error = displayText(response?.modelListError) || null;
-        update(row, { claudeModels: error && models.length === 0 ? row.snapshot.claudeModels : models, modelListError: error, engines: Array.isArray(response?.engines) ? response.engines.filter(value => typeof value === 'string') : row.snapshot.engines, loadedAt: Date.now() });
+        update(row, { claudeModels: error && models.length === 0 ? row.snapshot.claudeModels : models, modelListError: error, engines: Array.isArray(response?.engines) ? response.engines.filter(value => typeof value === 'string') : row.snapshot.engines, bothAvailable: response?.bothAvailable === true, bothUnavailableReason: displayText(response?.bothUnavailableReason), loadedAt: Date.now() });
       } catch (error) {
         if (row.revision === revision) update(row, { modelListError: displayText(error?.message ?? String(error)) || 'Unable to discover Claude Code models', loadedAt: Date.now() });
       } finally {
@@ -107,13 +109,17 @@
     return `${model.description ? `${model.description}\n` : ''}Model ID: ${model.value}${model.resolvedModel && model.resolvedModel !== model.value ? `\nResolves to: ${model.resolvedModel}` : ''}`;
   }
   function validate(selection) {
-    if (!['codex', 'claude'].includes(selection.engineMode)) throw Error('Codex + Claude Code is not available yet');
+    if (!['codex', 'claude', 'both'].includes(selection.engineMode)) throw Error('Unknown chat engine mode');
     if (selection.engineMode === 'claude' && selection.engineModel != null && !validModelId(selection.engineModel)) throw Error('Invalid Claude Code model identifier');
+    if (selection.engineModels != null && (typeof selection.engineModels !== 'object' || Array.isArray(selection.engineModels) || Object.entries(selection.engineModels).some(([engine, model]) => !['codex', 'claude'].includes(engine) || (model !== null && !validModelId(model))))) throw Error('Invalid engine model selection');
+    if (selection.template != null && (typeof selection.template !== 'object' || !/^[a-z][a-z0-9_-]{0,63}$/.test(selection.template.id) || !Number.isSafeInteger(selection.template.revision) || selection.template.revision < 1 || !selection.template.parameters || typeof selection.template.parameters !== 'object' || Array.isArray(selection.template.parameters))) throw Error('Invalid template selection');
   }
   function applyState(row, state) {
     const values = { loading: false, available: true, error: null };
-    if (['codex', 'claude'].includes(state?.engineMode)) values.engineMode = state.engineMode;
+    if (['codex', 'claude', 'both'].includes(state?.engineMode)) values.engineMode = state.engineMode;
     if (state?.models) values.models = { ...row.snapshot.models, ...state.models };
+    if (state?.template) values.template = copy(state.template);
+    if (state?.bothAvailable != null) values.bothAvailable = state.bothAvailable === true;
     if (state?.busy != null) values.busy = state.busy;
     if (state?.turnEngines) values.turnEngines = { ...row.snapshot.turnEngines, ...state.turnEngines };
     // A prewarmed shell still reports its old engine until the first turn reaches
@@ -121,6 +127,7 @@
     if (row.creationIntent) {
       values.engineMode = row.creationIntent.engineMode;
       if (row.creationIntent.engineMode === 'claude') values.models = { ...row.snapshot.models, ...values.models, claude: row.creationIntent.engineModel };
+      if (row.creationIntent.engineMode === 'both') { values.models = copy(row.creationIntent.engineModels); values.template = copy(row.creationIntent.template); }
     }
     row.hydrated = true;
     update(row, values);
@@ -128,17 +135,23 @@
   function requestFields(options) {
     if (options?.engineMode == null) return {};
     validate(options);
+    if (options.engineMode === 'both') return { engineMode: 'both', engineModels: copy({ codex: null, claude: 'default', ...options.engineModels }), template: copy(options.template ?? defaultTemplate()) };
     return options.engineMode === 'claude'
       ? { engineMode: 'claude', engineModel: options.engineModel ?? 'default' }
       : { engineMode: 'codex' };
   }
-  function turnRequestFields(manager, threadId, options, clientUserMessageId) {
+  function turnRequestFields(manager, threadId, options, clientUserMessageId, nativeModel) {
     const hostId = manager?.getHostId?.() ?? 'local';
     const row = local(hostId) ? threads.get(key(threadId, hostId)) : null;
-    if (!row?.creationIntent) return requestFields(options);
+    const selected = options?.engineMode != null ? options : row?.creationIntent ?? (row?.snapshot.engineMode === 'both' ? { engineMode: 'both', engineModels: row.snapshot.models, template: row.snapshot.template } : options);
+    const fields = requestFields(selected);
+    if (fields.engineMode === 'both' && nativeModel !== undefined) {
+      if (nativeModel !== null && !validModelId(nativeModel)) throw Error('Invalid Codex model identifier');
+      fields.engineModels.codex = nativeModel;
+    }
+    if (!row?.creationIntent) return fields;
     // Preparation may fail before the first override reaches the gateway. The
     // ordinary existing-chat retry must carry that same captured selection.
-    const fields = requestFields(options?.engineMode == null ? row.creationIntent : options);
     row.creationIntent = { ...fields, clientUserMessageId: clientUserMessageId ?? null };
     row.revision++;
     applyState(row, { engineMode: fields.engineMode });
@@ -149,11 +162,12 @@
     const row = record(scope, null);
     if (row.snapshot.pending || row.snapshot.busy) throw Error('Wait for the current turn to finish');
     row.revision++;
-    update(row, { engineMode: selection.engineMode, models: { ...row.snapshot.models, ...(selection.engineMode === 'claude' && selection.engineModel != null ? { claude: selection.engineModel } : {}) }, error: null });
+    update(row, { engineMode: selection.engineMode, models: { ...row.snapshot.models, ...copy(selection.engineModels ?? {}), ...(selection.engineMode === 'claude' && selection.engineModel != null ? { claude: selection.engineModel } : {}) }, template: copy(selection.template ?? row.snapshot.template), error: null });
   }
   function capture(scope, hostId) {
     if (!local(hostId)) return {};
     const state = record(scope, null).snapshot;
+    if (state.engineMode === 'both') return { ...requestFields({ engineMode: 'both', engineModels: state.models, template: state.template }), skipAutoTitleGeneration: true };
     if (state.engineMode === 'claude') return { engineMode: 'claude', engineModel: state.models.claude ?? 'default', skipAutoTitleGeneration: true };
     return { engineMode: 'codex' };
   }
@@ -166,7 +180,7 @@
     const fields = requestFields(options), row = record(null, threadId, 'local');
     row.creationIntent = { ...fields, clientUserMessageId: options.clientUserMessageId ?? null };
     row.revision++;
-    applyState(row, { ...fields, models: { ...row.snapshot.models, ...(fields.engineMode === 'claude' ? { claude: fields.engineModel } : {}) } });
+    applyState(row, { ...fields, models: { ...row.snapshot.models, ...fields.engineModels, ...(fields.engineMode === 'claude' ? { claude: fields.engineModel } : {}) } });
   }
   function observe(manager, method, params, response) {
     registerManager(manager);
@@ -183,13 +197,13 @@
       && (intent.clientUserMessageId == null || params.clientUserMessageId === intent.clientUserMessageId)) {
       row.creationIntent = null;
       row.revision++; // Invalidate mode reads that began before this acknowledgment.
-      applyState(row, { engineMode: intent.engineMode, models: row.snapshot.models });
+      applyState(row, { engineMode: intent.engineMode, models: { ...row.snapshot.models, ...intent.engineModels }, template: intent.template ?? row.snapshot.template });
     }
     const sources = { ...row.snapshot.turnEngines, ...(response?.turnEngines ?? {}), ...(method === 'engine/turns/read' ? response?.turns : {}) };
     const rawTurns = response?.thread?.turns ?? (Array.isArray(response?.turns) ? response.turns : []);
     for (const turn of rawTurns) {
       const engine = turn.cdxEngineSource ?? turn.items?.find(item => item.cdxEngineSource)?.cdxEngineSource;
-      if (['codex', 'claude'].includes(engine)) sources[turn.id ?? turn.turnId] = engine;
+      if (['codex', 'claude', 'both'].includes(engine)) sources[turn.id ?? turn.turnId] = engine;
     }
     update(row, { turnEngines: sources });
   }
@@ -220,7 +234,7 @@
     row.revision++;
     update(row, { pending: true, error: null });
     try {
-      const selected = requestFields({ ...selection, engineModel: selection.engineModel ?? row.snapshot.models.claude });
+      const selected = requestFields({ ...selection, engineModel: selection.engineModel ?? row.snapshot.models.claude, engineModels: { ...row.snapshot.models, ...selection.engineModels }, template: selection.template ?? row.snapshot.template });
       const state = await manager.sendRequest('engine/mode/set', { threadId, ...selected });
       row.creationIntent = null;
       applyState(row, state);
@@ -235,7 +249,7 @@
     const row = record(null, threadId, 'local');
     // Explicit Claude intent can precede the first request on a prewarmed shell.
     // Never let that shell's temporary Codex default authorize metadata inference.
-    if (row.creationIntent?.engineMode === 'claude' || row.snapshot.pending || row.snapshot.engineMode === 'claude') return false;
+    if (['claude', 'both'].includes(row.creationIntent?.engineMode) || row.snapshot.pending || ['claude', 'both'].includes(row.snapshot.engineMode)) return false;
     const revision = row.revision;
     try {
       // Always use a new read here: another window may have changed the engine,
@@ -248,7 +262,7 @@
   }
   function sourceFor(threadId, hostId, turnId, raw) {
     const explicit = raw?.cdxEngineSource ?? raw?.items?.find(item => item.cdxEngineSource)?.cdxEngineSource;
-    if (['codex', 'claude'].includes(explicit)) return explicit;
+    if (['codex', 'claude', 'both'].includes(explicit)) return explicit;
     if (!local(hostId)) return 'codex';
     return record(null, threadId, hostId).snapshot.turnEngines[turnId] ?? 'codex';
   }

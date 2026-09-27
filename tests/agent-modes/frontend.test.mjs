@@ -23,9 +23,9 @@ test('draft engine and Claude model stay scoped; Codex carries no Claude model o
   assert.deepEqual(plain(api.capture(a, 'remote-ssh:test')), {});
 });
 
-test('reserved Both and invalid model selections fail explicitly', () => {
+test('unknown modes and invalid model selections fail explicitly', () => {
   const api = load(), scope = draft();
-  assert.throws(() => api.setDraftSelection(scope, { engineMode: 'both' }), /not available/);
+  assert.throws(() => api.setDraftSelection(scope, { engineMode: 'unknown' }), /Unknown/);
   assert.throws(() => api.setDraftSelection(scope, { engineMode: 'claude', engineModel: 'invalid model' }), /model/);
 });
 
