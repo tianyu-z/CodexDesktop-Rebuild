@@ -206,3 +206,14 @@ test('explicit model selection survives mode changes and stale visible native me
   store.setMode('chat', 'both');
   assert.equal(new ConversationStore(directory).get('chat').models.codex, 'explicit-choice');
 });
+
+test('explicit workflow resume retains results and prevents resuming behind another active turn', () => {
+  const { store } = setup(); start(store);
+  store.putWorkflowRun('chat', 'workflow', { ...roleRun(), status: 'interrupted', text: 'partial' });
+  store.finishWorkflow('chat', 'workflow', 'interrupted');
+  store.resumeWorkflow('chat', 'workflow');
+  assert.equal(store.get('chat').activeTurn.id, 'workflow');
+  assert.equal(store.get('chat').turns[0].turn.status, 'inProgress');
+  assert.equal(store.get('chat').turns[0].runs[0].text, 'partial');
+  assert.throws(() => store.resumeWorkflow('chat', 'workflow'), /active/i);
+});

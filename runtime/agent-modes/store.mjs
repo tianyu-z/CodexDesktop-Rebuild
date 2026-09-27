@@ -236,6 +236,20 @@ export class ConversationStore {
     return { value, row };
   }
 
+  resumeWorkflow(id, workflowId) {
+    const { value, row } = this.workflowRecord(id, workflowId, { active: false });
+    if (value.activeTurn) throw new Error('A turn is already active in this conversation.');
+    if (!['failed', 'interrupted'].includes(row.turn.status)) throw new Error('Only an unsuccessful workflow can resume.');
+    if (row !== value.turns.at(-1)) throw new Error('Only the latest workflow can resume. Start a new request to revisit an older turn.');
+    value.activeTurn = { id: workflowId, turnId: row.turn.id, mode: 'both' };
+    value.models = { ...value.models, ...clone(row.workflow.config.models) };
+    value.template = { id: row.workflow.config.template.id, revision: row.workflow.config.template.revision, parameters: clone(row.workflow.config.parameters) };
+    value.mode = 'both'; row.workflow.status = 'running'; row.turn.status = 'inProgress';
+    delete row.turn.completedAt; delete row.turn.durationMs; row.turn.error = null;
+    this.save(value);
+    return clone(row);
+  }
+
   putWorkflowRun(id, workflowId, run) {
     const { value, row } = this.workflowRecord(id, workflowId);
     requiredId(run?.id, 'Run ID'); requiredId(run.roleId, 'Role ID'); requiredId(run.stepId, 'Step ID');
