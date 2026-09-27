@@ -320,3 +320,57 @@ test('completed historical workflows read once without persistent polling', asyn
   if (typeof cleanup === 'function') cleanup();
   assert.equal(cleanup, undefined);
 });
+
+test('refreshing a loaded template catalog keeps its picker usable', async () => {
+  const { api, manager } = await templateSetup();
+  let resolve;
+  manager.sendRequest = () => new Promise(done => { resolve = done; });
+  const pending = api.refreshTemplates(manager, 'local', true);
+  await tick();
+  const tree = ui(api, 'TemplateControls', { manager, selection: { id: 'polly', revision: 1, parameters: {} }, onChange: () => {} }).render();
+  assert.equal(find(tree, 'Workflow template').props.disabled, false);
+  resolve({ templates: [] }); await pending;
+});
+
+test('saving a template waits out an older catalog read before refreshing the new revision', async () => {
+  const { api, manager, templates } = await templateSetup();
+  const original = manager.sendRequest; let resolve;
+  manager.sendRequest = (method, params) => method === 'engine/templates/list' && !resolve ? new Promise(done => { resolve = done; }) : original(method, params);
+  const stale = api.refreshTemplates(manager, 'local', true); await tick();
+  const view = ui(api, 'TemplateManager', { manager, hostId: 'local', initialId: 'polly' });
+  button(view.render(), 'Duplicate template').props.onClick();
+  const saving = button(view.render(), 'Save template').props.onClick(); await tick();
+  resolve({ templates: templates.filter(template => template.id !== 'polly-copy') });
+  await stale; await saving;
+  assert.equal(find(view.render(), 'Managed template').props.value, 'polly-copy');
+});
+
+test('queued and approval-waiting scheduler runs expose per-run stop controls', async () => {
+  const { api } = setup(), calls = [];
+  api.registerManager({ getHostId: () => 'local', sendRequest: async (method, params) => {
+    calls.push({ method, params: plain(params) });
+    return method === 'engine/runs/read' ? { workflows: [{ turnId: 't', status: 'running', runs: ['queued', 'awaitingApproval', 'running', 'completed'].map(status => ({ id: status, roleId: 'worker', stepId: status, engine: 'claude', status, requestedModel: 'claude-selected' })) }] } : {};
+  } });
+  await api.refreshRuns('chat', 'local', 't');
+  const view = ui(api, 'SourceBadge', { threadId: 'chat', hostId: 'local', turnId: 't', raw: { cdxEngineSource: 'both' } });
+  for (const status of ['queued', 'awaitingApproval', 'running']) {
+    const control = find(view.render(), `Stop run ${status}`);
+    assert.ok(control, `Missing stop control for ${status}`);
+    await control.props.onClick();
+    assert.deepEqual(calls.findLast(call => call.method === 'engine/runs/interrupt').params, { threadId: 'chat', turnId: 't', runId: status });
+  }
+  assert.equal(find(view.render(), 'Stop run completed'), undefined);
+});
+
+test('both keeps the actual native model picker when the upstream width gate hides single-mode controls', () => {
+  const { api, scope } = setup(), manager = { getHostId: () => 'local' };
+  api.setDraftSelection(scope, selection());
+  const bothNativeModelPicker = { native: 'ungated-model-and-effort-controls' };
+  const props = selectorProps(scope, manager, { nativeModelPicker: false, bothNativeModelPicker });
+  const both = ui(api, 'Selector', props).render();
+  assert.ok(nodes(both).includes(bothNativeModelPicker));
+  api.setDraftSelection(scope, { engineMode: 'codex' });
+  const codex = ui(api, 'Selector', props).render();
+  assert.equal(codex.props.children[1], false);
+  assert.equal(nodes(codex).includes(bothNativeModelPicker), false);
+});

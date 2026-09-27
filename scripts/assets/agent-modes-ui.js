@@ -287,7 +287,7 @@
   }
   const selectStyle = { color: 'inherit', background: 'transparent', border: '1px solid var(--border, #8885)', borderRadius: 6, fontSize: 12, padding: '3px 5px', maxWidth: 160, cursor: 'pointer' };
   function Selector(props) {
-    const { React, jsx, scope, threadId, nativeModelPicker } = props;
+    const { React, jsx, scope, threadId, nativeModelPicker, bothNativeModelPicker } = props;
     const hostId = props.hostId ?? props.getHost(scope, threadId) ?? 'local';
     const cwd = threadId == null ? props.cwd : undefined;
     const row = record(scope, threadId, hostId), state = useRecord(React, row);
@@ -328,7 +328,7 @@
       onPointerDown: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       children: modelOptions(catalog, state.models.claude ?? 'default').map(model => jsx.jsx('option', { value: model.value, title: modelTitle(model), children: modelLabel(model) }, model.value)),
     }) : nativeModelPicker;
-    const modelPicker = mode === 'both' ? jsx.jsxs('span', { style: { display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0 }, children: [jsx.jsxs('fieldset', { 'aria-label': 'Codex model controls', disabled, style: { border: 0, margin: 0, padding: 0, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 4, ...(disabled ? { pointerEvents: 'none', opacity: 0.6 } : {}) }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Codex model' }), nativeModelPicker] }), jsx.jsxs('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Claude model' }), claudePicker] })] }) : claudePicker;
+    const modelPicker = mode === 'both' ? jsx.jsxs('span', { style: { display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0 }, children: [jsx.jsxs('fieldset', { 'aria-label': 'Codex model controls', disabled, style: { border: 0, margin: 0, padding: 0, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 4, ...(disabled ? { pointerEvents: 'none', opacity: 0.6 } : {}) }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Codex model' }), bothNativeModelPicker ?? nativeModelPicker] }), jsx.jsxs('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Claude model' }), claudePicker] })] }) : claudePicker;
     const refreshModels = (mode === 'claude' || mode === 'both' || catalog.modelListError) && local(hostId) ? jsx.jsx('button', { type: 'button', 'aria-label': 'Refresh Claude models', title: 'Refresh models', disabled: !manager || catalog.loading, style: { ...selectStyle, border: 'none', padding: '2px 4px' }, onClick: () => refreshCapabilities(manager, { hostId, threadId, cwd, force: true }), children: '↻' }) : null;
     const errorStyle = { fontSize: 11, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
     const modelError = local(hostId) && catalog.modelListError ? jsx.jsx('span', { role: 'status', title: catalog.modelListError, style: errorStyle, children: `Model discovery: ${catalog.modelListError}` }) : null;
@@ -347,7 +347,7 @@
   async function refreshTemplates(manager, hostId = 'local', force = false) {
     const row = templateRecord(manager);
     if (!manager || !local(hostId)) return row.snapshot;
-    if (row.promise) return row.promise;
+    if (row.promise) { if (!force) return row.promise; await row.promise; return refreshTemplates(manager, hostId, true); }
     if (!force && row.snapshot.loaded) return row.snapshot;
     update(row, { loading: true, error: null });
     row.promise = (async () => {
@@ -404,7 +404,7 @@
       } })] }, name);
     });
     return jsx.jsxs('span', { style: { display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0, fontSize: 12 }, children: [
-      jsx.jsxs('label', { children: ['Template ', jsx.jsx('select', { 'aria-label': 'Workflow template', style: selectStyle, value: templateKey(selection), disabled: disabled || catalog.loading, onFocus: () => refreshTemplates(manager, hostId, true), onChange: event => { const selected = templates.find(item => templateKey(item) === event.target.value); if (selected) onChange({ id: selected.id, revision: selected.revision, parameters: {} }); }, children: templates.map(item => jsx.jsx('option', { value: templateKey(item), children: `${item.name} · r${item.revision}` }, templateKey(item))) })] }),
+      jsx.jsxs('label', { children: ['Template ', jsx.jsx('select', { 'aria-label': 'Workflow template', style: selectStyle, value: templateKey(selection), disabled: Boolean(disabled || (!catalog.loaded && catalog.loading)), onFocus: () => refreshTemplates(manager, hostId, true), onChange: event => { const selected = templates.find(item => templateKey(item) === event.target.value); if (selected) onChange({ id: selected.id, revision: selected.revision, parameters: {} }); }, children: templates.map(item => jsx.jsx('option', { value: templateKey(item), children: `${item.name} · r${item.revision}` }, templateKey(item))) })] }),
       ...parameters,
       jsx.jsx('button', { type: 'button', style: selectStyle, disabled: !catalog.loaded || unavailableTemplate(manager, hostId), onClick: () => setManage(!manage), children: manage ? 'Close templates' : 'Manage templates' }),
       jsx.jsx('span', { style: { flexBasis: '100%', opacity: 0.75, fontSize: 11, whiteSpace: 'normal' }, children: `${template?.description ?? ''} ${coordinatorDescription(template)}`.trim() }),
@@ -540,7 +540,7 @@
           run.artifact ? jsx.jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: typeof run.artifact === 'string' ? run.artifact : JSON.stringify(run.artifact, null, 2) }) : null,
           run.text ? jsx.jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 360, overflow: 'auto', userSelect: 'text' }, children: run.text }) : null,
           run.error ? jsx.jsx('div', { role: 'alert', style: { overflowWrap: 'anywhere' }, children: errorText(run.error) }) : null,
-          ['running', 'inProgress', 'pending', 'waiting', 'awaiting_approval'].includes(run.status) ? actionButton('Stop run', `Stop run ${run.id}`, run.id, 'engine/runs/interrupt') : null,
+          ['queued', 'running', 'awaitingApproval'].includes(run.status) ? actionButton('Stop run', `Stop run ${run.id}`, run.id, 'engine/runs/interrupt') : null,
           ['failed', 'interrupted', 'cancelled', 'blocked'].includes(run.status) ? actionButton('Retry run', `Retry run ${run.id}`, run.id, 'engine/runs/retry') : null,
         ] }, run.id)),
         state.runsError ? jsx.jsx('div', { role: 'alert', children: state.runsError }) : null,

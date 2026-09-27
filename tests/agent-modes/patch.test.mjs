@@ -8,6 +8,7 @@ const { patchAppBundle, patchTurnBundle, replaceExactOnce } = require('../../scr
 
 // Deliberately literal upstream seams: a renamed binding must fail a build.
 const appFixture = [
+  'H=!P&&(0,H2.jsx)(`span`,{ref:S,children:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:F,permissionsCwdOverride:i,permissionsHostId:a})})',
   'async sendRequest(e,t,n){return this.requestClient.sendRequest(e,t,n)}',
   'HV.FooterInlineControls,{ref:x,children:[V,H,r,U]}',
   'let W;return t[35]!==r||t[36]!==V||t[37]!==H||t[38]!==U?',
@@ -70,7 +71,7 @@ test('app patch rejects every missing or duplicate upstream seam', () => {
 test('model discovery receives the composer project directory, including upgraded patches', () => {
   const patched = patchAppBundle(appFixture);
   assert.match(patched, /Selector,\{React:V2,jsx:H2,scope:u,threadId:f,hostId:a,cwd:i,/);
-  const previous = patched.replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:');
+  const previous = patched.replace(',bothNativeModelPicker:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:!1,permissionsCwdOverride:i,permissionsHostId:a})', '').replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:');
   assert.equal(patchAppBundle(previous), patched);
 });
 
@@ -148,7 +149,7 @@ test('existing-chat retry wire reconstruction carries retained first-turn creati
 
 test('known development preview patches upgrade exactly once without re-extraction', () => {
   const current = patchAppBundle(appFixture);
-  const previous = current.replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:').replace('busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H', 'busyAtom:yk,nativeModelPicker:H').replace('turnRequestFields(e,t,o,r,A??E?.settings?.model)', 'requestFields(o)');
+  const previous = current.replace(',bothNativeModelPicker:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:!1,permissionsCwdOverride:i,permissionsHostId:a})', '').replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:').replace('busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H', 'busyAtom:yk,nativeModelPicker:H').replace('turnRequestFields(e,t,o,r,A??E?.settings?.model)', 'requestFields(o)');
   assert.equal(patchAppBundle(previous), current);
   const oldSelector = previous.split('\n').find(line => line.startsWith('HV.FooterInlineControls'));
   assert.throws(() => patchAppBundle(previous + '\n' + oldSelector), /expected one previous match/);
@@ -190,4 +191,19 @@ test('recognized single-engine patches upgrade all dual propagation seams withou
   assert.notEqual(previous, current);
   const duplicate = previous.split('\n').find(line => line.startsWith('this.threadCreation.createConversation('));
   assert.throws(() => patchAppBundle(previous + '\n' + duplicate), /expected/);
+});
+
+test('dual footer assembles a native picker independently of the width-gated single-mode picker', () => {
+  const patched = patchAppBundle(appFixture), footer = patched.split('\n').find(line => line.startsWith('HV.FooterInlineControls,'));
+  const factory = { jsx: (type, props) => ({ type, props }) };
+  const context = { H2: factory, HV: { FooterInlineControls: 'footer' }, x: {}, V: null, H: false, r: null, U: null,
+    V2: {}, u: {}, f: 'thread', a: 'local', i: '/project', Rk: {}, zg: {}, ss: {}, yk: {}, kk: {}, XDr: {}, fNc: 'native-model-and-effort-picker', __cdxEngineModes: { Selector: 'engine-selector' } };
+  const tree = vm.runInNewContext(`(0,H2.jsx)(${footer})`, context);
+  const selector = tree.props.children[1];
+  assert.equal(selector.props.nativeModelPicker, false);
+  assert.equal(selector.props.bothNativeModelPicker?.type, 'native-model-and-effort-picker');
+  assert.deepEqual(JSON.parse(JSON.stringify(selector.props.bothNativeModelPicker.props)), { conversationId: 'thread', hideLabel: false, permissionsCwdOverride: '/project', permissionsHostId: 'local' });
+  const nativeContract = 'H=!P&&(0,H2.jsx)(`span`,{ref:S,children:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:F,permissionsCwdOverride:i,permissionsHostId:a})})';
+  assert.ok(patched.includes(nativeContract), 'Only-mode width policy must remain unchanged');
+  assert.throws(() => patchAppBundle(appFixture.replace(nativeContract, nativeContract.replace('fNc', 'changedNativePicker'))), /native model picker contract/);
 });
