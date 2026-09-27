@@ -54,8 +54,8 @@ test('app patch is idempotent and captures engine settings before preparation', 
   assert.match(patched, /Object\.assign\(S,__cdxEngineSelection\)/);
   assert.match(patched, /Object\.assign\(D,__cdxEngineSelection\)/);
   assert.match(patched, /Object\.assign\(b,__cdxEngineSelection\)/);
-  assert.match(patched, /request:\{threadId:B,clientUserMessageId:u,engineMode:e.engineMode,engineModel:e.engineModel,/);
-  assert.match(patched, /r.engineMode!==`claude`&&r.skipAutoTitleGeneration/);
+  assert.match(patched, /request:\{threadId:B,clientUserMessageId:u,\.\.\.globalThis\.__cdxEngineModes.requestFields\(e\),/);
+  assert.match(patched, /r.engineMode!==`claude`&&r.engineMode!==`both`&&r.skipAutoTitleGeneration/);
   assert.match(patched, /a=await globalThis\.__cdxEngineModes\.permitsNativeMetadata\(t,n\)\?await zX/);
   assert.match(patched, /let i=Vkl\(e\);return i.length===0\|\|!await globalThis\.__cdxEngineModes\.permitsNativeMetadata\(n,t\)\?null:/);
 });
@@ -118,10 +118,10 @@ test('prewarmed first-turn override survives the actual turn request reconstruct
   const patched = patchAppBundle(appFixture).split('\n');
   const firstTurn = patched.find(line => line.startsWith('await this.executeTurnStart('));
   const wireRequest = patched.find(line => line.startsWith('Ce={'));
-  const prepareWireRequest = new Function('o', 't', 'r', 'i', 'globalThis', `const e={getHostId:()=> 'local'};return (${wireRequest.slice(3)}model:o.model,collaborationMode:o.collaborationMode})`);
-  const startPrewarmed = new Function('e', 'B', 'u', 'executeTurnStart', `return ${firstTurn.replace('await this.executeTurnStart', 'executeTurnStart')}input:e.input,model:e.model,collaborationMode:e.collaborationMode}})`);
+  const prepareWireRequest = new Function('o', 't', 'r', 'i', 'globalThis', `const e={getHostId:()=> 'local'},A=o.model,E=o.collaborationMode;return (${wireRequest.slice(3)}model:o.model,collaborationMode:o.collaborationMode})`);
+  const startPrewarmed = new Function('e', 'B', 'u', 'executeTurnStart', `const globalThis=arguments[4];return ${firstTurn.replace('await this.executeTurnStart', 'executeTurnStart')}input:e.input,model:e.model,collaborationMode:e.collaborationMode}})`);
   const selected = { engineMode: 'claude', engineModel: 'haiku', model: 'gpt-native', input: [{ type: 'text', text: 'First message' }], collaborationMode: { mode: 'default' } };
-  const wire = startPrewarmed(selected, 'prewarmed-thread', 'message-1', (id, submission) => prepareWireRequest(submission.request, id, 'message-1', null, context));
+  const wire = startPrewarmed(selected, 'prewarmed-thread', 'message-1', (id, submission) => prepareWireRequest(submission.request, id, 'message-1', null, context), context);
   assert.equal(wire.threadId, 'prewarmed-thread');
   assert.equal(wire.engineMode, 'claude');
   assert.equal(wire.engineModel, 'haiku');
@@ -138,7 +138,7 @@ test('existing-chat retry wire reconstruction carries retained first-turn creati
   const manager = { getHostId: () => 'local' };
   context.__cdxEngineModes.noteStarted(manager, 'prewarmed-retry', { engineMode: 'claude', engineModel: 'haiku', clientUserMessageId: 'failed-prepare' });
   const wireRequest = patchAppBundle(appFixture).split('\n').find(line => line.startsWith('Ce={'));
-  const prepareWireRequest = new Function('e', 'o', 't', 'r', 'i', 'globalThis', `return (${wireRequest.slice(3)}model:o.model})`);
+  const prepareWireRequest = new Function('e', 'o', 't', 'r', 'i', 'globalThis', `const A=o.model,E=o.collaborationMode;return (${wireRequest.slice(3)}model:o.model})`);
   const wire = prepareWireRequest(manager, { input: [{ type: 'text', text: 'Retry' }], model: 'native-default' }, 'prewarmed-retry', 'retry-message', null, context);
   assert.equal(wire.engineMode, 'claude');
   assert.equal(wire.engineModel, 'haiku');
@@ -148,9 +148,46 @@ test('existing-chat retry wire reconstruction carries retained first-turn creati
 
 test('known development preview patches upgrade exactly once without re-extraction', () => {
   const current = patchAppBundle(appFixture);
-  const previous = current.replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:').replace('busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H', 'busyAtom:yk,nativeModelPicker:H').replace('turnRequestFields(e,t,o,r)', 'requestFields(o)');
+  const previous = current.replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:').replace('busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H', 'busyAtom:yk,nativeModelPicker:H').replace('turnRequestFields(e,t,o,r,A??E?.settings?.model)', 'requestFields(o)');
   assert.equal(patchAppBundle(previous), current);
   const oldSelector = previous.split('\n').find(line => line.startsWith('HV.FooterInlineControls'));
   assert.throws(() => patchAppBundle(previous + '\n' + oldSelector), /expected one previous match/);
   assert.throws(() => patchAppBundle(current + '\n' + oldSelector), /expected one previous match/);
+});
+
+
+test('dual creation and prepared-turn seams clone snapshots and resolve the current native Codex model', () => {
+  const context = {};
+  vm.runInNewContext(readFileSync(new URL('../../scripts/assets/agent-modes-ui.js', import.meta.url), 'utf8'), context);
+  const patched = patchAppBundle(appFixture).split('\n');
+  const creation = patched.find(line => line.startsWith('this.threadCreation.createConversation('));
+  const create = new Function('e', 'u', 'globalThis', `return (${creation.replace('this.threadCreation.createConversation(', '')}})`);
+  const selected = { engineMode: 'both', engineModels: { codex: 'stale-draft', claude: 'claude-exact' }, template: { id: 'debby', revision: 1, parameters: { rounds: 3 } } };
+  const cloned = create(selected, 'message', context);
+  assert.deepEqual(JSON.parse(JSON.stringify(cloned.engineModels)), selected.engineModels);
+  assert.notEqual(cloned.engineModels, selected.engineModels);
+  assert.notEqual(cloned.template.parameters, selected.template.parameters);
+  const wireRequest = patched.find(line => line.startsWith('Ce={'));
+  const prepare = new Function('e', 'o', 'A', 'E', 'globalThis', `const t='chat',r='message',i=null;return (${wireRequest.slice(3)}model:A,collaborationMode:E})`);
+  for (const [A, E, expected] of [['native-current', null, 'native-current'], [null, { settings: { model: 'collaboration-current' } }, 'collaboration-current']]) {
+    const wire = prepare({ getHostId: () => 'local' }, { ...selected, input: [] }, A, E, context);
+    assert.equal(wire.engineModels.codex, expected);
+    assert.equal(wire.engineModels.claude, 'claude-exact');
+    assert.equal(wire.template.parameters.rounds, 3);
+  }
+  const worktree = patched.find(line => line.startsWith('...Rbs('));
+  assert.match(worktree, /o.engineMode===`both`/);
+});
+
+test('recognized single-engine patches upgrade all dual propagation seams without ambiguity', () => {
+  const current = patchAppBundle(appFixture);
+  const previous = current
+    .replaceAll('...globalThis.__cdxEngineModes.requestFields(e),', 'engineMode:e.engineMode,engineModel:e.engineModel,')
+    .replace('turnRequestFields(e,t,o,r,A??E?.settings?.model)', 'turnRequestFields(e,t,o,r)')
+    .replace('o.engineMode===`claude`||o.engineMode===`both`||a.length>0', 'o.engineMode===`claude`||a.length>0')
+    .replace('r.engineMode!==`claude`&&r.engineMode!==`both`&&r.skipAutoTitleGeneration', 'r.engineMode!==`claude`&&r.skipAutoTitleGeneration');
+  assert.equal(patchAppBundle(previous), current);
+  assert.notEqual(previous, current);
+  const duplicate = previous.split('\n').find(line => line.startsWith('this.threadCreation.createConversation('));
+  assert.throws(() => patchAppBundle(previous + '\n' + duplicate), /expected/);
 });

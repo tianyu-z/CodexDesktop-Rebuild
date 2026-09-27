@@ -6,6 +6,8 @@
   const modelCatalogs = new WeakMap();
   const disconnectedCatalog = newCatalog();
   const drafts = new WeakMap();
+  const templateCatalogs = new WeakMap();
+  const disconnectedTemplates = { snapshot: { templates: [], byRevision: {}, loading: false, error: null, loaded: false }, listeners: new Set() };
   const threads = new Map();
   const managers = new Map();
   const key = (threadId, hostId) => `${hostId ?? 'local'}\0${threadId}`;
@@ -13,7 +15,7 @@
   const copy = value => JSON.parse(JSON.stringify(value));
   const defaultTemplate = () => ({ id: 'polly', revision: 1, parameters: {} });
   function fresh() {
-    return { snapshot: { engineMode: 'codex', models: { codex: null, claude: 'default' }, template: defaultTemplate(), bothAvailable: false, busy: false, pending: false, loading: false, available: null, error: null, turnEngines: {} }, listeners: new Set(), revision: 0, hydrated: false, creationIntent: null, read: null, sourcesRead: null };
+    return { snapshot: { engineMode: 'codex', models: { codex: null, claude: 'default' }, template: defaultTemplate(), bothAvailable: false, busy: false, pending: false, loading: false, available: null, error: null, turnEngines: {}, workflows: {}, runsError: null, runActions: {} }, listeners: new Set(), revision: 0, hydrated: false, creationIntent: null, read: null, sourcesRead: null, runsRead: new Map() };
   }
   function record(scope, threadId, hostId = 'local') {
     if (threadId != null) {
@@ -308,6 +310,7 @@
     const unavailable = !local(hostId) || !manager || state.available === false;
     const disabled = busy || state.loading || unavailable;
     const claudeAvailable = state.available === true || catalog.engines?.includes('claude') === true;
+    const bothAvailable = local(hostId) && (catalog.loadedAt != null ? catalog.bothAvailable === true : state.bothAvailable === true);
     const reason = !local(hostId) ? 'Claude Code is available for local chats only' : connectionError ?? state.error ?? (busy ? 'Wait for the current turn and approvals to finish' : 'Choose the engine for this chat');
     const mode = local(hostId) ? state.engineMode : 'codex';
     const change = selection => { changeSelection({ scope, threadId, hostId, manager }, selection).catch(() => {}); };
@@ -316,30 +319,236 @@
       onChange: event => change({ engineMode: event.target.value }),
       onFocus: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       onPointerDown: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
-      children: [jsx.jsx('option', { value: 'codex', children: 'Only Codex' }), jsx.jsx('option', { value: 'claude', disabled: !local(hostId) || !claudeAvailable, children: 'Only Claude Code' }), jsx.jsx('option', { value: 'both', disabled: true, children: 'Codex + Claude Code (coming later)' })],
+      children: [jsx.jsx('option', { value: 'codex', children: 'Only Codex' }), jsx.jsx('option', { value: 'claude', disabled: !local(hostId) || !claudeAvailable, children: 'Only Claude Code' }), jsx.jsx('option', { value: 'both', disabled: !bothAvailable, title: catalog.bothUnavailableReason || 'Run a workflow with both selected models', children: 'Codex + Claude Code' })],
     });
-    const modelPicker = mode === 'claude' ? jsx.jsx('select', {
+    const claudePicker = mode === 'claude' || mode === 'both' ? jsx.jsx('select', {
       'aria-label': 'Claude Code model', 'data-testid': 'claude-model-selector', value: state.models.claude ?? 'default', disabled: disabled || !claudeAvailable, title: 'Claude Code uses its own project/user permissions and per-tool approvals. The Codex permission selector applies only to Codex.', style: { ...selectStyle, maxWidth: 220 },
-      onChange: event => change({ engineMode: 'claude', engineModel: event.target.value }),
+      onChange: event => change(mode === 'both' ? { engineMode: 'both', engineModels: { claude: event.target.value } } : { engineMode: 'claude', engineModel: event.target.value }),
       onFocus: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       onPointerDown: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       children: modelOptions(catalog, state.models.claude ?? 'default').map(model => jsx.jsx('option', { value: model.value, title: modelTitle(model), children: modelLabel(model) }, model.value)),
     }) : nativeModelPicker;
-    const refreshModels = (mode === 'claude' || catalog.modelListError) && local(hostId) ? jsx.jsx('button', { type: 'button', 'aria-label': 'Refresh Claude models', title: 'Refresh models', disabled: !manager || catalog.loading, style: { ...selectStyle, border: 'none', padding: '2px 4px' }, onClick: () => refreshCapabilities(manager, { hostId, threadId, cwd, force: true }), children: '↻' }) : null;
+    const modelPicker = mode === 'both' ? jsx.jsxs('span', { style: { display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0 }, children: [jsx.jsxs('fieldset', { 'aria-label': 'Codex model controls', disabled, style: { border: 0, margin: 0, padding: 0, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 4, ...(disabled ? { pointerEvents: 'none', opacity: 0.6 } : {}) }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Codex model' }), nativeModelPicker] }), jsx.jsxs('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Claude model' }), claudePicker] })] }) : claudePicker;
+    const refreshModels = (mode === 'claude' || mode === 'both' || catalog.modelListError) && local(hostId) ? jsx.jsx('button', { type: 'button', 'aria-label': 'Refresh Claude models', title: 'Refresh models', disabled: !manager || catalog.loading, style: { ...selectStyle, border: 'none', padding: '2px 4px' }, onClick: () => refreshCapabilities(manager, { hostId, threadId, cwd, force: true }), children: '↻' }) : null;
     const errorStyle = { fontSize: 11, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
     const modelError = local(hostId) && catalog.modelListError ? jsx.jsx('span', { role: 'status', title: catalog.modelListError, style: errorStyle, children: `Model discovery: ${catalog.modelListError}` }) : null;
-    return jsx.jsxs('span', { className: 'flex min-w-0 items-center gap-1', 'data-cdx-engine-controls': true, children: [modePicker, modelPicker, refreshModels, modelError, state.error && local(hostId) ? jsx.jsx('span', { role: 'alert', title: state.error, style: errorStyle, children: state.error }) : null] });
+    return jsx.jsxs('span', { className: 'flex min-w-0 items-center gap-1', style: { display: 'inline-flex', flexWrap: 'wrap', minWidth: 0, gap: 4 }, 'data-cdx-engine-controls': true, children: [modePicker, modelPicker, refreshModels, mode === 'both' ? jsx.jsx(TemplateControls, { React, jsx, manager, hostId, selection: state.template, disabled, onChange: template => change({ engineMode: 'both', template }) }) : null, modelError, state.error && local(hostId) ? jsx.jsx('span', { role: 'alert', title: state.error, style: errorStyle, children: state.error }) : null] });
   }
-  function SourceBadge({ React, jsx, threadId, hostId, turnId, raw }) {
-    const row = record(null, threadId, hostId);
-    useRecord(React, row);
+  function templateRecord(manager) {
+    if (!manager || !['object', 'function'].includes(typeof manager)) return disconnectedTemplates;
+    if (!templateCatalogs.has(manager)) templateCatalogs.set(manager, { snapshot: { templates: [], byRevision: {}, loading: false, error: null, loaded: false }, listeners: new Set(), promise: null });
+    return templateCatalogs.get(manager);
+  }
+  const templateKey = template => `${template.id}@${template.revision}`;
+  function rememberTemplate(row, template) {
+    if (!template?.id || !template.revision) return;
+    update(row, { byRevision: { ...row.snapshot.byRevision, [templateKey(template)]: copy(template) } });
+  }
+  async function refreshTemplates(manager, hostId = 'local', force = false) {
+    const row = templateRecord(manager);
+    if (!manager || !local(hostId)) return row.snapshot;
+    if (row.promise) return row.promise;
+    if (!force && row.snapshot.loaded) return row.snapshot;
+    update(row, { loading: true, error: null });
+    row.promise = (async () => {
+      await Promise.resolve(); // Publish the pending request before a synchronous transport failure.
+      try {
+        const response = await manager.sendRequest('engine/templates/list', {});
+        const templates = Array.isArray(response?.templates) ? copy(response.templates) : [];
+        const byRevision = { ...row.snapshot.byRevision };
+        for (const template of templates) byRevision[templateKey(template)] = template;
+        update(row, { templates, byRevision, loaded: true });
+      } catch (error) { update(row, { error: error.message ?? String(error) }); }
+      finally { row.promise = null; update(row, { loading: false }); }
+      return row.snapshot;
+    })();
+    return row.promise;
+  }
+  async function readTemplate(manager, hostId, selected) {
+    if (!manager || !local(hostId) || !selected?.id) return;
+    const row = templateRecord(manager);
+    if (row.snapshot.byRevision[templateKey(selected)]) return;
+    try {
+      const response = await manager.sendRequest('engine/templates/read', { id: selected.id, revision: selected.revision });
+      if (!response?.template) throw Error(`Template ${templateKey(selected)} is unavailable`);
+      rememberTemplate(row, response.template);
+    } catch (error) { update(row, { error: error.message ?? String(error) }); }
+  }
+  function coordinatorDescription(template) {
+    if (!template) return 'Workflows bind every role to the two selected models.';
+    const visit = steps => steps.flatMap(step => [step, ...visit(step.steps ?? [])]);
+    const steps = visit(template.steps ?? []);
+    const coordinators = steps.filter(step => step.type === 'planTasks' || step.type === 'synthesize').map(step => template.roles?.[step.role]?.engine);
+    const engines = [...new Set(coordinators.filter(Boolean))];
+    return `Coordinator roles use ${engines.length ? engines.map(engine => `the selected ${engine === 'claude' ? 'Claude' : 'Codex'} model`).join(' and ') : 'the selected models assigned to their roles'}.`;
+  }
+  const unavailableTemplate = (manager, hostId) => !manager || !local(hostId);
+  function TemplateControls({ React, jsx, manager, hostId = 'local', selection = defaultTemplate(), disabled, onChange }) {
+    const row = templateRecord(manager), catalog = useRecord(React, row);
+    const [manage, setManage] = React.useState(false);
+    React.useEffect(() => { refreshTemplates(manager, hostId).then(() => readTemplate(manager, hostId, selection)); }, [manager, hostId, selection.id, selection.revision]);
+    const template = catalog.byRevision[templateKey(selection)];
+    const templates = [...catalog.templates];
+    if (!templates.some(item => templateKey(item) === templateKey(selection))) templates.push(template ?? { ...selection, name: `${selection.id} (saved revision ${selection.revision})` });
+    const setParameter = (name, value) => onChange({ ...copy(selection), parameters: { ...selection.parameters, [name]: value } });
+    const parameters = Object.entries(template?.parameters ?? {}).map(([name, definition]) => {
+      const value = selection.parameters[name] ?? definition.default;
+      if (template.id === 'debby' && name === 'rounds') return jsx.jsxs('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' }, children: [
+        jsx.jsxs('label', { children: [jsx.jsx('input', { type: 'checkbox', 'aria-label': 'Enable discussion', checked: value > 0, disabled, onChange: event => setParameter(name, event.target.checked ? 1 : 0) }), ' Discussion'] }),
+        value > 0 ? jsx.jsxs('label', { children: ['Rounds ', jsx.jsx('input', { type: 'number', 'aria-label': 'Discussion rounds', min: 1, max: 5, step: 1, value, disabled, style: { ...selectStyle, width: 48 }, onChange: event => { const number = Number(event.target.value); if (Number.isInteger(number) && number >= 1 && number <= 5) setParameter(name, number); } })] }) : null,
+      ] }, name);
+      return jsx.jsxs('label', { title: definition.description, children: [`${name} `, jsx.jsx('input', { 'aria-label': `Template parameter ${name}`, disabled, style: { ...selectStyle, maxWidth: 130 }, type: definition.type === 'boolean' ? 'checkbox' : ['integer', 'number'].includes(definition.type) ? 'number' : 'text', ...(definition.type === 'boolean' ? { checked: value } : { value }), min: definition.min, max: definition.max, step: definition.type === 'integer' ? 1 : 'any', onChange: event => {
+        const next = definition.type === 'boolean' ? event.target.checked : ['integer', 'number'].includes(definition.type) ? Number(event.target.value) : event.target.value;
+        if (['integer', 'number'].includes(definition.type) && (!Number.isFinite(next) || next < definition.min || next > definition.max || (definition.type === 'integer' && !Number.isSafeInteger(next)))) return;
+        setParameter(name, next);
+      } })] }, name);
+    });
+    return jsx.jsxs('span', { style: { display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0, fontSize: 12 }, children: [
+      jsx.jsxs('label', { children: ['Template ', jsx.jsx('select', { 'aria-label': 'Workflow template', style: selectStyle, value: templateKey(selection), disabled: disabled || catalog.loading, onFocus: () => refreshTemplates(manager, hostId, true), onChange: event => { const selected = templates.find(item => templateKey(item) === event.target.value); if (selected) onChange({ id: selected.id, revision: selected.revision, parameters: {} }); }, children: templates.map(item => jsx.jsx('option', { value: templateKey(item), children: `${item.name} · r${item.revision}` }, templateKey(item))) })] }),
+      ...parameters,
+      jsx.jsx('button', { type: 'button', style: selectStyle, disabled: !catalog.loaded || unavailableTemplate(manager, hostId), onClick: () => setManage(!manage), children: manage ? 'Close templates' : 'Manage templates' }),
+      jsx.jsx('span', { style: { flexBasis: '100%', opacity: 0.75, fontSize: 11, whiteSpace: 'normal' }, children: `${template?.description ?? ''} ${coordinatorDescription(template)}`.trim() }),
+      catalog.error ? jsx.jsx('span', { role: 'alert', children: catalog.error }) : null,
+      manage ? jsx.jsx(TemplateManager, { React, jsx, manager, hostId, initialId: selection.id }) : null,
+    ] });
+  }
+  function unusedId(base, values) { let id = base, n = 2; while (values.includes(id)) id = `${base.slice(0, 58)}-${n++}`; return id; }
+  function blankTemplate(id) {
+    const role = engine => ({ engine, prompt: 'Answer the user request using the supplied context. Preserve attribution and report uncertainty.', access: 'read', session: 'fresh' });
+    return { schemaVersion: 1, id, name: 'New dual template', description: '', builtin: false,
+      roles: { codex: role('codex'), claude: role('claude'), coordinator: { ...role('claude'), prompt: 'Synthesize the supplied answers. Attribute each view and explain unresolved differences.' } }, parameters: {}, limits: { concurrency: 2, tasks: 8, rounds: 2 },
+      steps: [{ id: 'answers', type: 'parallel', steps: [{ id: 'codex', type: 'run', role: 'codex', inputs: ['request', 'history'] }, { id: 'claude', type: 'run', role: 'claude', inputs: ['request', 'history'] }] }, { id: 'summary', type: 'synthesize', dependsOn: ['answers'], role: 'coordinator', inputs: ['request', 'answers.codex', 'answers.claude'] }],
+      output: { sources: ['answers.codex', 'answers.claude', 'summary'], final: 'summary', format: 'markdown' } };
+  }
+  function TemplateManager({ React, jsx, manager, hostId = 'local', initialId }) {
+    const row = templateRecord(manager), catalog = useRecord(React, row);
+    const [draft, setDraft] = React.useState(() => copy(catalog.templates.find(item => item.id === initialId) ?? catalog.templates[0] ?? blankTemplate('new-template')));
+    const [advanced, setAdvanced] = React.useState(false), [text, setText] = React.useState(''), [importText, setImportText] = React.useState('');
+    const [exported, setExported] = React.useState(''), [format, setFormat] = React.useState('yaml'), [pending, setPending] = React.useState(false), [error, setError] = React.useState(null), [notice, setNotice] = React.useState(null);
+    React.useEffect(() => { refreshTemplates(manager, hostId); }, [manager, hostId]);
+    const readonly = draft.builtin === true || ['polly', 'debby'].includes(draft.id);
+    const unavailable = !manager || !local(hostId), locked = readonly || pending || unavailable;
+    const load = template => { setDraft(copy(template)); setText(JSON.stringify(template, null, 2)); setAdvanced(false); setError(null); setExported(''); setNotice(null); };
+    const edit = (name, value) => setDraft(current => ({ ...current, [name]: value }));
+    const roleEdit = (id, name, value) => setDraft(current => ({ ...current, roles: { ...current.roles, [id]: { ...current.roles[id], [name]: value } } }));
+    const parameterEdit = (id, name, value) => setDraft(current => ({ ...current, parameters: { ...current.parameters, [id]: { ...current.parameters[id], [name]: value } } }));
+    const action = async run => { if (pending || unavailable) return; setPending(true); setError(null); setNotice(null); try { await run(); } catch (error) { setError(error.message ?? String(error)); } finally { setPending(false); } };
+    const accept = async template => { rememberTemplate(row, template); await refreshTemplates(manager, hostId, true); load(template); setNotice(`Saved ${template.id} revision ${template.revision}. Select this revision in the chat to use it.`); };
+    const control = (label, { multiline, ...props }) => jsx.jsxs('label', { style: { display: 'flex', flexDirection: 'column', gap: 3 }, children: [label, jsx.jsx(multiline ? 'textarea' : 'input', { 'aria-label': label, style: { ...selectStyle, maxWidth: '100%', width: '100%', boxSizing: 'border-box', ...(multiline ? { minHeight: 72, resize: 'vertical' } : {}) }, disabled: locked, ...props })] });
+    const choice = (label, value, values, onChange) => jsx.jsxs('label', { children: [label, ' ', jsx.jsx('select', { 'aria-label': label, style: selectStyle, value, disabled: locked, onChange: event => onChange(event.target.value), children: values.map(option => jsx.jsx('option', { value: option, children: option }, option)) })] });
+    const makeButton = (label, onClick, disabled = pending || unavailable) => jsx.jsx('button', { type: 'button', style: selectStyle, disabled, onClick, children: label });
+    const basic = jsx.jsxs('div', { style: { display: 'grid', gap: 10 }, children: [
+      control('Template ID', { value: draft.id, disabled: locked || Boolean(draft.revision), onChange: event => edit('id', event.target.value) }),
+      control('Template name', { value: draft.name, onChange: event => edit('name', event.target.value) }),
+      control('Template description', { multiline: true, value: draft.description, onChange: event => edit('description', event.target.value) }),
+      jsx.jsx('p', { children: 'Roles use the two selected models. Access is limited by host permissions. Edit the workflow graph, limits and output in Advanced YAML / JSON.' }),
+      ...Object.entries(draft.roles ?? {}).map(([id, role]) => jsx.jsxs('fieldset', { style: { border: '1px solid #8885', borderRadius: 6, padding: 8, display: 'grid', gap: 6 }, children: [jsx.jsx('legend', { children: `Role ${id}` }),
+        choice(`Role ${id} engine`, role.engine, ['codex', 'claude'], value => roleEdit(id, 'engine', value)),
+        choice(`Role ${id} access`, role.access, ['read', 'write'], value => roleEdit(id, 'access', value)),
+        choice(`Role ${id} session`, role.session, ['fresh', 'reuse'], value => roleEdit(id, 'session', value)),
+        control(`Role ${id} prompt`, { multiline: true, value: role.prompt, onChange: event => roleEdit(id, 'prompt', event.target.value) }),
+      ] }, id)),
+      jsx.jsx('strong', { children: 'Parameter definitions' }),
+      ...Object.entries(draft.parameters ?? {}).map(([id, definition]) => jsx.jsxs('fieldset', { style: { border: '1px solid #8885', borderRadius: 6, padding: 8, display: 'grid', gap: 6 }, children: [jsx.jsx('legend', { children: id }),
+        control(`Parameter ${id} name`, { defaultValue: id, onBlur: event => {
+          const name = event.target.value.trim();
+          if (name === id) return;
+          if (!/^[a-z][a-z0-9_-]{0,63}$/.test(name) || Object.hasOwn(draft.parameters, name)) { setError('Parameter names must be unique lowercase IDs.'); event.target.value = id; return; }
+          setDraft(current => { const parameters = { ...current.parameters, [name]: current.parameters[id] }; delete parameters[id]; return { ...current, parameters }; });
+        } }),
+        choice(`Parameter ${id} type`, definition.type, ['integer', 'number', 'boolean', 'string'], type => { const numeric = ['integer', 'number'].includes(type); setDraft(current => ({ ...current, parameters: { ...current.parameters, [id]: { type, default: numeric ? 0 : type === 'boolean' ? false : '', ...(numeric ? { min: 0, max: 5 } : {}), description: definition.description ?? '' } } })); }),
+        control(`Parameter ${id} default`, { type: definition.type === 'boolean' ? 'checkbox' : ['integer', 'number'].includes(definition.type) ? 'number' : 'text', ...(definition.type === 'boolean' ? { checked: definition.default } : { value: definition.default }), onChange: event => parameterEdit(id, 'default', definition.type === 'boolean' ? event.target.checked : ['integer', 'number'].includes(definition.type) ? Number(event.target.value) : event.target.value) }),
+        ...(['integer', 'number'].includes(definition.type) ? ['min', 'max'].map(bound => control(`Parameter ${id} ${bound}`, { type: 'number', value: definition[bound], onChange: event => parameterEdit(id, bound, Number(event.target.value)) })) : []),
+        control(`Parameter ${id} description`, { value: definition.description ?? '', onChange: event => parameterEdit(id, 'description', event.target.value) }),
+        makeButton(`Remove parameter ${id}`, () => setDraft(current => { const parameters = { ...current.parameters }; delete parameters[id]; return { ...current, parameters }; }), locked),
+      ] }, id)),
+      makeButton('Add parameter', () => { const id = unusedId('parameter', Object.keys(draft.parameters ?? {})); edit('parameters', { ...draft.parameters, [id]: { type: 'integer', default: 0, min: 0, max: 5, description: '' } }); }, locked),
+    ] });
+    return jsx.jsxs('section', { 'aria-label': 'Template manager', style: { flexBasis: '100%', width: 'min(680px, 100%)', maxHeight: '65vh', overflow: 'auto', border: '1px solid #8885', borderRadius: 8, padding: 12, display: 'grid', gap: 10, whiteSpace: 'normal' }, children: [
+      jsx.jsx('strong', { children: 'Workflow templates' }),
+      jsx.jsx('select', { 'aria-label': 'Managed template', style: { ...selectStyle, maxWidth: '100%' }, value: catalog.templates.some(item => item.id === draft.id) ? draft.id : '', disabled: pending || unavailable, onChange: event => { const template = catalog.templates.find(item => item.id === event.target.value); if (template) load(template); }, children: [jsx.jsx('option', { value: '', disabled: true, children: 'Unsaved template' }), ...catalog.templates.map(template => jsx.jsx('option', { value: template.id, children: `${template.name} · r${template.revision}${template.builtin ? ' · Built-in' : ''}` }, template.id))] }),
+      jsx.jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6 }, children: [makeButton('New dual template', () => load(blankTemplate(unusedId('new-template', catalog.templates.map(item => item.id))))), makeButton('Duplicate template', () => { const duplicate = copy(draft); duplicate.id = unusedId(`${draft.id.slice(0, 55)}-copy`, catalog.templates.map(item => item.id)); duplicate.name = `${draft.name} copy`; duplicate.builtin = false; delete duplicate.revision; delete duplicate.contentHash; load(duplicate); }), makeButton(advanced ? 'Basic form' : 'Advanced YAML / JSON', () => { if (advanced && text !== JSON.stringify(draft, null, 2)) { setError('Save changes from the YAML / JSON editor before switching to the basic form.'); return; } if (!advanced) setText(JSON.stringify(draft, null, 2)); setAdvanced(!advanced); })] }),
+      readonly ? jsx.jsx('p', { children: 'Built-in templates are read-only. Duplicate to make an editable template with a new ID.' }) : null,
+      advanced ? control('Advanced YAML or JSON', { multiline: true, value: text, readOnly: readonly, style: { ...selectStyle, maxWidth: '100%', width: '100%', minHeight: 240, boxSizing: 'border-box', fontFamily: 'monospace', resize: 'vertical' }, onChange: event => setText(event.target.value) }) : basic,
+      jsx.jsxs('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' }, children: [makeButton('Save template', () => action(async () => { if (readonly) return; const response = await manager.sendRequest(advanced ? 'engine/templates/import' : 'engine/templates/save', advanced ? { text } : { template: copy(draft) }); await accept(response.template); }), locked), makeButton('Delete template', () => action(async () => { if (readonly || !draft.revision) return; await manager.sendRequest('engine/templates/delete', { id: draft.id }); await refreshTemplates(manager, hostId, true); load(row.snapshot.templates[0] ?? blankTemplate('new-template')); setNotice('Template deleted. Historical turn revisions are retained.'); }), locked || !draft.revision)] }),
+      jsx.jsxs('details', { children: [jsx.jsx('summary', { children: 'Import YAML or JSON' }), jsx.jsxs('div', { style: { display: 'grid', gap: 8 }, children: [control('Import YAML or JSON', { multiline: true, disabled: pending || unavailable, value: importText, onChange: event => setImportText(event.target.value) }), jsx.jsx('input', { type: 'file', accept: '.yaml,.yml,.json,application/json,text/yaml', 'aria-label': 'Import template file', disabled: pending || unavailable, onChange: event => { const file = event.target.files?.[0]; if (file) action(async () => { if (file.size > 2 * 1024 * 1024) throw Error('Template files must be at most 2 MiB'); setImportText(await file.text()); }); } }), makeButton('Import template', () => action(async () => { const response = await manager.sendRequest('engine/templates/import', { text: importText }); await accept(response.template); }), pending || unavailable || !importText.trim())] })] }),
+      jsx.jsxs('div', { style: { display: 'flex', gap: 6 }, children: [jsx.jsx('select', { 'aria-label': 'Export format', style: selectStyle, value: format, onChange: event => setFormat(event.target.value), children: ['yaml', 'json'].map(value => jsx.jsx('option', { value, children: value.toUpperCase() }, value)) }), makeButton('Export template', () => action(async () => { const response = await manager.sendRequest('engine/templates/export', { id: draft.id, revision: draft.revision, format }); setExported(response.text); }), pending || unavailable || !draft.revision)] }),
+      exported ? control('Exported template', { multiline: true, disabled: false, readOnly: true, value: exported }) : null,
+      error ? jsx.jsx('div', { role: 'alert', style: { color: 'var(--text-danger, #c44)', overflowWrap: 'anywhere' }, children: error }) : null,
+      notice ? jsx.jsx('div', { role: 'status', children: notice }) : null,
+    ] });
+  }
+  async function refreshRuns(threadId, hostId = 'local', turnId) {
+    const manager = managers.get(hostId);
+    if (!local(hostId) || !manager || !threadId) return;
+    const row = record(null, threadId, hostId), readKey = turnId ?? '*';
+    if (row.runsRead.has(readKey)) return row.runsRead.get(readKey);
+    const pending = (async () => {
+      await Promise.resolve(); // Ensure finally clears an already-published request.
+      try {
+        const response = await manager.sendRequest('engine/runs/read', { threadId, ...(turnId ? { turnId } : {}) });
+        const workflows = { ...row.snapshot.workflows };
+        for (const workflow of response?.workflows ?? []) workflows[workflow.turnId] = copy(workflow);
+        update(row, { workflows, runsError: null });
+      } catch (error) { update(row, { runsError: error.message ?? String(error) }); }
+      finally { row.runsRead.delete(readKey); }
+    })();
+    row.runsRead.set(readKey, pending);
+    return pending;
+  }
+  async function runAction(threadId, hostId, turnId, runId, method) {
+    const manager = managers.get(hostId ?? 'local');
+    if (!local(hostId) || !manager) return;
+    const row = record(null, threadId, hostId), actionKey = `${turnId}:${runId ?? '*'}`;
+    if (row.snapshot.runActions[actionKey]) return;
+    update(row, { runActions: { ...row.snapshot.runActions, [actionKey]: true }, runsError: null });
+    try {
+      await manager.sendRequest(method, { threadId, turnId, ...(runId ? { runId } : {}) });
+      // Wait out an earlier poll so the post-action read cannot reuse stale data.
+      if (row.runsRead.has(turnId)) await row.runsRead.get(turnId);
+      await refreshRuns(threadId, hostId, turnId);
+    } catch (error) { update(row, { runsError: error.message ?? String(error) }); }
+    finally { update(row, { runActions: { ...row.snapshot.runActions, [actionKey]: false } }); }
+  }
+  function SourceBadge({ React, jsx, threadId, hostId = 'local', turnId, raw }) {
+    const row = record(null, threadId, hostId), state = useRecord(React, row);
+    const source = sourceFor(threadId, hostId, turnId, raw);
     React.useEffect(() => { refreshSources(threadId, hostId); }, [threadId, hostId, turnId, raw?.status]);
+    React.useEffect(() => {
+      if (source !== 'both' || !local(hostId) || !threadId || !turnId || ['completed', 'interrupted', 'cancelled'].includes(state.workflows[turnId]?.status)) return;
+      refreshRuns(threadId, hostId, turnId);
+      const timer = setInterval(() => refreshRuns(threadId, hostId, turnId), 2000);
+      return () => clearInterval(timer);
+    }, [source, threadId, hostId, turnId, state.workflows[turnId]?.status]);
     if (!threadId || !turnId) return null;
-    const source = sourceFor(threadId, hostId, turnId, raw), label = source === 'claude' ? 'Claude Code' : 'Codex';
-    return jsx.jsx('div', { 'data-cdx-engine-source': source, style: { fontSize: 11, opacity: 0.65, margin: '8px 0 4px', userSelect: 'none' }, children: label });
+    const label = source === 'both' ? 'Codex + Claude Code' : source === 'claude' ? 'Claude Code' : 'Codex';
+    const workflow = state.workflows[turnId], runs = workflow?.runs ?? [];
+    const blocked = ['blocked', 'failed', 'needs_attention'].includes(workflow?.status);
+    const interactive = local(hostId) && managers.has(hostId);
+    const actionButton = (label, aria, runId, method) => jsx.jsx('button', { type: 'button', 'aria-label': aria, style: selectStyle, disabled: !interactive || Boolean(state.runActions[`${turnId}:${runId ?? '*'}`]), onClick: () => runAction(threadId, hostId, turnId, runId, method), children: label });
+    const errorText = error => typeof error === 'string' ? error : error?.message ?? (error ? JSON.stringify(error) : '');
+    return jsx.jsxs('div', { 'data-cdx-engine-source': source, style: { fontSize: 11, margin: '8px 0 4px', minWidth: 0 }, children: [
+      jsx.jsx('span', { style: { opacity: 0.65 }, children: label }),
+      source === 'both' ? jsx.jsxs('details', { style: { marginTop: 4, border: '1px solid #8884', borderRadius: 6, padding: 6 }, children: [
+        jsx.jsx('summary', { style: { cursor: 'pointer' }, children: `Workflow runs · ${workflow?.status ?? 'loading'} · ${runs.length} runs` }),
+        blocked ? jsx.jsxs('div', { role: 'status', style: { margin: '8px 0' }, children: ['Dependent work is blocked. Retry a failed run or end the turn to keep the partial results. ', actionButton('End turn', 'End workflow turn', null, 'turn/interrupt')] }) : null,
+        ...runs.map(run => jsx.jsxs('details', { 'data-cdx-run-id': run.id, style: { margin: '6px 0', padding: 6, border: '1px solid #8884', borderRadius: 4 }, children: [
+          jsx.jsx('summary', { style: { cursor: 'pointer', overflowWrap: 'anywhere' }, children: `${run.roleId ?? 'Role'} · ${run.stepId ?? run.taskId ?? run.id} · ${run.engine === 'claude' ? 'Claude Code' : run.engine === 'codex' ? 'Codex' : run.engine} · ${run.status}${run.round != null ? ` · round ${run.round}` : ''}${run.attempt != null ? ` · attempt ${run.attempt}` : ''}` }),
+          jsx.jsx('div', { style: { overflowWrap: 'anywhere' }, children: `Requested model: ${run.requestedModel ?? 'engine default'}` }),
+          run.actualModel ? jsx.jsx('div', { style: { overflowWrap: 'anywhere' }, children: `Actual model: ${run.actualModel}` }) : null,
+          run.cwd ? jsx.jsx('div', { style: { overflowWrap: 'anywhere' }, children: `Workspace: ${run.cwd}` }) : null,
+          run.artifact ? jsx.jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: typeof run.artifact === 'string' ? run.artifact : JSON.stringify(run.artifact, null, 2) }) : null,
+          run.text ? jsx.jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 360, overflow: 'auto', userSelect: 'text' }, children: run.text }) : null,
+          run.error ? jsx.jsx('div', { role: 'alert', style: { overflowWrap: 'anywhere' }, children: errorText(run.error) }) : null,
+          ['running', 'inProgress', 'pending', 'waiting', 'awaiting_approval'].includes(run.status) ? actionButton('Stop run', `Stop run ${run.id}`, run.id, 'engine/runs/interrupt') : null,
+          ['failed', 'interrupted', 'cancelled', 'blocked'].includes(run.status) ? actionButton('Retry run', `Retry run ${run.id}`, run.id, 'engine/runs/retry') : null,
+        ] }, run.id)),
+        state.runsError ? jsx.jsx('div', { role: 'alert', children: state.runsError }) : null,
+      ] }) : null,
+    ] });
   }
   globalThis.__cdxEngineModes = {
-    Selector, SourceBadge, capture, requestFields, turnRequestFields, registerManager, noteStarted, observe,
+    Selector, SourceBadge, TemplateControls, TemplateManager, refreshTemplates, refreshRuns, capture, requestFields, turnRequestFields, registerManager, noteStarted, observe,
     permitsNativeMetadata, sourceFor, setDraftSelection, changeSelection, refreshThread, refreshCapabilities,
     getCapabilities: (manager, context) => catalogRecord(manager, context).snapshot,
     getSnapshot: (scope, threadId, hostId) => record(scope, threadId, hostId).snapshot,

@@ -64,3 +64,259 @@ test('both capability and source labels require authoritative engine values', as
   assert.equal(api.sourceFor('chat', 'local', 't', { cdxEngineSource: 'both' }), 'both');
   assert.throws(() => api.requestFields({ ...selection(), engineModels: { claude: 'bad model' } }), /model/i);
 });
+
+const jsx = { jsx: (type, props, key) => ({ type, props, key }), jsxs: (type, props, key) => ({ type, props, key }) };
+function ui(api, component, props = {}) {
+  const slots = []; let index = 0;
+  const React = { useSyncExternalStore: (_subscribe, read) => read(), useEffect: () => {}, useState: initial => { const slot = index++; if (!(slot in slots)) slots[slot] = typeof initial === 'function' ? initial() : initial; return [slots[slot], value => { slots[slot] = typeof value === 'function' ? value(slots[slot]) : value; }]; } };
+  return { render: () => { index = 0; return api[component]({ React, jsx, ...props }); } };
+}
+function nodes(tree) { return !tree || typeof tree !== 'object' ? [] : [tree, ...[].concat(tree.props?.children ?? []).flat(Infinity).flatMap(nodes)]; }
+const find = (tree, label) => nodes(tree).find(node => node.props?.['aria-label'] === label);
+const button = (tree, label) => nodes(tree).find(node => node.type === 'button' && node.props?.children === label);
+const words = tree => nodes(tree).flatMap(node => [].concat(node.props?.children ?? []).filter(value => typeof value === 'string')).join(' ');
+const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+
+function selectorProps(scope, manager, extras = {}) {
+  return { scope, hostId: 'local', getHost: () => 'local', getManager: () => manager, useAtom: () => false, nativeModelPicker: { native: true }, ...extras };
+}
+
+test('both selector uses only authoritative local capability and preserves native model controls', async () => {
+  const { api, scope } = setup();
+  const manager = { getHostId: () => 'local', sendRequest: async () => ({ engines: ['codex', 'claude'], bothAvailable: true, claudeModels: [{ value: 'claude-exact' }] }) };
+  await api.refreshCapabilities(manager);
+  api.setDraftSelection(scope, selection());
+  const props = selectorProps(scope, manager), tree = ui(api, 'Selector', props).render();
+  assert.equal(find(tree, 'Chat engine').props.children[2].props.disabled, false);
+  assert.ok(nodes(tree).includes(props.nativeModelPicker));
+  assert.equal(find(tree, 'Claude Code model').props.value, 'claude-selected');
+  assert.match(words(tree), /Codex model/);
+  assert.match(tree.props.style.flexWrap, /wrap/);
+  find(tree, 'Claude Code model').props.onChange({ target: { value: 'claude-exact' } });
+  await tick();
+  assert.deepEqual(plain(api.capture(scope, 'local').engineModels), { codex: 'gpt-selected', claude: 'claude-exact' });
+  const other = { getHostId: () => 'local', sendRequest: async () => ({ engines: ['codex', 'claude'] }) };
+  await api.refreshCapabilities(other);
+  assert.equal(find(ui(api, 'Selector', selectorProps(scope, other)).render(), 'Chat engine').props.children[2].props.disabled, true);
+  assert.equal(find(ui(api, 'Selector', selectorProps(scope, manager, { hostId: 'remote' })).render(), 'Chat engine').props.children[2].props.disabled, true);
+});
+
+test('both controls disable only the busy chat and include native picker interaction boundary', () => {
+  const { api, scope } = setup(); const manager = { getHostId: () => 'local' };
+  api.observe(manager, 'engine/mode/set', { threadId: 'busy' }, { engineMode: 'both', models: selection().engineModels, busy: true, bothAvailable: true });
+  const busyTree = ui(api, 'Selector', selectorProps(scope, manager, { threadId: 'busy' })).render();
+  assert.equal(find(busyTree, 'Chat engine').props.disabled, true);
+  assert.equal(find(busyTree, 'Claude Code model').props.disabled, true);
+  assert.equal(find(busyTree, 'Codex model controls').props.disabled, true);
+  assert.equal(find(ui(api, 'Selector', selectorProps(scope, manager, { threadId: 'idle' })).render(), 'Chat engine').props.disabled, false);
+});
+
+async function templateSetup() {
+  const { BUILTIN_TEMPLATES } = await import('../../runtime/agent-modes/templates/builtins.mjs');
+  const { api, scope } = setup(), calls = [], templates = plain(BUILTIN_TEMPLATES);
+  const manager = { getHostId: () => 'local', sendRequest: async (method, params) => {
+    calls.push({ method, params: plain(params) });
+    if (method === 'engine/templates/list') return { templates: plain(templates) };
+    if (method === 'engine/templates/read') return { template: plain(templates.find(row => row.id === params.id)) };
+    if (method === 'engine/templates/export') return { text: params.format === 'yaml' ? `id: ${params.id}\nrevision: ${params.revision}\n` : JSON.stringify(templates.find(row => row.id === params.id)) };
+    if (method === 'engine/templates/delete') { templates.splice(templates.findIndex(row => row.id === params.id), 1); return { deleted: true }; }
+    if (method === 'engine/templates/save' || method === 'engine/templates/import') {
+      const template = method.endsWith('import') ? JSON.parse(params.text) : plain(params.template);
+      if (!template.name) throw Object.assign(Error('$.name: must not be empty'), { path: '$.name' });
+      template.revision = (templates.find(row => row.id === template.id)?.revision ?? 0) + 1; template.builtin = false;
+      const previous = templates.findIndex(row => row.id === template.id); if (previous >= 0) templates.splice(previous, 1);
+      templates.push(template); return { template };
+    }
+    throw Error(`Unexpected ${method}`);
+  } };
+  await api.refreshTemplates(manager, 'local');
+  return { api, scope, manager, calls, templates };
+}
+
+test('template selector defaults to Polly and Debby discussion changes 0 to 1 with bounded rounds', async () => {
+  const { api, scope, manager } = await templateSetup(), changes = [];
+  let selected = api.getSnapshot(scope).template;
+  const props = { manager, hostId: 'local', selection: selected, disabled: false, onChange: value => { selected = value; changes.push(value); props.selection = value; } };
+  const view = ui(api, 'TemplateControls', props);
+  assert.equal(find(view.render(), 'Workflow template').props.value, 'polly@1');
+  find(view.render(), 'Workflow template').props.onChange({ target: { value: 'debby@1' } });
+  const debby = ui(api, 'TemplateControls', { ...props, selection: selected });
+  assert.equal(find(debby.render(), 'Enable discussion').props.checked, false);
+  find(debby.render(), 'Enable discussion').props.onChange({ target: { checked: true } });
+  assert.equal(changes.at(-1).parameters.rounds, 1);
+  const enabled = ui(api, 'TemplateControls', { ...props, selection: changes.at(-1) }).render();
+  assert.equal(find(enabled, 'Discussion rounds').props.min, 1);
+  assert.equal(find(enabled, 'Discussion rounds').props.max, 5);
+  assert.match(words(enabled), /selected Claude model/);
+});
+
+test('template manager copies builtins, edits roles and definitions, and saves a separate revision', async () => {
+  const { api, manager, calls } = await templateSetup();
+  const view = ui(api, 'TemplateManager', { manager, hostId: 'local' });
+  assert.equal(find(view.render(), 'Template name').props.disabled, true);
+  assert.equal(button(view.render(), 'Save template').props.disabled, true);
+  button(view.render(), 'Duplicate template').props.onClick();
+  let tree = view.render();
+  assert.equal(find(tree, 'Template ID').props.value, 'polly-copy');
+  find(tree, 'Template name').props.onChange({ target: { value: 'My coordinator' } });
+  find(view.render(), 'Role planner engine').props.onChange({ target: { value: 'codex' } });
+  find(view.render(), 'Role planner prompt').props.onChange({ target: { value: 'Coordinate this work.' } });
+  button(view.render(), 'Add parameter').props.onClick();
+  assert.ok(find(view.render(), 'Parameter parameter type'));
+  await button(view.render(), 'Save template').props.onClick();
+  const saved = calls.findLast(call => call.method === 'engine/templates/save').params.template;
+  assert.equal(saved.id, 'polly-copy'); assert.equal(saved.name, 'My coordinator');
+  assert.equal(saved.roles.planner.engine, 'codex'); assert.equal(saved.roles.planner.prompt, 'Coordinate this work.');
+  assert.equal(saved.builtin, false); assert.equal(saved.revision, undefined);
+  assert.equal(find(view.render(), 'Template ID').props.value, 'polly-copy');
+  await button(view.render(), 'Export template').props.onClick();
+  assert.match(find(view.render(), 'Exported template').props.value, /id: polly-copy/);
+  await button(view.render(), 'Delete template').props.onClick();
+  assert.equal(calls.findLast(call => call.method === 'engine/templates/delete').params.id, 'polly-copy');
+});
+
+test('new dual template is schema-valid and advanced import preserves optimistic revision and errors', async () => {
+  const { validateTemplate } = await import('../../runtime/agent-modes/templates/schema.mjs');
+  const { api, manager, calls } = await templateSetup();
+  const view = ui(api, 'TemplateManager', { manager, hostId: 'local' });
+  button(view.render(), 'New dual template').props.onClick();
+  await button(view.render(), 'Save template').props.onClick();
+  assert.doesNotThrow(() => validateTemplate(calls.findLast(call => call.method === 'engine/templates/save').params.template));
+  button(view.render(), 'Advanced YAML / JSON').props.onClick();
+  let advanced = JSON.parse(find(view.render(), 'Advanced YAML or JSON').props.value);
+  assert.equal(advanced.revision, 1); advanced.description = 'Changed description';
+  find(view.render(), 'Advanced YAML or JSON').props.onChange({ target: { value: JSON.stringify(advanced) } });
+  await button(view.render(), 'Save template').props.onClick();
+  assert.equal(JSON.parse(calls.findLast(call => call.method === 'engine/templates/import').params.text).revision, 1);
+  find(view.render(), 'Import YAML or JSON').props.onChange({ target: { value: JSON.stringify({ ...advanced, name: '' }) } });
+  await button(view.render(), 'Import template').props.onClick();
+  assert.match(words(view.render()), /\$\.name: must not be empty/);
+});
+
+test('both source panel attributes roles, keeps unreported models absent and stops or retries runs', async () => {
+  const { api } = setup(), calls = [];
+  const manager = { getHostId: () => 'local', sendRequest: async (method, params) => {
+    calls.push({ method, params });
+    return method === 'engine/runs/read' ? { workflows: [{ turnId: 't', workflowId: 'w', status: 'blocked', runs: [
+      { id: 'c', roleId: 'planner', stepId: 'plan', engine: 'claude', status: 'failed', requestedModel: 'claude-selected', text: 'partial plan', error: 'Network failure' },
+      { id: 'x', roleId: 'worker', stepId: 'task-1', engine: 'codex', status: 'running', requestedModel: 'gpt-selected', actualModel: 'gpt-actual', text: 'code output' },
+    ] }] } : {};
+  } };
+  api.registerManager(manager);
+  await api.refreshRuns('chat', 'local', 't');
+  api.observe(manager, 'engine/turns/read', { threadId: 'chat' }, { turns: { t: 'both' } });
+  api.observe(manager, 'engine/mode/set', { threadId: 'chat' }, { engineMode: 'codex', models: {} });
+  const view = ui(api, 'SourceBadge', { threadId: 'chat', hostId: 'local', turnId: 't', raw: {} });
+  let tree = view.render();
+  assert.equal(tree.props['data-cdx-engine-source'], 'both');
+  assert.ok(nodes(tree).some(node => node.type === 'details'));
+  assert.match(words(tree), /Codex \+ Claude Code/);
+  assert.match(words(tree), /planner/); assert.match(words(tree), /task-1/);
+  assert.match(words(tree), /partial plan/); assert.match(words(tree), /Requested model: claude-selected/);
+  assert.equal((words(tree).match(/Actual model:/g) ?? []).length, 1);
+  assert.match(words(tree), /Dependent work is blocked/);
+  await find(tree, 'Retry run c').props.onClick();
+  await find(view.render(), 'Stop run x').props.onClick();
+  await button(view.render(), 'End turn').props.onClick();
+  assert.deepEqual(plain(calls.find(call => call.method === 'engine/runs/retry').params), { threadId: 'chat', turnId: 't', runId: 'c' });
+  assert.deepEqual(plain(calls.find(call => call.method === 'engine/runs/interrupt').params), { threadId: 'chat', turnId: 't', runId: 'x' });
+  assert.deepEqual(plain(calls.find(call => call.method === 'turn/interrupt').params), { threadId: 'chat', turnId: 't' });
+});
+
+test('template manager exposes a native import disclosure and editable named parameter definitions', async () => {
+  const { api, manager, calls } = await templateSetup(), view = ui(api, 'TemplateManager', { manager, hostId: 'local' });
+  const disclosure = nodes(view.render()).find(node => node.type === 'details');
+  assert.equal(disclosure.props.children[0].type, 'summary');
+  button(view.render(), 'New dual template').props.onClick();
+  button(view.render(), 'Add parameter').props.onClick();
+  find(view.render(), 'Parameter parameter name').props.onBlur({ target: { value: 'depth' } });
+  assert.ok(find(view.render(), 'Parameter depth type'));
+  find(view.render(), 'Parameter depth type').props.onChange({ target: { value: 'boolean' } });
+  find(view.render(), 'Parameter depth default').props.onChange({ target: { checked: true } });
+  await button(view.render(), 'Save template').props.onClick();
+  assert.deepEqual(calls.findLast(call => call.method === 'engine/templates/save').params.template.parameters.depth, { type: 'boolean', default: true, description: '' });
+  assert.equal(nodes(view.render()).some(node => node.props?.multiline !== undefined), false);
+});
+
+test('advanced YAML edits cannot be silently discarded by switching to the basic form', async () => {
+  const { api, manager } = await templateSetup(), view = ui(api, 'TemplateManager', { manager, hostId: 'local' });
+  button(view.render(), 'New dual template').props.onClick();
+  button(view.render(), 'Advanced YAML / JSON').props.onClick();
+  find(view.render(), 'Advanced YAML or JSON').props.onChange({ target: { value: 'id: custom\nrevision: 2\n' } });
+  button(view.render(), 'Basic form').props.onClick();
+  assert.equal(find(view.render(), 'Advanced YAML or JSON').props.value, 'id: custom\nrevision: 2\n');
+  assert.match(words(view.render()), /Save.*YAML.*before.*basic form/);
+});
+
+test('synchronous template and run transport failures can be retried and remain local', async () => {
+  const { api } = setup(); let count = 0;
+  const manager = { getHostId: () => 'local', sendRequest: () => { count++; throw Error('Offline'); } };
+  await api.refreshTemplates(manager); await api.refreshTemplates(manager);
+  assert.equal(count, 2);
+  api.registerManager(manager);
+  await api.refreshRuns('chat', 'local', 'turn'); await api.refreshRuns('chat', 'local', 'turn');
+  assert.equal(count, 4);
+  await api.refreshTemplates(manager, 'remote'); await api.refreshRuns('chat', 'remote', 'turn');
+  assert.equal(count, 4);
+});
+
+test('custom template parameters use schema types and describe a selected Codex coordinator', async () => {
+  const { api, manager, templates } = await templateSetup();
+  const custom = plain(templates[1]); custom.id = 'custom'; custom.roles.moderator.engine = 'codex';
+  custom.parameters = { flag: { type: 'boolean', default: false }, note: { type: 'string', default: 'test' }, count: { type: 'integer', min: 1, max: 4, default: 2 } };
+  templates.push(custom); await api.refreshTemplates(manager, 'local', true);
+  const changes = [], view = ui(api, 'TemplateControls', { manager, selection: { id: 'custom', revision: 1, parameters: {} }, onChange: value => changes.push(value) });
+  assert.match(words(view.render()), /selected Codex model/);
+  find(view.render(), 'Template parameter flag').props.onChange({ target: { checked: true } });
+  assert.equal(changes.at(-1).parameters.flag, true);
+  find(view.render(), 'Template parameter count').props.onChange({ target: { value: '5' } });
+  assert.equal(changes.length, 1);
+  find(view.render(), 'Template parameter count').props.onChange({ target: { value: '3' } });
+  assert.equal(changes.at(-1).parameters.count, 3);
+});
+
+test('template manager round-trips real YAML and reports revision conflicts from the template store', async t => {
+  const { TemplateStore } = await import('../../runtime/agent-modes/templates/store.mjs');
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const directory = mkdtempSync(join(tmpdir(), 'dual-template-ui-')); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const store = new TemplateStore(directory), { api } = setup(), calls = [];
+  const manager = { sendRequest: async (method, params) => {
+    params = plain(params); // The production RPC serializes across renderer/gateway realms.
+    calls.push({ method, params: plain(params) });
+    if (method.endsWith('/list')) return { templates: store.list() };
+    if (method.endsWith('/save')) return { template: store.save(params.template) };
+    if (method.endsWith('/import')) return { template: store.import(params.text) };
+    if (method.endsWith('/export')) return { text: store.export(params.id, params.revision, params.format) };
+    throw Error(method);
+  } };
+  await api.refreshTemplates(manager);
+  const view = ui(api, 'TemplateManager', { manager, hostId: 'local', initialId: 'polly' });
+  button(view.render(), 'Duplicate template').props.onClick();
+  await button(view.render(), 'Save template').props.onClick();
+  assert.equal(store.read('polly-copy').revision, 1);
+  const yaml = store.export('polly-copy', 1, 'yaml').replace('name: Polly', 'name: Edited Polly');
+  button(view.render(), 'Advanced YAML / JSON').props.onClick();
+  find(view.render(), 'Advanced YAML or JSON').props.onChange({ target: { value: yaml } });
+  await button(view.render(), 'Save template').props.onClick();
+  assert.equal(calls.findLast(call => call.method.endsWith('/import')).params.text, yaml);
+  assert.equal(store.read('polly-copy').revision, 2);
+  store.save({ ...store.read('polly-copy'), description: 'Updated in another window' });
+  button(view.render(), 'Advanced YAML / JSON').props.onClick();
+  await button(view.render(), 'Save template').props.onClick();
+  assert.match(words(view.render()), /\$\.revision: revision conflict/);
+  assert.equal(store.read('polly-copy').description, 'Updated in another window');
+});
+
+test('completed historical workflows read once without persistent polling', async () => {
+  const { api } = setup(); let reads = 0;
+  api.registerManager({ getHostId: () => 'local', sendRequest: async () => { reads++; return { workflows: [{ turnId: 't', status: 'completed', runs: [] }] }; } });
+  await api.refreshRuns('chat', 'local', 't');
+  const effects = [];
+  const React = { useSyncExternalStore: (_subscribe, read) => read(), useEffect: fn => effects.push(fn) };
+  api.SourceBadge({ React, jsx, threadId: 'chat', hostId: 'local', turnId: 't', raw: { cdxEngineSource: 'both' } });
+  const cleanup = effects[1]();
+  if (typeof cleanup === 'function') cleanup();
+  assert.equal(cleanup, undefined);
+});
