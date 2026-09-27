@@ -97,3 +97,7 @@ node tests/agent-modes/live-permissions.mjs
 回退时先退出 `chatgpt-dev`，将当前应用移到另一个保留位置，再把记录中的原应用备份复制回 `/Applications/chatgpt-dev.app`。保留 `engine-conversations` 数据目录；回退后原版界面不会显示 Claude 的附加历史，再次安装补丁后可恢复。回退不要求删除或改写原生 Codex 历史。
 
 源代码在 `codex/claude-code-modes` 分支，原有模型选择定制单独保存在基线提交中。此改造不包含 Omnigent 服务；后续可在现有引擎适配器上增加执行策略、每轮多个运行、隔离工作树、预算和结果汇总。
+
+## 远程验证进展
+
+2026-09-27 已通过 SSH 验证 rno、bar、ala、blc、blc-2、sko 的真实 Claude 推理和远程文件读取，以及 rno 的原生会话恢复。测试需要将集群请求通过 SSH 转发到本机可用的 Foundry 连接。当前安装版尚未接入远程 Claude 选择器；具体结果、未连通别名和待实现边界见[远程验证记录](remote-claude-validation.md)与[远程接入设计草案](superpowers/specs/2026-09-27-remote-agent-modes-design.md)。
