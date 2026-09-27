@@ -41,7 +41,11 @@ function json(value, path = '$', seen = new Set(), depth = 0) {
   if (typeof value === 'number' && Number.isFinite(value)) return;
   if (typeof value !== 'object') fail(path, 'expected serializable JSON data');
   if (seen.has(value)) fail(path, 'cyclic data is not supported');
-  if (!Array.isArray(value)) object(value, path);
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      if (!own(value, index)) fail(`${path}[${index}]`, 'sparse arrays are not serializable template data');
+    }
+  } else object(value, path);
   seen.add(value);
   for (const [key, item] of Object.entries(value)) json(item, `${path}${Array.isArray(value) ? `[${key}]` : `.${key}`}`, seen, depth + 1);
   seen.delete(value);
@@ -96,6 +100,7 @@ export function resolveParameters(template, values = {}) {
 function bound(value, path, min, max, template) {
   if (typeof value === 'number') { integer(value, path, min, max); return value; }
   fields(value, ['parameter'], path);
+  validateId(value.parameter, `${path}.parameter`);
   const definition = template.parameters[value.parameter];
   if (!definition || definition.type !== 'integer') fail(`${path}.parameter`, `unknown or non-integer parameter ${String(value.parameter)}`);
   if (definition.min < min || definition.max > max) fail(path, `parameter bounds must fit ${min}–${max}`);

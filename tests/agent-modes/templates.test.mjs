@@ -218,6 +218,26 @@ test('repeat validates prior-round snapshots, bounded counts and zero-round outp
   ]) { const invalid = clone(value); change(invalid); assert.throws(() => validateTemplate(invalid), expected); }
 });
 
+test('all bounded parameter references require scalar valid parameter IDs', () => {
+  const cases = [
+    ['debby', 'repeat', 'count', 'rounds'],
+    ['polly', 'planTasks', 'maxTasks', 'task_count'],
+    ['polly', 'crossReview', 'maxRepairs', 'repairs'],
+  ];
+  for (const [id, type, field, name] of cases) {
+    const value = clone(BUILTIN_TEMPLATES.find(item => item.id === id));
+    const max = field === 'maxTasks' ? 8 : 2;
+    value.parameters[name] = { type: 'integer', default: 1, min: 1, max };
+    const step = value.steps.find(item => item.type === type);
+    step[field] = { parameter: name };
+    assert.doesNotThrow(() => validateTemplate(value));
+    for (const invalid of [[name], { name }, 1, null, '', '../rounds', 'Rounds']) {
+      step[field] = { parameter: invalid };
+      assert.throws(() => validateTemplate(value), new RegExp(`${field}\\.parameter`));
+    }
+  }
+});
+
 test('Polly binds dynamic tasks to slots and enforces opposite-engine read-only review', () => {
   const value = clone(BUILTIN_TEMPLATES.find(item => item.id === 'polly'));
   const execute = value.steps.find(step => step.type === 'executeTasks');
@@ -283,4 +303,19 @@ test('tampered revisions are rejected and failed validation never replaces curre
   const disk = JSON.parse(readFileSync(revisionFile, 'utf8')); disk.name = 'Tampered';
   writeFileSync(revisionFile, JSON.stringify(disk));
   assert.throws(() => store.read('custom', 1), /hash|integrity/i);
+});
+
+test('sparse arrays are rejected before save can replace a readable current revision', t => {
+  const { store, directory } = setup(t);
+  const saved = store.save(template());
+  for (const field of ['inputs', 'dependsOn']) {
+    const sparse = clone(saved);
+    sparse.steps[1][field] = Array(1);
+    assert.throws(() => store.save(sparse), new RegExp(`${field}\\[0\\].*sparse|${field}\\[0\\].*missing`));
+    assert.deepEqual(store.read('custom'), saved);
+    assert.deepEqual(new TemplateStore(directory).read('custom', 1), saved);
+  }
+  const sparse = clone(saved); sparse.output.sources = Array(1);
+  assert.throws(() => store.save(sparse), /output.sources\[0\].*sparse|output.sources\[0\].*missing/);
+  assert.deepEqual(readdirSync(join(directory, 'custom', 'revisions')), ['1.json']);
 });
