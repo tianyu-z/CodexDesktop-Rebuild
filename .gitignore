@@ -3,6 +3,7 @@ Codex.app/
 
 # Dependencies
 node_modules/
+/node_modules
 
 # Build outputs
 out/
@@ -43,3 +44,7 @@ resources/bin/
 resources/codex
 resources/codex.exe
 .claude/
+
+# Agent integration generated artifacts
+.artifacts/
+runtime/agent-modes/node_modules/
