@@ -195,3 +195,14 @@ test('nullable role cursors, cross-engine retries and legacy finish cannot break
   assert.equal(store.get('chat').activeTurn.id, 'workflow');
   assert.equal(store.get('chat').turns[0].runs[0].text, 'retained');
 });
+
+test('explicit model selection survives mode changes and stale visible native metadata', () => {
+  const { store, directory } = setup();
+  store.setMode('chat', 'both', { models: { codex: 'explicit-choice' } });
+  store.setMode('chat', 'claude');
+  store.mergeNativeThread({ ...metadata, model: 'old-visible-model' });
+  store.setMode('chat', 'codex');
+  store.mergeNativeThread({ ...metadata, model: 'old-visible-model' });
+  store.setMode('chat', 'both');
+  assert.equal(new ConversationStore(directory).get('chat').models.codex, 'explicit-choice');
+});

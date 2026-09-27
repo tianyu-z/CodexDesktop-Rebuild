@@ -45,8 +45,9 @@ export function publicHistory(conversation, afterSeq = 0) {
       const header = `[Run ${run.id}; engine ${run.engine}; role ${run.roleId}; step ${run.stepId}; round ${run.round}; attempt ${run.attempt}; status ${run.status}; requested model ${run.requestedModel ?? 'default'}; actual model ${run.actualModel ?? 'unknown'}]`;
       // Only public outcomes belong in a handoff. Never serialize native event
       // envelopes, private reasoning, settings, or internal session metadata.
-      const displayed = row.turn.items.some(item => item.cdxRunId === run.id && item.type === 'agentMessage' && item.text);
-      const outcome = !displayed ? run.text || (run.structuredOutput ? JSON.stringify(run.structuredOutput) : '') : '';
+      const displayed = row.turn.items.filter(item => item.cdxRunId === run.id && item.type === 'agentMessage').map(item => item.text);
+      const parts = [run.text, run.structuredOutput ? JSON.stringify(run.structuredOutput) : ''].filter(Boolean);
+      const outcome = [...new Set(parts)].filter(text => !displayed.includes(text)).join('\n');
       items.push(`${header}${outcome ? `\n${outcome}` : ''}`);
     }
     return `[Turn ${row.seq}; engine ${row.engine}; status ${row.turn.status}]\n${items.join('\n\n')}`;

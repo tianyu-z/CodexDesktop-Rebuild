@@ -18,7 +18,10 @@ export function toolItem(event, cwd) {
   };
 }
 
-export function presentItem(item, engine) { return { ...structuredClone(item), cdxEngineSource: engine }; }
+export function presentItem(item, engine) {
+  const source = engine === 'both' && ['codex', 'claude'].includes(item.cdxEngineSource) ? item.cdxEngineSource : engine;
+  return { ...structuredClone(item), cdxEngineSource: source };
+}
 export function presentTurn(turn, engine) {
   return { ...structuredClone(turn), items: turn.items.map(item => presentItem(item, engine)), cdxEngineSource: engine, itemsView: 'full' };
 }

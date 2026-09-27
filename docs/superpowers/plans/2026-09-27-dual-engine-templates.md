@@ -40,7 +40,7 @@ new WorkflowScheduler({ runner, workspaces, onEvent, onPermission }).start({
 
 Files: create `runtime/agent-modes/templates/{schema,builtins,store}.mjs`, template attribution/license files, and `tests/agent-modes/templates.test.mjs`; update only isolated runtime package/lock if YAML dependency is needed.
 
-- [ ] Write failing behavior tests for built-ins, YAML/JSON round trips, immutable revisions, invalid graphs/parameters and role references.
+- [x] Write failing behavior tests for built-ins, YAML/JSON round trips, immutable revisions, invalid graphs/parameters and role references.
 
 ```js
 const repository = new TemplateStore(tempDirectory);
@@ -52,17 +52,17 @@ assert.equal(repository.read(saved.id, saved.revision).name, 'My debate');
 assert.throws(() => repository.save({...copy, unexpected: true}), /unexpected/);
 ```
 
-- [ ] Run `node --test tests/agent-modes/templates.test.mjs`; establish meaningful failure before production implementation.
-- [ ] Implement strict declarative schema. Roles: `{engine,prompt,access,session}`; parameters: typed defaults/min/max; steps: run, parallel, repeat, synthesize, planTasks, executeTasks, crossReview; limits: concurrency 1–4, tasks 1–32, rounds 0–10. Validate unknown fields, IDs, DAGs, reachable dual engines, role/input references, bounded repeats and review ownership. Publish precise step schemas in a local README consumed by following tasks.
-- [ ] Built-in Debby: parallel independent answers, optional rounds referencing the other's previous answer, Claude synthesis; parameter `rounds` defaults 0 with UI toggle enabling 1. Polly: Claude planner, dynamically assigned Codex/Claude tasks, opposite-engine review, integration and Claude summary. Both share slot-bound models.
-- [ ] Implement atomic revision files and immutable read snapshots, read-only built-ins, safe IDs/paths, JSON/YAML import/export. Import parses only data and fails on unsupported upstream fields/tags. Preserve Apache 2.0 attribution to Omnigent revision `56c6a7f73024a257a5d359378e8ebb68a66dde7f`.
-- [ ] Run focused tests, then spec review and quality review. Commit only task files.
+- [x] Run `node --test tests/agent-modes/templates.test.mjs`; establish meaningful failure before production implementation.
+- [x] Implement strict declarative schema. Roles: `{engine,prompt,access,session}`; parameters: typed defaults/min/max; steps: run, parallel, repeat, synthesize, planTasks, executeTasks, crossReview; limits: concurrency 1–4, tasks 1–32, rounds 0–10. Validate unknown fields, IDs, DAGs, reachable dual engines, role/input references, bounded repeats and review ownership. Publish precise step schemas in a local README consumed by following tasks.
+- [x] Built-in Debby: parallel independent answers, optional rounds referencing the other's previous answer, Claude synthesis; parameter `rounds` defaults 0 with UI toggle enabling 1. Polly: Claude planner, dynamically assigned Codex/Claude tasks, opposite-engine review, integration and Claude summary. Both share slot-bound models.
+- [x] Implement atomic revision files and immutable read snapshots, read-only built-ins, safe IDs/paths, JSON/YAML import/export. Import parses only data and fails on unsupported upstream fields/tags. Preserve Apache 2.0 attribution to Omnigent revision `56c6a7f73024a257a5d359378e8ebb68a66dde7f`.
+- [x] Run focused tests, then spec review and quality review. Commit only task files.
 
 ## Task 2: Native role runners and enforced role access
 
 Files: create `runtime/agent-modes/orchestration/{role-runner,codex-role}.mjs`, modify `claude-adapter.mjs` for optional role options, add `tests/agent-modes/{role-runner,codex-role}.test.mjs` and relevant adapter tests.
 
-- [ ] Write failing tests for simultaneous isolated executions, exact per-engine model selection, restricted read tools, structured planning output, stream/error/cancel ownership, session resume and native approval mapping.
+- [x] Write failing tests for simultaneous isolated executions, exact per-engine model selection, restricted read tools, structured planning output, stream/error/cancel ownership, session resume and native approval mapping.
 
 ```js
 const run = runner.start({runId:'r1',engine:'claude',model:'claude-opus-5-5',cwd,
@@ -73,11 +73,11 @@ assert.equal(recordedOptions.model, 'claude-opus-5-5');
 assert.equal(recordedOptions.systemPrompt.preset, 'claude_code');
 ```
 
-- [ ] Run focused tests and observe failure.
-- [ ] Codex role owns an App Server client, initialization, internal thread and turn, normalized public tool/message events and mapped request/response IDs. Use original CLI path, not gateway wrapper. Use ephemeral threads where supported to avoid sidebar pollution; stable role sessions resume explicitly. Preserve native approval/sandbox options; read role uses native read-only sandbox and denies escalation/writes. No forced never-approve/bypass setting.
-- [ ] Claude optional role instructions append to preset, output schema uses supported SDK option, and read access exposes only read tools with strict MCP policy and denial hooks. Keep user/project settings for normal single-engine execution. For role restriction, ensure configured hooks, plugins or MCP cannot create a bypass; verify actual CLI support before advertising enforced read access.
-- [ ] Both adapters return the shared runner contract and capture requested/actual model separately. A terminal result settles once after process cleanup; stop before start, pending approval and unexpected exit are covered. Track only owned processes and native sessions.
-- [ ] Run focused and adapter regression tests. Review spec then quality; commit.
+- [x] Run focused tests and observe failure.
+- [x] Codex role owns an App Server client, initialization, internal thread and turn, normalized public tool/message events and mapped request/response IDs. Use original CLI path, not gateway wrapper. Use ephemeral threads where supported to avoid sidebar pollution; stable role sessions resume explicitly. Preserve native approval/sandbox options; read role uses native read-only sandbox and denies escalation/writes. No forced never-approve/bypass setting.
+- [x] Claude optional role instructions append to preset, output schema uses supported SDK option, and read access exposes only read tools with strict MCP policy and denial hooks. Keep user/project settings for normal single-engine execution. For role restriction, ensure configured hooks, plugins or MCP cannot create a bypass; verify actual CLI support before advertising enforced read access.
+- [x] Both adapters return the shared runner contract and capture requested/actual model separately. A terminal result settles once after process cleanup; stop before start, pending approval and unexpected exit are covered. Track only owned processes and native sessions.
+- [x] Run focused and adapter regression tests. Review spec then quality; commit.
 
 ## Task 3: Workspaces, fixed review snapshots and integration
 
@@ -158,6 +158,16 @@ Files: create `tests/agent-modes/live-dual.mjs`; update `docs/agent-modes.md` an
 
 ## Review and execution notes
 
-Use independently scoped implementers, then independent spec and quality review. Tasks 2 (native runners) and 3 (Git workspaces) have no dependency on each other and own disjoint source/tests: execute them concurrently under dispatching-parallel-agents, with commits serialized by the controller. Do not begin dependent scheduler/router integration until their reviews pass. The controller may perform capability research while implementation runs. Reuse the active worktree and preserve the published previous version. Do not push unfinished implementation merely because previous-version publishing was authorized; current task is to make and verify the feature locally.
+Use independently scoped implementers, then independent spec and quality review. Tasks 2 (native runners) and 3 (Git workspaces) have no dependency on each other and own disjoint source/tests: execute them concurrently under dispatching-parallel-agents, with commits serialized by the controller. Native runner review is complete. The generic scheduler may be implemented against the reviewed runner/template contracts while the workspace transaction fix is reviewed; actual Polly workspace integration and live file application still wait for workspace spec and quality approval. Frontend controls and request propagation are independently owned and may proceed against the documented RPC contract. The controller may perform capability research while implementation runs. Reuse the active worktree and preserve the published previous version. Do not push unfinished implementation merely because previous-version publishing was authorized; current task is to make and verify the feature locally.
 
 All six tasks are necessary for the requested first release. The task is not complete when only the selector or Debby works.
+
+
+## Execution checkpoint
+
+- Template data/schema/revision store: spec and quality approved.
+- Native role runners: spec and quality approved, 60 focused tests plus real new/resume smoke for both engines.
+- Workflow conversation store and public handoff: implemented; final quality fixes under re-review.
+- Workspace manager: initial implementation complete; review fixes in progress, including ancestor-safe apply via an isolated Node helper pinned to directory identity.
+- Renderer dual selection snapshots: 32 focused tests passed; full controls/template management/run presentation and asset seams in progress independently.
+- Scheduler, gateway integration, live full workflows, preview and installed-app validation remain required.

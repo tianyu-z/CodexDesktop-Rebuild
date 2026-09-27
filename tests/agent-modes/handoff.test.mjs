@@ -76,3 +76,13 @@ test('dual handoff preserves role outcomes and partial failure attribution witho
   assert.doesNotMatch(h.text, /private-dual-reasoning/);
   assert.equal(h.throughSeq, 3);
 });
+
+test('partial commentary cannot suppress the final role text or structured result', () => {
+  const c = conversation();
+  c.turns.push({ seq: 3, engine: 'both', runs: [{ id: 'planner', engine: 'claude', roleId: 'planner', stepId: 'plan', round: 0, attempt: 1, status: 'completed',
+    text: 'The plan has two tasks.', structuredOutput: { tasks: [{ id: 'backend' }, { id: 'frontend' }] } }],
+  turn: { id: 'dual', status: 'completed', items: [{ type: 'agentMessage', text: 'I am preparing a plan.', cdxRunId: 'planner', cdxRoleId: 'planner', cdxEngineSource: 'claude' }] } });
+  const text = buildHandoff(c, 'codex').text;
+  assert.match(text, /The plan has two tasks/);
+  assert.match(text, /backend/); assert.match(text, /frontend/);
+});

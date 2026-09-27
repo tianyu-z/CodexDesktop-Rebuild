@@ -131,7 +131,7 @@ export class ConversationStore {
     const { turns = [], ...metadata } = thread;
     value.thread = { ...value.thread, ...clone(metadata), preview: metadata.preview || value.thread.preview, updatedAt: Math.max(metadata.updatedAt ?? 0, value.thread.updatedAt ?? 0), recencyAt: Math.max(metadata.recencyAt ?? 0, value.thread.recencyAt ?? 0) };
     value.cwd = thread.cwd ?? value.cwd;
-    if (value.mode !== 'both' && thread.model && !thread.model.startsWith('claude-code/')) value.models.codex = thread.model;
+    if (value.mode !== 'both' && !value.explicitModels?.codex && thread.model && !thread.model.startsWith('claude-code/')) value.models.codex = thread.model;
     for (const turn of turns) {
       const existing = value.turns.find(row => row.turn.id === turn.id);
       if (existing && existing.turn.status !== 'inProgress' && turn.status === 'inProgress') continue;
@@ -149,8 +149,11 @@ export class ConversationStore {
     const value = this.require(id);
     if (value.activeRun) throw new Error('Finish or interrupt the active run before switching engines.');
     value.mode = mode;
-    if (model) value.models[mode] = model;
-    if (nextModels) value.models = { ...value.models, ...nextModels };
+    if (model) { value.models[mode] = model; value.explicitModels = { ...value.explicitModels, [mode]: true }; }
+    if (nextModels) {
+      value.models = { ...value.models, ...nextModels };
+      value.explicitModels = { ...value.explicitModels, ...Object.fromEntries(Object.keys(nextModels).map(engine => [engine, true])) };
+    }
     if (nextTemplate !== undefined) value.template = nextTemplate;
     this.save(value);
     return clone(value);
@@ -219,6 +222,7 @@ export class ConversationStore {
     row.workflow = { id: workflowId, status: 'running', config: frozen, events: [], state: null };
     value.mode = 'both';
     value.models = { ...value.models, ...models };
+    value.explicitModels = { ...value.explicitModels, ...Object.fromEntries(Object.keys(models).map(engine => [engine, true])) };
     value.template = template;
     value.activeTurn = { id: workflowId, turnId: turn.id, mode: 'both' };
     this.save(value);
