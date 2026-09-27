@@ -41,10 +41,10 @@ test('native history refresh cannot erase or duplicate Claude turns', () => {
   assert.equal(store.get('thread-one').turns[1].turn.items[0].text, 'second');
 });
 
-test('only an idle conversation can change modes and Both never becomes executable', () => {
+test('only an idle conversation can change modes, including Both', () => {
   const { store } = setup();
   store.ensureThread(thread());
-  assert.throws(() => store.setMode('thread-one', 'both'), /not.*implemented|not.*available/i);
+  assert.equal(store.setMode('thread-one', 'both').mode, 'both');
   assert.throws(() => store.setMode('thread-one', 'unknown'), /mode/i);
   store.beginRun('thread-one', { id: 'r1', turnId: 't1', engine: 'claude' });
   assert.throws(() => store.setMode('thread-one', 'claude'), /active|running/i);
