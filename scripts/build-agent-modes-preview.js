@@ -19,6 +19,8 @@ async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = pat
   const asar = await import('@electron/asar');
   const { patchAssets } = require('./patch-agent-modes.js');
   const { patchCatalogBuild } = require('./patch-agent-catalog.js');
+  const { patchRemoteBuild } = require('./patch-agent-remote.js');
+  const { packageRemoteRuntime } = require('./remote-runtime-package.js');
   const source = path.join(ROOT, 'src', 'mac-arm64', '_asar');
   const version = JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8')).version;
   if (version !== VERSION) throw new Error(`Unsupported source version ${version}; expected ${VERSION}.`);
@@ -27,6 +29,7 @@ async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = pat
   execFileSync('/bin/cp', ['-cR', source, stagedAsar]);
   patchAssets(path.join(stagedAsar, 'webview', 'assets'));
   patchCatalogBuild(path.join(stagedAsar, '.vite', 'build'));
+  patchRemoteBuild(path.join(stagedAsar, '.vite', 'build'));
   const bootstrap = path.join(stagedAsar, '.vite', 'build', 'early-bootstrap.js');
   fs.writeFileSync(bootstrap, patchBootstrap(fs.readFileSync(bootstrap, 'utf8')));
   fs.copyFileSync(path.join(ROOT, 'scripts', 'assets', 'agent-modes-bootstrap.cjs'), path.join(stagedAsar, '.vite', 'build', 'agent-modes-bootstrap.cjs'));
@@ -50,6 +53,8 @@ async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = pat
   // with the application and never replaces the original Codex executable.
   fs.writeFileSync(path.join(runtime, 'codex-gateway'), '#!/bin/sh\nCDX_GATEWAY_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\nexec "$CDX_GATEWAY_DIR/node" "$CDX_GATEWAY_DIR/gateway.mjs" "$@"\n', { mode: 0o755 });
   fs.writeFileSync(path.join(runtime, 'build.json'), JSON.stringify(buildInfo, null, 2));
+  const remotePackage = packageRemoteRuntime(path.join(ROOT, 'runtime', 'agent-modes'), path.join(runtime, 'remote-runtime.tar.gz'));
+  fs.writeFileSync(path.join(runtime, 'remote-build.json'), JSON.stringify(remotePackage));
   const archive = path.join(staging, 'app.asar');
   await asar.createPackage(stagedAsar, archive);
   fs.copyFileSync(archive, path.join(resources, 'app.asar'));

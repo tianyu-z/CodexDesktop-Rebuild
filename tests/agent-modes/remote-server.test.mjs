@@ -1,0 +1,94 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import WebSocket from '../../runtime/agent-modes/node_modules/ws/wrapper.mjs';
+import { startRemoteServer } from '../../runtime/agent-modes/remote/server.mjs';
+
+async function fixture(t, options = {}) {
+  const dir = await mkdtemp(join(tmpdir(), 'cdx-remote-test-'));
+  let emit, starts = 0, initialized = 0, finished = false, pending = null, closed = false, releaseInitialization;
+  const blocked = [];
+  const server = await startRemoteServer({ ...options, socketPath: join(dir, 'rpc.sock'), runtimeFactory: callbacks => {
+    emit = callbacks.emit;
+    return { request: async (method, params) => {
+      if (method === 'initialize') { initialized++; if (options.pauseInitialize) return new Promise(resolve => { releaseInitialization = () => resolve({ userAgent: 'fixture' }); }); return { userAgent: 'fixture' }; }
+      if (method === 'turn/start') {
+        starts++;
+        setTimeout(() => { if (params.approve) { pending = 'approval:one'; emit({ id: pending, method: 'item/tool/requestUserInput', params: { threadId: 'remote-chat' } }); }
+          else { finished = true; emit({ method: 'turn/completed', params: { threadId: 'remote-chat' } }); } }, 20);
+        return { turn: { id: 'turn-one' } };
+      }
+      if (method === 'thread/read') return { finished, starts, initialized, pending };
+      if (method === 'config/read') return new Promise(resolve => blocked.push(resolve));
+      if (method === 'turn/interrupt') return { interrupted: true };
+      throw Error('unknown method');
+    }, respond: message => { if (message.id === pending) { pending = null; finished = message.result.decision === 'accept'; emit({ method: 'serverRequest/resolved', params: { requestId: message.id } }); return true; } return false; },
+    notify: () => {}, close: async () => { closed = true; releaseInitialization?.(); blocked.forEach(resolve => resolve({})); } };
+  } });
+  t.after(async () => { await server.close(); assert.equal(closed, true); await rm(dir, { recursive: true, force: true }); });
+  const connect = async () => {
+    const ws = new WebSocket('ws+unix://' + join(dir, 'rpc.sock') + ':/rpc');
+    const inbox = [], waiters = [];
+    ws.on('message', bytes => { const message = JSON.parse(bytes); const next = waiters.shift(); if (next) next(message); else inbox.push(message); });
+    await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+    const next = () => inbox.length ? Promise.resolve(inbox.shift()) : new Promise(resolve => waiters.push(resolve));
+    return { ws, next, send: message => ws.send(JSON.stringify(message)), disconnect: () => new Promise(resolve => { ws.once('close', resolve); ws.terminate(); }) };
+  };
+  return { connect, dir, releaseInitialization: () => releaseInitialization() };
+}
+test('remote socket is private and reconnect observes completion without re-running a turn', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  assert.equal((await stat(join(f.dir, 'rpc.sock'))).mode & 0o777, 0o600);
+  let c = await f.connect();
+  c.send({ id: 1, method: 'initialize', params: {} }); assert.equal((await c.next()).id, 1);
+  c.send({ method: 'initialized' });
+  c.send({ id: 2, method: 'turn/start', params: {} }); assert.equal((await c.next()).id, 2);
+  await c.disconnect(); await new Promise(resolve => setTimeout(resolve, 40));
+  c = await f.connect();
+  c.send({ id: 1, method: 'initialize', params: {} }); assert.equal((await c.next()).id, 1);
+  c.send({ method: 'initialized' });
+  c.send({ id: 2, method: 'thread/read', params: {} });
+  let m; do { m = await c.next(); } while (m.id !== 2);
+  assert.deepEqual(m.result, { finished: true, starts: 1, initialized: 1, pending: null });
+  await c.disconnect();
+});
+test('initialization can finish after the originating controller disconnects', { timeout: 5000 }, async t => {
+  const f = await fixture(t, { pauseInitialize: true });
+  let c = await f.connect(); c.send({ id: 1, method: 'initialize', params: {} });
+  await new Promise(resolve => setTimeout(resolve, 10)); await c.disconnect();
+  c = await f.connect(); c.send({ id: 2, method: 'initialize', params: {} });
+  f.releaseInitialization(); assert.equal((await c.next()).id, 2); c.send({ method: 'initialized' });
+  c.send({ id: 3, method: 'thread/read', params: {} }); assert.equal((await c.next()).result.initialized, 1);
+  await c.disconnect();
+});
+test('bounded ordinary RPCs retain separate interrupt capacity', { timeout: 5000 }, async t => {
+  const f = await fixture(t, { maxInFlight: 2 }), c = await f.connect();
+  c.send({ id: 1, method: 'initialize', params: {} }); await c.next(); c.send({ method: 'initialized' });
+  c.send({ id: 2, method: 'config/read' }); c.send({ id: 3, method: 'config/read' }); c.send({ id: 4, method: 'config/read' });
+  const rejected = await c.next(); assert.equal(rejected.id, 4); assert.match(rejected.error.message, /in.flight/i);
+  c.send({ id: 5, method: 'turn/interrupt', params: {} }); assert.deepEqual((await c.next()).result, { interrupted: true });
+  await c.disconnect();
+});
+test('pending approval replays the same ID after reconnect and remains unapproved', { timeout: 5000 }, async t => {
+  const f = await fixture(t); let c = await f.connect();
+  c.send({ id: 1, method: 'initialize', params: {} }); await c.next(); c.send({ method: 'initialized' });
+  c.send({ id: 2, method: 'turn/start', params: { approve: true } }); await c.next();
+  const approval = await c.next(); assert.equal(approval.id, 'approval:one');
+  await c.disconnect(); c = await f.connect();
+  c.send({ id: 1, method: 'initialize', params: {} }); await c.next(); c.send({ method: 'initialized' });
+  assert.deepEqual(await c.next(), approval);
+  c.send({ id: approval.id, result: { decision: 'decline' } });
+  assert.equal((await c.next()).method, 'serverRequest/resolved');
+  c.send({ id: 3, method: 'thread/read', params: {} });
+  assert.equal((await c.next()).result.finished, false);
+  await c.disconnect();
+});
+test('second controller cannot initialize or answer an approval owned by a live connection', { timeout: 5000 }, async t => {
+  const f = await fixture(t), a = await f.connect(), b = await f.connect();
+  a.send({ id: 1, method: 'initialize', params: {} }); await a.next(); a.send({ method: 'initialized' });
+  b.send({ id: 1, method: 'initialize', params: {} }); assert.match((await b.next()).error.message, /controller/i);
+  b.send({ id: 2, method: 'turn/start', params: {} }); assert.ok((await b.next()).error);
+  await b.disconnect(); await a.disconnect();
+});

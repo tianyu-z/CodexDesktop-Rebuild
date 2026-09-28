@@ -4,6 +4,18 @@ import { getEventListeners } from 'node:events';
 import { ClaudeAdapter } from '../../runtime/agent-modes/claude-adapter.mjs';
 
 const test = (name, fn) => nodeTest(name, { timeout: 3000 }, fn);
+test('interrupt during asynchronous provider resolution never starts the native query', async () => {
+  let resolveEnvironment, launches = 0;
+  const environment = new Promise(resolve => { resolveEnvironment = resolve; });
+  const adapter = new ClaudeAdapter({ environment: () => environment, queryImpl: () => { launches++; throw Error('must not launch'); } });
+  const run = adapter.start({ cwd: '/tmp', prompt: 'fixture' });
+  await new Promise(resolve => setImmediate(resolve));
+  const stopping = run.interrupt();
+  resolveEnvironment({});
+  const result = await stopping;
+  assert.equal(result.status, 'interrupted');
+  assert.equal(launches, 0);
+});
 
 const session = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const cwd = '/workspace/project';

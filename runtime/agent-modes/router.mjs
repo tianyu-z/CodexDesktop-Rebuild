@@ -29,7 +29,7 @@ export class EngineRouter {
     const id = params.threadId;
     // Read-only catalog discovery can wait on a subprocess. It must not queue
     // a user's interrupt or next submission behind that independent work.
-    if (!id || method === 'engine/capabilities') return this.dispatch(method, params);
+    if (!id || ['engine/capabilities', 'turn/interrupt', 'engine/runs/interrupt'].includes(method)) return this.dispatch(method, params);
     // Reserve submission before awaiting native I/O. Approval responses use the
     // separate response path and cannot deadlock behind a pending turn request.
     const previous = this.locks.get(id) ?? Promise.resolve();

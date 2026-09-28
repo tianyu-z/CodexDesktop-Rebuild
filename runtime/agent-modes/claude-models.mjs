@@ -162,12 +162,11 @@ export class ClaudeModelCatalog {
     if (this.closed) throw new Error('Claude model catalog is closed.');
     if (typeof cwd !== 'string' || !cwd || cwd.includes('\0')) throw new TypeError('Invalid Claude model discovery working directory.');
     const directory = resolve(cwd);
-    const resolvedEnv = this.environment();
-    if (!record(resolvedEnv)) throw new TypeError('Claude environment must be an object.');
-    const env = { ...resolvedEnv };
-    let providerEnv;
+    let env, providerEnv;
     try {
-      const settings = await this.settingsFor(directory);
+      const { settings, environment } = await this.settingsFor(directory);
+      if (!record(environment)) throw new TypeError('Claude environment must be an object.');
+      env = { ...environment };
       const settingsEnv = settings.effective.env ?? {};
       if (!record(settingsEnv) || Object.values(settingsEnv).some(value => typeof value !== 'string')) throw new Error('Invalid settings environment.');
       // The CLI applies its settings cascade after options.env. Use that same
@@ -210,7 +209,11 @@ export class ClaudeModelCatalog {
       Promise.resolve().then(async () => {
         const resolveSettings = this.resolveSettingsImpl ?? (await import('@anthropic-ai/claude-agent-sdk')).resolveSettings;
         signal.throwIfAborted();
-        return await resolveSettings({ cwd, settingSources: ['user', 'project', 'local'] });
+        const settings = await resolveSettings({ cwd, settingSources: ['user', 'project', 'local'] });
+        signal.throwIfAborted();
+        const environment = await this.environment({ cwd, effectiveSettings: settings.effective, signal });
+        signal.throwIfAborted();
+        return { settings, environment };
       }),
       aborted,
     ]);

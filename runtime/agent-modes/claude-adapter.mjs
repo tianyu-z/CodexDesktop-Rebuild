@@ -197,6 +197,10 @@ export class ClaudeAdapter {
           if (typeof options.prompt !== 'string' || typeof options.cwd !== 'string' || !options.cwd) throw new TypeError('Claude requires a prompt string and working directory.');
           if (options.model !== undefined) assertClaudeModel(options.model);
           const queryImpl = this.queryImpl ?? (await import('@anthropic-ai/claude-agent-sdk')).query;
+          const environment = interrupted ? {} : await Promise.race([
+            Promise.resolve().then(() => this.environment({ cwd: options.cwd, signal: cancellation.signal })),
+            inputClosed.then(() => { throw Error('Claude provider resolution interrupted.'); }),
+          ]);
           if (!interrupted) {
             const prompt = (async function* () {
               if (cancellation.signal.aborted) return;
@@ -206,7 +210,7 @@ export class ClaudeAdapter {
             })();
             query = queryImpl({ prompt, options: {
               cwd: options.cwd,
-              env: this.environment(),
+              env: environment,
               ...(options.nativeSessionId ? { resume: options.nativeSessionId } : {}),
               ...(options.model ? { model: options.model } : {}),
               pathToClaudeCodeExecutable: this.executablePath,

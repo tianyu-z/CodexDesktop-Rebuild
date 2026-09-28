@@ -18,6 +18,20 @@ function catalog(queryImpl, options = {}) {
 }
 
 const foundry = { CLAUDE_CODE_USE_FOUNDRY: '1', ANTHROPIC_FOUNDRY_BASE_URL: 'https://fixture.test/anthropic', ANTHROPIC_FOUNDRY_API_KEY: 'fixture-key' };
+test('catalog close cancels asynchronous provider resolution before launching discovery', async () => {
+  let launches = 0, received;
+  const entered = deferred(), pending = deferred();
+  const models = catalog(() => { launches++; }, { environment: options => { received = options; entered.resolve(); return pending.promise; } });
+  const listing = models.listCatalog({ cwd: '/fixture/project' });
+  const rejected = assert.rejects(listing, /closed|resolve/i);
+  await entered.promise;
+  await models.close();
+  pending.resolve({});
+  await rejected;
+  assert.equal(launches, 0);
+  assert.equal(received.cwd, '/fixture/project');
+  assert.deepEqual(received.effectiveSettings, {});
+});
 
 test('API discovery follows effective project settings and invalidates cache when those settings change', async () => {
   let projectEnv = { ANTHROPIC_FOUNDRY_BASE_URL: 'https://project.test/anthropic', ANTHROPIC_FOUNDRY_API_KEY: 'project-key' };
