@@ -32,7 +32,7 @@ function controlRequest(path = '/health', method = 'GET') {
   return new Promise((resolve, reject) => {
     const req = request({ socketPath, path, method, timeout: 1500 }, res => {
       let body = ''; res.setEncoding('utf8'); res.on('data', part => { body += part; if (body.length > 4096) req.destroy(); });
-      res.on('end', () => { try { const result = JSON.parse(body); if (res.statusCode >= 400) reject(Error(result.error ?? 'Gateway control request failed.')); else resolve(result); } catch { reject(Error('Invalid gateway control response.')); } });
+      res.on('end', () => { try { const result = JSON.parse(body); if (res.statusCode >= 400) reject(Object.assign(Error(result.error ?? 'Gateway control request failed.'), { statusCode: res.statusCode })); else resolve(result); } catch { reject(Error('Invalid gateway control response.')); } });
     });
     req.on('timeout', () => req.destroy(Error('Remote gateway health check timed out.'))); req.on('error', reject); req.end();
   });
@@ -40,7 +40,13 @@ function controlRequest(path = '/health', method = 'GET') {
 const health = () => controlRequest();
 async function waitForStop() {
   for (let attempt = 0; attempt < 100; attempt++) {
-    try { await health(); } catch (error) { if (['ENOENT', 'ECONNREFUSED'].includes(error.code)) return; throw error; }
+    try { await health(); }
+    catch (error) {
+      if (['ENOENT', 'ECONNREFUSED'].includes(error.code)) return;
+      // A health request accepted just before close may lose its socket. Keep
+      // polling until the owner is gone instead of failing a successful stop.
+      if (error.code !== 'ECONNRESET') throw error;
+    }
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   throw Error('Remote gateway is still stopping. Retry after its active operations finish.');
@@ -50,16 +56,31 @@ async function stop(force = false) {
   catch (error) { if (['ENOENT', 'ECONNREFUSED'].includes(error.code)) return; throw error; }
   await waitForStop();
 }
+function connectionStatus(status) {
+  if (status.protocolVersion !== 1) throw Error('The old remote gateway requires a scoped restart before upgrading.');
+  // The socket and wire protocol are stable across runtime builds. Reattach to
+  // a busy owner so its work/approvals remain reachable; the next idle ensure
+  // can upgrade. Never report that the requested runtime is already running.
+  return status.version === version ? status : { ...status, upgradeDeferred: true, requestedVersion: version };
+}
 async function ensure() {
   prepareDirectory();
   try {
     const status = await health();
     if (status.stopping) await waitForStop();
     else if (status.version !== version) {
-      if (status.protocolVersion !== 1) throw Error('The old remote gateway requires a scoped restart before upgrading.');
-      if (status.busy) throw Error('Remote gateway has active work. Finish or interrupt it before upgrading.');
-      await stop();
-    } else return status;
+      const existing = connectionStatus(status);
+      if (status.busy) return existing;
+      try { await stop(); }
+      catch (error) {
+        // Work can start after /health reports idle. A refused graceful stop
+        // must take the same reconnect path, never escalate to forced shutdown.
+        if (error.statusCode !== 409) throw error;
+        const current = await health();
+        if (current.stopping) await waitForStop();
+        else return connectionStatus(current);
+      }
+    } else return connectionStatus(status);
   } catch (error) {
     if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error;
   }
@@ -72,8 +93,9 @@ async function ensure() {
   while (performance.now() < deadline) {
     try {
       const status = await health();
-      if (status.version !== version) throw Error('Remote gateway version changed while connecting.');
-      return status;
+      // Another installer may win startup with a compatible version. Reuse it
+      // rather than reject a reachable owner or start a replacement underneath it.
+      if (!status.stopping) return connectionStatus(status);
     } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error; }
     if (exited) throw Error('Remote engine gateway exited during startup. Inspect its private gateway.log.');
     await new Promise(resolve => setTimeout(resolve, 100));

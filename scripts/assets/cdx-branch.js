@@ -89,13 +89,8 @@ const api = {
     this.mode = null;
     if (mode === "inplace") return;
     const idx = this.turnIndex(threadId, turnId);
-    let snapId = null;
-    try {
-      snapId = await fork();
-    } catch (e) {
-      console.warn("[cdx-branch] snapshot fork failed, edit will be destructive", e);
-      return;
-    }
+    const snapId = await fork();
+    if (snapId == null) throw new Error("Could not save the previous message version. Editing was cancelled.");
     if (snapId != null && idx != null) this.record(threadId, snapId, idx);
   },
 

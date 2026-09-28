@@ -40,6 +40,82 @@ async function started(f) {
 }
 const roles = () => ['codex', 'claude'].map(engine => ({ id: `${engine}-run`, roleId: engine, stepId: `answers.${engine}`, round: 0, attempt: 1, status: 'running', engine, requestedModel: engine === 'codex' ? 'codex-current' : 'claude-y', cwd: '/fixture' }));
 
+test('workflow roles preserve independent permission modes in selection and frozen execution', async t => {
+  const f = fixture(t);
+  const config = { ...structuredClone(selected), claudePermissionMode: 'plan', roleOverrides: { claude: { permissionMode: 'bypassPermissions' } } };
+  const created = await f.router.request('thread/start', { ...config, cwd: f.dir });
+  assert.equal(created.engineState.claudePermissionMode, 'plan');
+  assert.equal(created.engineState.roleOverrides.claude.permissionMode, 'bypassPermissions');
+  await f.router.request('turn/start', { ...config, threadId: 'chat', input: [{ type: 'text', text: 'compare' }] }); await tick();
+  const w = f.workflows[0];
+  assert.equal(w.options.template.roles.claude.permissionMode, 'bypassPermissions');
+  assert.equal(w.options.claudePermissionMode, 'plan');
+  assert.equal(w.options.nativeOptions.claudePermissionMode, undefined);
+  const before = f.store.get('chat');
+  await assert.rejects(f.router.request('engine/mode/set', { threadId: 'chat', ...config, roleOverrides: { claude: { permissionMode: 'invalid' } } }), /permissionMode/);
+  assert.deepEqual(f.store.get('chat'), before);
+  w.finish('interrupted'); await tick();
+  f.store.setMode('chat', 'claude', { claudePermissionMode: 'auto' });
+  await f.router.request('engine/runs/retry', { threadId: 'chat', turnId: before.turns[0].turn.id }); await tick();
+  assert.equal(f.workflows[1].options.template.roles.claude.permissionMode, 'bypassPermissions');
+  assert.equal(f.router.state('chat').claudePermissionMode, 'plan');
+});
+
+test('completed Claude mode transitions update the next workflow without changing frozen role configuration', async t => {
+  const f = fixture(t);
+  const roleOverrides = { claude: { engine: 'claude', model: 'claude-exact', prompt: 'Plan carefully.', permissionMode: 'plan' } };
+  await f.router.request('thread/start', { ...structuredClone(selected), cwd: f.dir, claudePermissionMode: 'auto', roleOverrides });
+  await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'text', text: 'plan' }] }); await tick();
+  const w = f.workflows[0], frozenConfig = structuredClone(f.store.get('chat').turns[0].workflow.config);
+  const child = (id, patch, extra = {}) => ({ id, stepId: id, roleId: 'claude', engine: 'claude', requestedModel: 'claude-exact', permissionMode: 'plan',
+    round: 0, attempt: 1, cwd: f.dir, status: 'completed', ...(patch ? { settingsPatch: patch } : {}), ...extra });
+  w.state.runs = [
+    child('early', { permissionMode: 'acceptEdits' }),
+    child('latest-transition', { permissionMode: 'default', model: 'must-not-replace-role-model' }),
+    child('init-only', null, { actualPermissionMode: 'acceptEdits' }),
+    child('invalid-transition', { permissionMode: 'unknown' }),
+  ];
+  w.state.invocations = { first: { permissionMode: 'plan', prompt: 'Frozen prompt' } };
+  w.finish('completed'); await tick();
+  const stored = f.store.get('chat');
+  assert.deepEqual(stored.roleOverrides, { claude: { ...roleOverrides.claude, permissionMode: 'default' } });
+  assert.equal(stored.claudePermissionMode, 'auto');
+  assert.deepEqual(stored.turns[0].workflow.config, frozenConfig);
+  assert.deepEqual(stored.turns[0].workflow.state.invocations, w.state.invocations);
+  assert.deepEqual(new ConversationStore(f.store.directory).get('chat').roleOverrides, stored.roleOverrides);
+  await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'text', text: 'continue' }] }); await tick();
+  assert.equal(f.workflows[1].options.template.roles.claude.permissionMode, 'default');
+  assert.equal(f.workflows[1].options.template.roles.claude.model, 'claude-exact');
+  assert.equal(f.workflows[1].options.template.roles.claude.prompt, 'Plan carefully.');
+});
+
+test('init-only fallback and unsuccessful native mode changes do not rewrite a workflow role selection', async t => {
+  for (const [status, patch] of [['completed', undefined], ['failed', 'default'], ['interrupted', 'default'], ['completed', 'unknown']]) {
+    const f = fixture(t), roleOverrides = { claude: { permissionMode: 'plan' } };
+    await f.router.request('thread/start', { ...structuredClone(selected), cwd: f.dir, roleOverrides });
+    await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'text', text: 'plan' }] }); await tick();
+    const w = f.workflows[0];
+    w.state.runs = [{ id: 'child', stepId: 'answer', roleId: 'claude', engine: 'claude', requestedModel: 'claude-y', permissionMode: 'plan',
+      round: 0, attempt: 1, cwd: f.dir, status, actualPermissionMode: 'default', ...(patch ? { settingsPatch: { permissionMode: patch } } : {}) }];
+    w.finish(status); await tick();
+    assert.deepEqual(f.store.get('chat').roleOverrides, roleOverrides, `${status} / ${String(patch)}`);
+  }
+});
+
+test('completed role transitions survive workflow interruption while retry still uses the frozen plan mode', async t => {
+  const f = fixture(t), roleOverrides = { claude: { permissionMode: 'plan' } };
+  await f.router.request('thread/start', { ...structuredClone(selected), cwd: f.dir, roleOverrides });
+  const { turn } = await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'text', text: 'plan' }] }); await tick();
+  const w = f.workflows[0];
+  w.state.runs = [{ id: 'child', stepId: 'answer', roleId: 'claude', engine: 'claude', requestedModel: 'claude-y', permissionMode: 'plan',
+    round: 0, attempt: 1, cwd: f.dir, status: 'completed', settingsPatch: { permissionMode: 'default' } }];
+  w.finish('interrupted'); await tick();
+  assert.equal(f.store.get('chat').roleOverrides.claude.permissionMode, 'default');
+  await f.router.request('engine/runs/retry', { threadId: 'chat', turnId: turn.id }); await tick();
+  assert.equal(f.workflows[1].options.template.roles.claude.permissionMode, 'plan');
+  assert.equal(f.workflows[1].options.previousSnapshot.config.template.roles.claude.permissionMode, 'plan');
+});
+
 function trackSnapshotCommits(t, store) {
   const destination = store.path('chat'), original = fs.renameSync;
   const commits = { count: 0, failure: null };

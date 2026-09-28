@@ -10,6 +10,17 @@
   const disconnectedCatalog = newCatalog();
   const drafts = new WeakMap();
   const templateCatalogs = new WeakMap();
+  const commandCatalogs = new WeakMap();
+  const permissionModes = [
+    ['default', 'Manual', 'Ask before edits and commands that require approval.'],
+    ['acceptEdits', 'Edit automatically', 'Allow file edits; ask before other actions that require approval.'],
+    ['plan', 'Plan', 'Explore and plan before editing.'],
+    ['auto', 'Auto', 'Claude checks actions and asks when they need your approval.'],
+    ['bypassPermissions', 'Bypass permissions', 'Run tools without permission prompts.'],
+  ];
+  const validPermission = mode => [...permissionModes.map(row => row[0]), 'dontAsk'].includes(mode);
+  const validCommandName = name => typeof name === 'string' && /^[^\s/\\\x00-\x1f\x7f]{1,200}$/u.test(name);
+  const disconnectedCommands = { snapshot: { commands: [], loading: false, error: null, loadedAt: null }, listeners: new Set() };
   const disconnectedTemplates = { snapshot: { templates: [], byRevision: {}, loading: false, error: null, loaded: false }, listeners: new Set() };
   const threads = new Map();
   const managers = new Map();
@@ -158,13 +169,16 @@
   }
   function validate(selection) {
     if (!['codex', 'claude', 'both'].includes(selection.engineMode)) throw Error('Unknown chat engine mode');
+    if (selection.claudePermissionMode !== undefined && !validPermission(selection.claudePermissionMode)) throw Error('Invalid Claude permission mode');
+    if (selection.claudeCommandTarget !== undefined && selection.claudeCommandTarget !== null && !/^[a-z][a-z0-9_-]{0,63}$/.test(selection.claudeCommandTarget)) throw Error('Invalid Claude command target');
     if (selection.engineMode === 'claude' && selection.engineModel != null && !validModelId(selection.engineModel)) throw Error('Invalid Claude Code model identifier');
     if (selection.engineModels != null && (typeof selection.engineModels !== 'object' || Array.isArray(selection.engineModels) || Object.entries(selection.engineModels).some(([engine, model]) => !['codex', 'claude'].includes(engine) || (model !== null && !validModelId(model))))) throw Error('Invalid engine model selection');
     if (selection.roleOverrides !== undefined) {
       const overrides = selection.roleOverrides;
       if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides) || Object.keys(overrides).length > 64) throw Error('Invalid role overrides');
       for (const [id, role] of Object.entries(overrides)) {
-        if (!/^[a-z][a-z0-9_-]{0,63}$/.test(id) || ['constructor', 'prototype', '__proto__', 'request', 'history', 'parameters', 'previousRound'].includes(id) || !role || typeof role !== 'object' || Array.isArray(role) || Object.keys(role).some(field => !['engine', 'model', 'prompt'].includes(field))) throw Error('Invalid role override');
+        if (!/^[a-z][a-z0-9_-]{0,63}$/.test(id) || ['constructor', 'prototype', '__proto__', 'request', 'history', 'parameters', 'previousRound'].includes(id) || !role || typeof role !== 'object' || Array.isArray(role) || Object.keys(role).some(field => !['engine', 'model', 'prompt', 'permissionMode'].includes(field))) throw Error('Invalid role override');
+        if (Object.hasOwn(role, 'permissionMode') && !validPermission(role.permissionMode)) throw Error('Invalid Claude role permission mode');
         if (Object.hasOwn(role, 'engine') && !['codex', 'claude'].includes(role.engine)) throw Error('Invalid role engine');
         if (Object.hasOwn(role, 'model') && role.model !== null && !validModelId(role.model)) throw Error('Invalid role model');
         if (Object.hasOwn(role, 'prompt') && (typeof role.prompt !== 'string' || !role.prompt.trim() || role.prompt.length > 100000)) throw Error('Role prompt must contain 1–100000 characters');
@@ -180,6 +194,10 @@
     const values = { loading: false, available: true, error: null };
     if (['codex', 'claude', 'both'].includes(state?.engineMode)) values.engineMode = state.engineMode;
     if (state?.models) values.models = { ...row.snapshot.models, ...state.models };
+    for (const name of ['claudePermissionMode', 'claudeActualPermissionMode', 'claudeCommandTarget']) if (state?.[name] !== undefined) values[name] = state[name];
+    if (state?.claudeClientActions) values.claudeClientActions = state.claudeClientActions;
+    if (state?.claudeRoleActualPermissionModes) values.claudeRoleActualPermissionModes = state.claudeRoleActualPermissionModes;
+    for (const name of ['claudeActiveRuns', 'claudeCommandRunId']) if (state?.[name] !== undefined) values[name] = state[name];
     if (state?.template) values.template = copy(state.template);
     if (state?.roleOverrides != null) values.roleOverrides = copy(state.roleOverrides);
     if (state?.bothAvailable != null) values.bothAvailable = state.bothAvailable === true;
@@ -188,6 +206,7 @@
     // A prewarmed shell still reports its old engine until the first turn reaches
     // the gateway. Reads may update busy/history, but cannot erase captured intent.
     if (row.creationIntent) {
+      for (const name of ['claudePermissionMode', 'claudeCommandTarget']) if (row.creationIntent[name] !== undefined) values[name] = row.creationIntent[name];
       values.engineMode = row.creationIntent.engineMode;
       if (row.creationIntent.engineMode === 'claude') values.models = { ...row.snapshot.models, ...values.models, claude: row.creationIntent.engineModel };
       if (row.creationIntent.engineMode === 'both') { values.models = copy(row.creationIntent.engineModels); values.template = copy(row.creationIntent.template); values.roleOverrides = copy(row.creationIntent.roleOverrides ?? row.snapshot.roleOverrides); }
@@ -198,16 +217,16 @@
   function requestFields(options) {
     if (options?.engineMode == null) return {};
     validate(options);
-    if (options.engineMode === 'both') return { engineMode: 'both', engineModels: copy({ codex: null, claude: 'default', ...options.engineModels }), template: copy(options.template ?? defaultTemplate()), ...(options.roleOverrides !== undefined ? { roleOverrides: copy(options.roleOverrides) } : {}) };
+    if (options.engineMode === 'both') return { engineMode: 'both', ...(options.claudePermissionMode !== undefined ? { claudePermissionMode: options.claudePermissionMode } : {}), engineModels: copy({ codex: null, claude: 'default', ...options.engineModels }), template: copy(options.template ?? defaultTemplate()), ...(options.roleOverrides !== undefined ? { roleOverrides: copy(options.roleOverrides) } : {}), ...(options.claudeCommandTarget !== undefined ? { claudeCommandTarget: options.claudeCommandTarget } : {}) };
     return options.engineMode === 'claude'
-      ? { engineMode: 'claude', engineModel: options.engineModel ?? 'default' }
+      ? { engineMode: 'claude', engineModel: options.engineModel ?? 'default', ...(options.claudePermissionMode !== undefined ? { claudePermissionMode: options.claudePermissionMode } : {}) }
       : { engineMode: 'codex' };
   }
   function turnRequestFields(manager, threadId, options, clientUserMessageId, nativeModel) {
     const hostId = managerHost(manager);
     const row = threads.get(key(threadId, hostId));
     if (row?.snapshot.pending) throw Error('Chat engine or roles are still saving. Wait for the save to finish, then send again.');
-    const selected = options?.engineMode != null ? options : row?.creationIntent ?? (row?.snapshot.engineMode === 'both' ? { engineMode: 'both', engineModels: row.snapshot.models, template: row.snapshot.template, roleOverrides: row.snapshot.roleOverrides } : options);
+    const selected = options?.engineMode != null ? options : row?.creationIntent ?? (row?.snapshot.engineMode === 'both' ? { engineMode: 'both', engineModels: row.snapshot.models, template: row.snapshot.template, roleOverrides: row.snapshot.roleOverrides, claudePermissionMode: row.snapshot.claudePermissionMode, claudeCommandTarget: row.snapshot.claudeCommandTarget } : options);
     const fields = requestFields(selected);
     if (fields.engineMode === 'both' && nativeModel !== undefined) {
       if (nativeModel !== null && !validModelId(nativeModel)) throw Error('Invalid Codex model identifier');
@@ -226,12 +245,13 @@
     const row = record(scope, null, hostId);
     if (row.snapshot.pending || row.snapshot.busy || row.nativeControlsBlocked) throw Error('Wait for the current turn to finish');
     row.revision++;
+    for (const name of ['claudePermissionMode', 'claudeCommandTarget']) if (selection[name] !== undefined) update(row, { [name]: selection[name] });
     update(row, { engineMode: selection.engineMode, models: { ...row.snapshot.models, ...copy(selection.engineModels ?? {}), ...(selection.engineMode === 'claude' && selection.engineModel != null ? { claude: selection.engineModel } : {}) }, template: copy(selection.template ?? row.snapshot.template), roleOverrides: selectionOverrides(row.snapshot, selection), error: null });
   }
   function capture(scope, hostId) {
     const state = record(scope, null, hostId).snapshot;
-    if (state.engineMode === 'both') return { ...requestFields({ engineMode: 'both', engineModels: state.models, template: state.template, roleOverrides: state.roleOverrides }), skipAutoTitleGeneration: true };
-    if (state.engineMode === 'claude') return { engineMode: 'claude', engineModel: state.models.claude ?? 'default', skipAutoTitleGeneration: true };
+    if (state.engineMode === 'both') return { ...requestFields({ engineMode: 'both', engineModels: state.models, template: state.template, roleOverrides: state.roleOverrides, claudePermissionMode: state.claudePermissionMode, claudeCommandTarget: state.claudeCommandTarget }), skipAutoTitleGeneration: true };
+    if (state.engineMode === 'claude') return { ...requestFields({ engineMode: 'claude', engineModel: state.models.claude ?? 'default', claudePermissionMode: state.claudePermissionMode }), skipAutoTitleGeneration: true };
     return { engineMode: 'codex' };
   }
   function registerManager(manager, hostId = managerHost(manager)) {
@@ -296,7 +316,7 @@
     row.revision++;
     update(row, { pending: true, error: null });
     try {
-      const selected = requestFields({ ...selection, engineModel: selection.engineModel ?? row.snapshot.models.claude, engineModels: { ...row.snapshot.models, ...selection.engineModels }, template: selection.template ?? row.snapshot.template, ...(selection.engineMode === 'both' ? { roleOverrides: selectionOverrides(row.snapshot, selection) } : {}) });
+      const selected = requestFields({ claudePermissionMode: row.snapshot.claudePermissionMode, claudeCommandTarget: row.snapshot.claudeCommandTarget, ...selection, engineModel: selection.engineModel ?? row.snapshot.models.claude, engineModels: { ...row.snapshot.models, ...selection.engineModels }, template: selection.template ?? row.snapshot.template, ...(selection.engineMode === 'both' ? { roleOverrides: selectionOverrides(row.snapshot, selection) } : {}) });
       const state = await manager.sendRequest('engine/mode/set', { threadId, ...selected });
       row.creationIntent = null;
       applyState(row, state);
@@ -357,6 +377,158 @@
     return row.snapshot.engineMode !== 'both' || !(row.nativeControlsBlocked || row.snapshot.busy || row.snapshot.pending || row.snapshot.loading || row.snapshot.available === false);
   }
   const selectStyle = { color: 'inherit', background: 'transparent', border: '1px solid var(--border, #8885)', borderRadius: 6, fontSize: 12, padding: '3px 5px', maxWidth: 160, cursor: 'pointer' };
+  function permissionSelect(jsx, label, value, disabled, onChange) {
+    const choices = value === 'dontAsk' ? [...permissionModes, ['dontAsk', "Don't ask", 'Deny actions that would require approval.']] : permissionModes;
+    return jsx.jsx('select', { 'aria-label': label, value, disabled, style: selectStyle, title: `${label}: ${choices.find(row => row[0] === value)?.[2] ?? value}`, onChange: event => onChange(event.target.value), children: choices.map(([value, label, title]) => jsx.jsx('option', { value, title, children: label }, value)) });
+  }
+  function effectiveRoles(state, catalog) {
+    const template = catalog.byRevision[templateKey(state.template)];
+    return Object.entries(template?.roles ?? {}).map(([id, role]) => ({ id, ...role, ...state.roleOverrides?.[id] }));
+  }
+  function PermissionControls({ React, jsx, scope, threadId, hostId, cwd, getHost, getManager, nativePicker }) {
+    hostId ??= getHost?.(scope, threadId) ?? 'local';
+    let manager; try { manager = getManager(scope, hostId); } catch { /* selector reports connection failures */ }
+    const row = record(scope, threadId, hostId), state = useRecord(React, row);
+    const catalog = useRecord(React, templateRecord(manager, hostId));
+    React.useEffect(() => { if (state.engineMode === 'both') refreshTemplates(manager, hostId).then(() => readTemplate(manager, hostId, state.template)); }, [manager, hostId, state.engineMode, state.template.id, state.template.revision]);
+    if (state.engineMode === 'codex') return nativePicker;
+    const disabled = Boolean(state.busy || state.pending || state.loading || row.nativeControlsBlocked);
+    const change = selection => changeSelection({ scope, threadId, hostId, manager }, selection).catch(() => {});
+    if (state.engineMode === 'claude') {
+      const picker = permissionSelect(jsx, 'Claude permissions', state.claudePermissionMode ?? 'default', disabled, claudePermissionMode => change({ engineMode: 'claude', claudePermissionMode }));
+      const actual = state.claudeActualPermissionMode;
+      if (!actual || actual === (state.claudePermissionMode ?? 'default')) return picker;
+      return jsx.jsxs('span', { style: { display: 'inline-flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }, children: [picker, jsx.jsx('span', { role: 'status', style: { fontSize: 11 }, title: 'Last permission mode reported by Claude. The selected mode is requested again on the next run.', children: `Claude reported: ${permissionModes.find(row => row[0] === actual)?.[1] ?? actual}` })] });
+    }
+    const roles = effectiveRoles(state, catalog), claudeRoles = roles.filter(role => role.engine === 'claude');
+    return jsx.jsxs('span', { style: { display: 'inline-flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }, children: [
+      roles.some(role => role.engine === 'codex') || !roles.length ? jsx.jsxs('label', { children: ['Codex ', nativePicker] }) : null,
+      claudeRoles.length ? jsx.jsxs('details', { style: { fontSize: 12 }, children: [jsx.jsx('summary', { children: 'Claude permissions', style: { cursor: 'pointer' } }), ...claudeRoles.map(role => jsx.jsxs('label', { style: { display: 'flex', gap: 6, alignItems: 'center', marginTop: 4 }, children: [roleLabel(role.id), permissionSelect(jsx, `${roleLabel(role.id)} Claude permissions`, role.permissionMode ?? 'default', disabled, permissionMode => change({ engineMode: 'both', roleOverrides: { ...state.roleOverrides, [role.id]: { ...state.roleOverrides?.[role.id], permissionMode } } })), state.claudeRoleActualPermissionModes?.[role.id] && state.claudeRoleActualPermissionModes[role.id] !== (role.permissionMode ?? 'default') ? jsx.jsx('span', { role: 'status', children: `Last run: ${permissionModes.find(row => row[0] === state.claudeRoleActualPermissionModes[role.id])?.[1] ?? state.claudeRoleActualPermissionModes[role.id]}` }) : null] }, role.id))] }) : null,
+    ] });
+  }
+  function commandRecord(manager, { hostId = managerHost(manager), threadId, cwd, target } = {}) {
+    if (!manager || !['object', 'function'].includes(typeof manager)) return disconnectedCommands;
+    if (!commandCatalogs.has(manager)) commandCatalogs.set(manager, new Map());
+    const contexts = commandCatalogs.get(manager), id = JSON.stringify([hostId, threadId ?? null, cwd ?? null, target ?? null]);
+    if (!contexts.has(id)) contexts.set(id, { snapshot: { commands: [], loading: false, error: null, loadedAt: null }, listeners: new Set(), revision: 0, promise: null });
+    return contexts.get(id);
+  }
+  async function refreshClaudeCommands(manager, context = {}) {
+    const row = commandRecord(manager, context);
+    if (!manager) return row.snapshot;
+    if (row.promise) return row.promise;
+    if (!context.force && !row.snapshot.error && row.snapshot.loadedAt != null && Date.now() - row.snapshot.loadedAt < MODEL_CACHE_TTL) return row.snapshot;
+    update(row, { loading: true });
+    row.promise = (async () => {
+      await Promise.resolve();
+      try {
+        const response = await manager.sendRequest('engine/claude/commands', { ...(context.threadId != null ? { threadId: context.threadId } : {}), ...(context.cwd ? { cwd: context.cwd } : {}), ...(context.target ? { target: context.target } : {}), ...(context.force ? { refresh: true } : {}) });
+        if (!Array.isArray(response?.commands)) throw Error('Claude returned no command catalog');
+        const commands = response.commands.filter(row => validCommandName(row?.name)).map(row => ({ ...row, description: displayText(row.description, 1500), argumentHint: displayText(row.argumentHint, 200), aliases: (row.aliases ?? []).filter(validCommandName) }));
+        update(row, { commands, error: null, loadedAt: Date.now() });
+      } catch (error) { update(row, { error: displayText(error?.message ?? String(error)), loadedAt: Date.now() }); }
+      finally { row.promise = null; update(row, { loading: false }); }
+      return row.snapshot;
+    })();
+    return row.promise;
+  }
+  function useClaudeCommands({ React, scope, threadId, hostId, cwd, composer, nativeCommands, getHost, getManager }) {
+    hostId ??= getHost?.(scope, threadId) ?? 'local';
+    let manager; try { manager = getManager(scope, hostId); } catch { /* a disconnected catalog stays empty */ }
+    const row = record(scope, threadId, hostId), state = useRecord(React, row);
+    const templates = useRecord(React, templateRecord(manager, hostId));
+    const target = state.engineMode === 'both' ? state.claudeCommandTarget : undefined;
+    const context = { hostId, threadId, cwd: threadId == null ? cwd : undefined, target };
+    const catalog = useRecord(React, commandRecord(manager, context));
+    const hasClaude = state.engineMode === 'claude' || state.engineMode === 'both' && effectiveRoles(state, templates).some(role => role.engine === 'claude');
+    React.useEffect(() => {
+      if (state.engineMode === 'both') refreshTemplates(manager, hostId).then(() => readTemplate(manager, hostId, state.template));
+      if (hasClaude) refreshClaudeCommands(manager, context);
+    }, [manager, hostId, threadId, cwd, target, hasClaude, state.template.id, state.template.revision]);
+    return React.useMemo(() => {
+      if (!hasClaude) return nativeCommands;
+      const insert = (text, range) => {
+        const view = composer.view;
+        view.dispatch(view.state.tr.insertText(text, range?.from ?? view.state.selection.from, range?.to ?? view.state.selection.to));
+        composer.focus();
+      };
+      const entries = catalog.commands.map(command => ({
+        id: `claude:${command.invocation ?? command.name}`, title: `/${command.invocation ?? command.name}`, description: `${command.description}${command.argumentHint ? ` · ${command.argumentHint}` : ''}`,
+        group: 'claude', searchAliases: command.aliases, triggers: ['/'],
+        onSelect: () => insert(`/${command.invocation ?? command.name} `),
+        onSelectFromInlineSlash: suggestion => insert(`/${command.invocation ?? command.name} `, suggestion.range),
+      }));
+      return entries;
+    }, [catalog, nativeCommands, hasClaude, composer]);
+  }
+  async function performClaudeClientAction(action) {
+    if (action.type === 'copy') {
+      if (!globalThis.navigator?.clipboard?.writeText) throw Error('Clipboard unavailable. Retry with the Copy button.');
+      await globalThis.navigator.clipboard.writeText(action.text);
+    } else if (action.type === 'download') {
+      const url = URL.createObjectURL(new Blob([action.text], { type: 'text/plain;charset=utf-8' }));
+      try {
+        const link = document.createElement('a'); link.href = url;
+        link.download = action.filename || 'claude-conversation.txt';
+        document.body.appendChild(link); link.click(); link.remove();
+      } finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
+    } else throw Error('Unknown Claude client action.');
+  }
+  async function retryClaudeClientAction(context, deliver = performClaudeClientAction) {
+    const row = record(context.scope, context.threadId, context.hostId), action = row.snapshot.claudeClientDelivery?.action;
+    if (!action) return;
+    try {
+      await deliver(action);
+      update(row, { claudeClientDelivery: { message: action.type === 'copy' ? 'Claude response copied.' : 'Claude transcript download started.' } });
+    } catch (error) { update(row, { claudeClientDelivery: { action, error: error.message ?? String(error) } }); }
+  }
+  async function deliverClaudeClientActions(context, deliver = performClaudeClientAction) {
+    const { scope, threadId, hostId, manager } = context;
+    if (!manager || !threadId) return;
+    const row = record(scope, threadId, hostId);
+    row.claimedClientActions ??= new Set();
+    for (const metadata of row.snapshot.claudeClientActions ?? []) {
+      if (row.claimedClientActions.has(metadata.id)) continue;
+      row.claimedClientActions.add(metadata.id);
+      try {
+        const { action } = await manager.sendRequest('engine/claude/client-action/claim', { threadId, actionId: metadata.id });
+        if (action) { update(row, { claudeClientDelivery: { action } }); await retryClaudeClientAction(context, deliver); }
+      } catch (error) {
+        row.claimedClientActions.delete(metadata.id);
+        update(row, { claudeClientDelivery: { error: error.message ?? String(error) } });
+      }
+    }
+  }
+  async function changeCommandTarget(context, target, runId) {
+    if (!context.threadId) return changeSelection(context, { engineMode: 'both', claudeCommandTarget: target });
+    const row = record(context.scope, context.threadId, context.hostId);
+    try {
+      const state = await context.manager.sendRequest('engine/claude/target/set', { threadId: context.threadId, claudeCommandTarget: target, ...(runId ? { runId } : {}) });
+      row.revision++; applyState(row, state);
+    } catch (error) { update(row, { error: error.message ?? String(error) }); }
+  }
+  function CommandControls({ React, jsx, scope, threadId, hostId, cwd, manager }) {
+    const row = record(scope, threadId, hostId), state = useRecord(React, row);
+    const templates = useRecord(React, templateRecord(manager, hostId));
+    const roles = effectiveRoles(state, templates).filter(role => role.engine === 'claude');
+    const target = state.engineMode === 'both' ? state.claudeCommandTarget : undefined;
+    const context = { hostId, threadId, cwd: threadId == null ? cwd : undefined, target };
+    const catalog = useRecord(React, commandRecord(manager, context));
+    const available = state.engineMode === 'claude' || state.engineMode === 'both' && roles.length > 0;
+    React.useEffect(() => { if (available) refreshClaudeCommands(manager, context); }, [manager, hostId, threadId, cwd, target, available]);
+    React.useEffect(() => { deliverClaudeClientActions({ scope, threadId, hostId, manager }); }, [manager, hostId, threadId, state.claudeClientActions]);
+    if (!available) return null;
+    const selected = roles.some(role => role.id === target) ? target : roles.find(role => role.id === 'host')?.id ?? roles[0]?.id;
+    const activeTasks = (state.claudeActiveRuns ?? []).filter(run => run.roleId === selected);
+    return jsx.jsxs('span', { style: { display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 4, fontSize: 11 }, children: [
+      state.engineMode === 'both' ? jsx.jsxs('label', { children: ['Claude / commands → ', jsx.jsx('select', { 'aria-label': 'Claude command target', value: selected, disabled: state.pending, style: selectStyle, onChange: event => changeCommandTarget({ scope, threadId, hostId, manager }, event.target.value), children: roles.map(role => jsx.jsx('option', { value: role.id, children: roleLabel(role.id) }, role.id)) })] }) : jsx.jsx('span', { children: `Claude / commands${catalog.commands.length ? ` · ${catalog.commands.length}` : ''}` }),
+      activeTasks.length > 1 ? jsx.jsx('select', { 'aria-label': 'Claude command task', value: state.claudeCommandRunId ?? '', style: selectStyle, onChange: event => changeCommandTarget({ scope, threadId, hostId, manager }, selected, event.target.value), children: [jsx.jsx('option', { value: '', children: 'Choose active task' }), ...activeTasks.map(run => jsx.jsx('option', { value: run.id, children: `${run.stepId} · ${run.id}`, title: run.id }, run.id))] }) : null,
+      jsx.jsx('button', { type: 'button', 'aria-label': 'Refresh Claude commands', title: 'Read commands and skills from Claude Code in this workspace', disabled: catalog.loading || !manager, style: { ...selectStyle, border: 'none' }, onClick: () => refreshClaudeCommands(manager, { ...context, force: true }), children: catalog.loading ? '…' : '↻' }),
+      catalog.error ? jsx.jsx('span', { role: 'status', title: catalog.error, children: `Commands: ${catalog.error}` }) : null,
+      state.claudeClientDelivery ? jsx.jsxs('span', { role: 'status', children: [state.claudeClientDelivery.error ?? state.claudeClientDelivery.message,
+        state.claudeClientDelivery.error && state.claudeClientDelivery.action ? jsx.jsx('button', { type: 'button', style: selectStyle, onClick: () => retryClaudeClientAction({ scope, threadId, hostId }), children: state.claudeClientDelivery.action.type === 'copy' ? 'Copy' : 'Download' }) : null] }) : null,
+    ] });
+  }
   function Selector(props) {
     const { React, jsx, scope, threadId, nativeModelPicker, bothNativeModelPicker } = props;
     const hostId = props.hostId ?? props.getHost(scope, threadId) ?? 'local';
@@ -407,7 +579,7 @@
     const refreshModels = (mode === 'claude' || mode === 'both' || catalog.modelListError) ? jsx.jsx('button', { type: 'button', 'aria-label': 'Refresh Claude models', title: 'Refresh models', disabled: !manager || catalog.loading, style: { ...selectStyle, border: 'none', padding: '2px 4px' }, onClick: () => refreshCapabilities(manager, { hostId, threadId, cwd, force: true }), children: '↻' }) : null;
     const errorStyle = { fontSize: 11, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
     const modelError = catalog.modelListError ? jsx.jsx('span', { role: 'status', title: catalog.modelListError, style: errorStyle, children: `Model discovery: ${catalog.modelListError}` }) : null;
-    return jsx.jsxs('span', { className: 'flex min-w-0 items-center gap-1', style: { display: 'inline-flex', flexWrap: 'wrap', minWidth: 0, gap: 4 }, 'data-cdx-engine-controls': true, children: [modePicker, modelPicker, refreshModels, mode === 'both' ? jsx.jsx(TemplateControls, { React, jsx, manager, hostId, selection: state.template, disabled, onChange: template => change({ engineMode: 'both', template }) }, hostId) : null, mode === 'both' ? jsx.jsx(RoleControls, { React, jsx, manager, hostId, threadId, cwd, selection: state.template, roleOverrides: state.roleOverrides, models: state.models, disabled, onChange: roleOverrides => change({ engineMode: 'both', roleOverrides }) }, `${hostId}:${threadId ?? ''}:${templateKey(state.template)}`) : null, modelError, state.error ? jsx.jsx('span', { role: 'alert', title: state.error, style: errorStyle, children: state.error }) : null] });
+    return jsx.jsxs('span', { className: 'flex min-w-0 items-center gap-1', style: { display: 'inline-flex', flexWrap: 'wrap', minWidth: 0, gap: 4 }, 'data-cdx-engine-controls': true, children: [modePicker, modelPicker, refreshModels, mode === 'both' ? jsx.jsx(TemplateControls, { React, jsx, manager, hostId, selection: state.template, disabled, onChange: template => change({ engineMode: 'both', template }) }, hostId) : null, mode === 'both' ? jsx.jsx(RoleControls, { React, jsx, manager, hostId, threadId, cwd, selection: state.template, roleOverrides: state.roleOverrides, models: state.models, disabled, onChange: roleOverrides => change({ engineMode: 'both', roleOverrides }) }, `${hostId}:${threadId ?? ''}:${templateKey(state.template)}`) : null, modelError, state.error ? jsx.jsx('span', { role: 'alert', title: state.error, style: errorStyle, children: state.error }) : null, jsx.jsx(CommandControls, { React, jsx, scope, threadId, hostId, cwd, manager })] });
   }
   function templateRecord(manager, hostId = managerHost(manager)) {
     if (!manager || !['object', 'function'].includes(typeof manager)) return disconnectedTemplates;
@@ -679,6 +851,7 @@
           jsx.jsx('summary', { style: { cursor: 'pointer', overflowWrap: 'anywhere' }, children: `${run.roleId ? roleLabel(run.roleId) : 'Role'} · ${run.stepId ?? run.taskId ?? run.id} · ${run.engine === 'claude' ? 'Claude Code' : run.engine === 'codex' ? 'Codex' : run.engine} · ${run.status}${run.round != null ? ` · round ${run.round}` : ''}${run.attempt != null ? ` · attempt ${run.attempt}` : ''}` }),
           jsx.jsx('div', { style: { overflowWrap: 'anywhere' }, children: `Requested model: ${run.requestedModel ?? 'engine default'}` }),
           run.actualModel ? jsx.jsx('div', { style: { overflowWrap: 'anywhere' }, children: `Actual model: ${run.actualModel}` }) : null,
+          run.engine === 'claude' && run.actualPermissionMode ? jsx.jsx('div', { children: `Claude permissions: ${permissionModes.find(row => row[0] === run.actualPermissionMode)?.[1] ?? run.actualPermissionMode}${run.permissionMode && run.permissionMode !== run.actualPermissionMode ? ` (requested ${permissionModes.find(row => row[0] === run.permissionMode)?.[1] ?? run.permissionMode})` : ''}` }) : null,
           run.cwd ? jsx.jsx('div', { style: { overflowWrap: 'anywhere' }, children: `Workspace: ${run.cwd}` }) : null,
           run.artifact ? jsx.jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: typeof run.artifact === 'string' ? run.artifact : JSON.stringify(run.artifact, null, 2) }) : null,
           run.text ? jsx.jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 360, overflow: 'auto', userSelect: 'text' }, children: run.text }) : null,
@@ -692,6 +865,8 @@
   }
   globalThis.__cdxEngineModes = {
     Selector, SourceBadge, TemplateControls, TemplateManager, RoleControls, refreshTemplates, refreshRuns, capture, requestFields, turnRequestFields, registerManager, noteStarted, observe,
+    PermissionControls, useClaudeCommands, refreshClaudeCommands,
+    deliverClaudeClientActions, retryClaudeClientAction,
     permitsNativeMetadata, permitsNativeModelSelection, sourceFor, setDraftSelection, changeSelection, refreshThread, refreshCapabilities,
     getCapabilities: (manager, context) => catalogRecord(manager, context).snapshot,
     configureCodexAvailability: hooks => { codexAvailability = hooks; },

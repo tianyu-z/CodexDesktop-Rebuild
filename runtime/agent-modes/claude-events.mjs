@@ -1,6 +1,8 @@
 const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const identifier = (value) => typeof value === 'string' && value.length > 0;
 const indexValue = (value) => Number.isSafeInteger(value) && value >= 0;
+const terminalTask = status => ['completed', 'failed', 'stopped', 'killed', 'process-ended'].includes(status);
+const taskEvents = new Set(['task_started', 'task_updated', 'task_progress', 'task_notification', 'background_tasks_changed']);
 const modelContent = (content) => record(content) && (
   (content.type === 'text' && identifier(content.text)) ||
   (content.type === 'tool_use' && identifier(content.id) && identifier(content.name) && record(content.input)) ||
@@ -18,6 +20,9 @@ export class ClaudeEventNormalizer {
     this.nativeSessionId = undefined;
     this.error = undefined;
     this.inputAcknowledged = false;
+    this.obsoleteSessions = new Set();
+    this.resultTextLength = 0;
+    this.nativeTaskState = new Map();
   }
 
   consume(envelope) {
@@ -27,26 +32,49 @@ export class ClaudeEventNormalizer {
       this.seen.add(envelope.uuid);
     }
     const scope = identifier(envelope.parent_tool_use_id) ? envelope.parent_tool_use_id : null;
+    if (envelope.type === 'conversation_reset' && scope === null && identifier(envelope.new_conversation_id)) {
+      this.finish();
+      if (this.nativeSessionId) this.obsoleteSessions.add(this.nativeSessionId);
+      if (identifier(envelope.session_id) && envelope.session_id !== envelope.new_conversation_id) this.obsoleteSessions.add(envelope.session_id);
+      this.nativeSessionId = envelope.new_conversation_id;
+      this.sessionReported = true;
+      this.contextReset = true;
+      this.messages.clear();
+      this.active.clear();
+      this.tools.clear();
+      this.resultTextLength = 0;
+      this.onEvent({ type: 'context-reset', sessionId: this.nativeSessionId, ...(identifier(envelope.trigger) ? { trigger: envelope.trigger } : {}), ...(identifier(envelope.user_message_uuid) ? { userMessageId: envelope.user_message_uuid } : {}) });
+      this.onEvent({ type: 'session', sessionId: this.nativeSessionId });
+      return;
+    }
     const model = envelope.type === 'assistant' ? envelope.message?.model : envelope.type === 'system' && envelope.subtype === 'init' ? envelope.model : envelope.type === 'stream_event' ? envelope.event?.message?.model : undefined;
     if (scope === null && identifier(model) && model !== '<synthetic>') this.actualModel = model;
-    if (scope === null && identifier(envelope.session_id) && (envelope.session_id !== this.nativeSessionId || !this.sessionReported)) {
+    if (scope === null && identifier(envelope.session_id) && !this.obsoleteSessions.has(envelope.session_id) && (envelope.session_id !== this.nativeSessionId || !this.sessionReported)) {
       this.nativeSessionId = envelope.session_id;
       this.sessionReported = true;
       this.onEvent({ type: 'session', sessionId: this.nativeSessionId });
     }
+    if (envelope.type === 'system' && taskEvents.has(envelope.subtype)) { this.consumeTask(envelope); return; }
     if (envelope.type === 'stream_event') this.consumePartial(envelope.event, scope);
     else if (envelope.type === 'assistant') {
       if (identifier(envelope.error)) this.error = `Claude assistant error: ${envelope.error}`;
       this.consumeAssistant(envelope.message, scope, envelope.error == null);
     } else if (envelope.type === 'user') this.consumeToolResults(envelope.message);
+    else if (envelope.type === 'system' && envelope.subtype === 'local_command_output' && typeof envelope.content === 'string') {
+      this.output(envelope.content, `local:${envelope.uuid ?? this.messages.size}`, scope);
+    }
     else if (envelope.type === 'system' && envelope.subtype === 'status') {
       if (envelope.status === null || typeof envelope.status === 'string') this.onEvent({ type: 'status', status: envelope.status });
     } else if (envelope.type === 'result') {
+      if (this.text.length === this.resultTextLength && identifier(envelope.result)) this.output(envelope.result, `result:${envelope.uuid ?? this.messages.size}`);
       this.finish();
-      const successful = envelope.subtype === 'success' && envelope.is_error === false;
+      const unavailable = envelope.num_turns === 0 && typeof envelope.result === 'string' && (/^\/\S+ (?:isn.t|is not) available in this environment\.?$/i.test(envelope.result.trim()) || /^Unknown (?:skill|command):/i.test(envelope.result.trim()));
+      const successful = envelope.subtype === 'success' && envelope.is_error === false && !unavailable;
       if (successful) this.acknowledgeInput(scope);
       const result = { nativeSessionId: this.nativeSessionId, status: successful ? 'completed' : 'failed', text: typeof envelope.result === 'string' ? envelope.result : this.text };
       if (this.actualModel) result.actualModel = this.actualModel;
+      if (identifier(envelope.local_command)) result.localCommand = envelope.local_command;
+      if (this.contextReset) result.contextReset = true;
       if (envelope.structured_output !== undefined) result.structuredOutput = structuredClone(envelope.structured_output);
       if (!successful) {
         const errors = Array.isArray(envelope.errors) ? envelope.errors.filter(identifier) : [];
@@ -58,8 +86,70 @@ export class ClaudeEventNormalizer {
         if (record(envelope.modelUsage)) result.usage.modelUsage = envelope.modelUsage;
         if (typeof envelope.total_cost_usd === 'number') result.usage.total_cost_usd = envelope.total_cost_usd;
       }
+      this.beginTurn();
       return result;
     }
+  }
+
+  output(text, id, scope = null) {
+    if (!identifier(text)) return;
+    const message = this.message(id, scope);
+    const block = this.block(message, 0, { type: 'text', text });
+    if (block) this.completeText(block);
+  }
+
+  beginTurn() {
+    this.resultTextLength = this.text.length;
+  }
+
+  get nativeTasks() { return structuredClone([...this.nativeTaskState.values()]); }
+
+  consumeTask(event) {
+    const update = (id, values) => {
+      const task = this.nativeTaskState.get(id) ?? { id, status: 'unknown' };
+      for (const [source, target] of [['description', 'description'], ['task_type', 'taskType'], ['summary', 'summary'], ['last_tool_name', 'lastToolName'], ['output_file', 'outputFile'], ['reason', 'reason'], ['tool_use_id', 'toolUseId']]) {
+        if (typeof values[source] === 'string') task[target] = values[source];
+      }
+      for (const [source, target] of [['is_backgrounded', 'isBackgrounded'], ['ambient', 'ambient']]) if (typeof values[source] === 'boolean') task[target] = values[source];
+      if (record(values.usage)) task.usage = Object.fromEntries(['total_tokens', 'tool_uses', 'duration_ms'].filter(key => Number.isFinite(values.usage[key]) && values.usage[key] >= 0).map(key => [key, values.usage[key]]));
+      this.nativeTaskState.set(id, task);
+      return task;
+    };
+    if (event.subtype === 'background_tasks_changed') {
+      if (!Array.isArray(event.tasks)) return;
+      const tasks = event.tasks.filter(task => record(task) && identifier(task.task_id));
+      const live = new Set(tasks.map(task => task.task_id));
+      for (const task of this.nativeTaskState.values()) if (task.isBackgrounded && !live.has(task.id)) {
+        task.backgroundActive = false;
+        // A level update can precede its terminal bookend. Absence proves only
+        // that it is no longer in the live set, not how the task finished.
+        if (!terminalTask(task.status)) task.status = 'unknown';
+      }
+      for (const row of tasks) {
+        const task = update(row.task_id, row);
+        task.isBackgrounded = task.backgroundActive = true;
+        if (!terminalTask(task.status) && task.status !== 'paused') task.status = 'running';
+      }
+    } else {
+      if (!identifier(event.task_id)) return;
+      const task = update(event.task_id, event.subtype === 'task_updated' && record(event.patch) ? event.patch : event);
+      if (event.subtype === 'task_started' || event.subtype === 'task_progress') {
+        if (!terminalTask(task.status)) task.status = 'running';
+      } else if (event.subtype === 'task_updated' && ['pending', 'running', 'completed', 'failed', 'killed', 'paused'].includes(event.patch?.status)) {
+        if (!terminalTask(task.status) || terminalTask(event.patch.status)) task.status = event.patch.status;
+      } else if (event.subtype === 'task_notification' && ['completed', 'failed', 'stopped'].includes(event.status)) task.status = event.status;
+      if (terminalTask(task.status)) task.backgroundActive = false;
+    }
+    this.onEvent({ type: 'native-tasks', nativeTasks: this.nativeTasks });
+  }
+
+  endTasks() {
+    for (const task of this.nativeTaskState.values()) {
+      if (!terminalTask(task.status)) { task.lastStatus = task.status; task.status = 'process-ended'; }
+      task.processEnded = true;
+      task.backgroundActive = false;
+    }
+    if (this.nativeTaskState.size) this.onEvent({ type: 'native-tasks', nativeTasks: this.nativeTasks });
   }
 
   acknowledgeInput(scope) {

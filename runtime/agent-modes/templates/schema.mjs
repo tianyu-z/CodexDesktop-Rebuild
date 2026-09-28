@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { CLAUDE_PERMISSION_MODES } from '../claude-permissions.mjs';
 
 export const SCHEMA_VERSION = 2;
 export const DEFAULT_LIMITS = Object.freeze({ concurrency: 2, tasks: 8, rounds: 2 });
@@ -42,10 +43,11 @@ export function validateRoleOverrides(value, roles) {
   for (const [id, override] of Object.entries(value)) {
     const path = `$.roleOverrides.${id}`; validateId(id, path);
     if (roles && !own(roles, id)) fail(path, 'unknown role');
-    fields(override, ['engine', 'model', 'prompt'], path);
+    fields(override, ['engine', 'model', 'prompt', 'permissionMode'], path);
     if (own(override, 'engine')) choice(override.engine, ENGINES, `${path}.engine`);
     if (own(override, 'model')) validateModel(override.model, `${path}.model`);
     if (own(override, 'prompt')) string(override.prompt, `${path}.prompt`);
+    if (own(override, 'permissionMode')) choice(override.permissionMode, CLAUDE_PERMISSION_MODES, `${path}.permissionMode`);
   }
   return structuredClone(value);
 }
@@ -58,7 +60,8 @@ export function resolveRoleConfig(input, overrides = {}, models = {}) {
   for (const [id, role] of Object.entries(template.roles)) {
     const override = roleOverrides[id] ?? {};
     const engine = override.engine ?? role.engine;
-    template.roles[id] = { ...role, ...override, model: own(override, 'model') ? override.model : own(role, 'model') ? role.model : models[engine] ?? null };
+    template.roles[id] = { ...role, ...override, model: own(override, 'model') ? override.model : own(role, 'model') ? role.model : models[engine] ?? null,
+      ...(engine === 'claude' ? { permissionMode: override.permissionMode ?? role.permissionMode ?? 'default' } : {}) };
   }
   return { template: validateTemplate(template), roleOverrides };
 }
@@ -345,9 +348,10 @@ export function validateTemplate(input) {
   if (!Object.keys(value.roles).length || Object.keys(value.roles).length > 64) fail('$.roles', 'expected 1–64 roles');
   for (const [id, role] of Object.entries(value.roles)) {
     const path = `$.roles.${id}`; validateId(id, path);
-    fields(role, ['engine', 'model', 'prompt', 'access', 'session'], path);
+    fields(role, ['engine', 'model', 'prompt', 'access', 'session', 'permissionMode'], path);
     choice(role.engine, ENGINES, `${path}.engine`);
     if (own(role, 'model')) { validateModel(role.model, `${path}.model`); value.schemaVersion = SCHEMA_VERSION; }
+    if (own(role, 'permissionMode')) { choice(role.permissionMode, CLAUDE_PERMISSION_MODES, `${path}.permissionMode`); value.schemaVersion = SCHEMA_VERSION; }
     string(role.prompt, `${path}.prompt`);
     choice(role.access, ['read', 'write'], `${path}.access`);
     choice(role.session, ['reuse', 'fresh'], `${path}.session`);

@@ -16,6 +16,39 @@ function fixture(t) {
   t.after(async()=>{await router.close();rmSync(dir,{recursive:true,force:true});});return {dir,thread,calls,events,runs,store,router};
 }
 async function start(f,engineMode='codex'){return f.router.request('thread/start',{cwd:f.dir,engineMode,model:'codex-model',agentMode:'guardian-approvals'});}
+test('Claude permission selections persist through thread creation, mode changes, and same-mode turns', async t => {
+  const f = fixture(t);
+  const created = await f.router.request('thread/start', { cwd: f.dir, engineMode: 'claude', claudePermissionMode: 'acceptEdits', approvalPolicy: 'never' });
+  assert.equal(created.engineState.claudePermissionMode, 'acceptEdits');
+  assert.equal(f.calls[0].params.claudePermissionMode, undefined);
+  assert.equal(f.calls[0].params.approvalPolicy, 'never');
+  await f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', claudePermissionMode: 'plan' });
+  await f.router.request('turn/start', { threadId: 'thread-1', engineMode: 'claude', claudePermissionMode: 'auto', approvalPolicy: 'on-request', input: [{ type: 'text', text: 'hello' }] });
+  await tick();
+  assert.equal(f.runs[0].options.permissionMode, 'auto');
+  assert.equal(f.store.get('thread-1').claudePermissionMode, 'auto');
+  f.runs[0].options.onEvent({ type: 'permission-mode', requestedMode: 'auto', actualMode: 'default' });
+  assert.equal(f.router.state('thread-1').claudeActualPermissionMode, 'default');
+  assert.equal(f.router.state('thread-1').claudePermissionMode, 'auto');
+  f.runs[0].finish({ status: 'completed' }); await tick();
+  const state = await f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'codex' });
+  assert.equal(state.claudePermissionMode, 'auto');
+  assert.equal(new ConversationStore(f.dir).get('thread-1').claudePermissionMode, 'auto');
+  await f.router.request('turn/start', { threadId: 'thread-1', claudePermissionMode: 'plan', input: [{ type: 'text', text: 'codex' }] });
+  assert.equal(f.calls.find(call => call.method === 'turn/start').params.claudePermissionMode, undefined);
+});
+test('invalid Claude permission modes fail before native creation, hydration, or state mutation', async t => {
+  const f = fixture(t);
+  await assert.rejects(f.router.request('thread/start', { engineMode: 'claude', claudePermissionMode: 'never' }), /permission mode/i);
+  assert.equal(f.calls.length, 0);
+  await start(f, 'claude');
+  for (const method of ['engine/mode/set', 'turn/start']) {
+    const before = f.store.get('thread-1'), count = f.calls.length;
+    await assert.rejects(f.router.request(method, { threadId: 'thread-1', engineMode: 'codex', claudePermissionMode: null, input: [{ type: 'text', text: 'test' }] }), /permission mode/i);
+    assert.deepEqual(f.store.get('thread-1'), before);
+    assert.equal(f.calls.length, count);
+  }
+});
 test('interrupt bypasses a pending history read for the same chat', async t => {
   const f = fixture(t); await start(f, 'claude');
   const { turn } = await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] }); await tick();

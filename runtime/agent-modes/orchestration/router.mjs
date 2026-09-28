@@ -3,7 +3,8 @@ import { existsSync, readFileSync, writeFileSync, renameSync, statSync } from 'n
 import { join } from 'node:path';
 import { resolveParameters, resolveRoleConfig } from '../templates/schema.mjs';
 import { assertClaudeModel } from '../claude-models.mjs';
-import { inputText, publicHistory } from '../handoff.mjs';
+import { CLAUDE_PERMISSION_MODES } from '../claude-permissions.mjs';
+import { inputText, publicHistory, writeHistorySnapshot } from '../handoff.mjs';
 import { presentItem, presentTurn, toolItem } from '../codex-events.mjs';
 
 const clone = value => structuredClone(value);
@@ -90,13 +91,14 @@ export class WorkflowRouter {
     const nativeOptions = Object.fromEntries(nativeKeys.filter(key => params[key] !== undefined).map(key => [key, clone(params[key])]));
     nativeOptions.cwd = chat.cwd;
     nativeOptions.effort = params.collaborationMode?.settings?.reasoning_effort ?? nativeOptions.effort;
-    const historyPath = this.store.path(id).replace(/\.json$/, '.history.txt'), fullHistory = publicHistory(chat);
-    writeFileSync(historyPath, fullHistory, { mode: 0o600 });
+    const fullHistory = publicHistory(chat), historyPath = writeHistorySnapshot(this.store.directory, fullHistory);
     const history = chat.turns.map(row => ({ seq: row.seq, text: publicHistory({ turns: [row] }) }));
     let length = fullHistory.length, omitted = false;
     while (history.length > 1 && length > 60000) { length -= history.shift().text.length; omitted = true; }
     if (history[0] && (omitted || history[0].text.length > 60000)) history[0].text = `[Earlier public history: ${historyPath}]\n${history[0].text.slice(-60000)}`;
-    const config = { mode: 'both', models: selected.models, roleOverrides: selected.roleOverrides, template: selected.template, parameters: selected.parameters, nativeOptions, cwd: chat.cwd, input, history, throughSeq: chat.nextSeq - 1 };
+    const config = { mode: 'both', models: selected.models, roleOverrides: selected.roleOverrides, template: selected.template, parameters: selected.parameters,
+      claudePermissionMode: params.claudePermissionMode === undefined ? chat.claudePermissionMode : params.claudePermissionMode,
+      nativeOptions, cwd: chat.cwd, input, history, throughSeq: chat.nextSeq - 1 };
     this.store.beginWorkflow(id, { id: idRun, turn, config });
     this.launch(id, idRun, turn, config);
     return { turn: presentTurn(turn, 'both'), engineState: this.router.state(id) };
@@ -136,7 +138,21 @@ export class WorkflowRouter {
       const row = this.store.workflowRecord(id, workflowId).row;
       for (const child of row.runs) if (!terminal.has(child.status)) this.store.putWorkflowRun(id, workflowId, { ...child, status: result.status === 'failed' ? 'failed' : 'interrupted' });
       const status = ['completed', 'failed', 'interrupted'].includes(result.status) ? result.status : 'failed';
-      const finished = this.store.finishWorkflow(id, workflowId, status, { error: result.error });
+      const finished = this.store.batch(id, () => {
+        const finished = this.store.finishWorkflow(id, workflowId, status, { error: result.error });
+        const chat = this.store.require(id);
+        // Runs are stored in execution order. Only completed explicit native
+        // transitions update future selections; initialization fallback and
+        // unsuccessful runs do not change the frozen workflow or its retries.
+        for (const child of finished.runs) {
+          const permissionMode = child.settingsPatch?.permissionMode;
+          if (child.status !== 'completed' || child.engine !== 'claude' ||
+            finished.workflow.config.template.roles[child.roleId]?.engine !== 'claude' || !CLAUDE_PERMISSION_MODES.includes(permissionMode)) continue;
+          chat.roleOverrides[child.roleId] = { ...chat.roleOverrides[child.roleId], permissionMode };
+        }
+        this.store.save(chat);
+        return finished;
+      });
       this.active.delete(workflowId);
       this.router.notify('turn/completed', { threadId: id, turn: presentTurn(finished.turn, 'both') });
       this.router.notify('thread/status/changed', { threadId: id, status: { type: 'idle' } });
@@ -233,6 +249,7 @@ export class WorkflowRouter {
   async retry(id, turnId, roleId) {
     const chat = this.store.get(id), row = chat?.turns.find(row => row.turn.id === turnId && row.workflow);
     if (!row) throw new Error('Workflow turn ownership mismatch.');
+    if (row.historyDetached) throw new Error('This workflow is a history snapshot. Send a new message to run it again.');
     const latest = new Map();
     const key = child => JSON.stringify([child.stepId, child.roleId, child.round]);
     for (const run of row.runs) if ((latest.get(key(run))?.attempt ?? 0) < run.attempt) latest.set(key(run), run);

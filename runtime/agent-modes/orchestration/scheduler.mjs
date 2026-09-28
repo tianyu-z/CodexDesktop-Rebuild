@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { resolveParameters, resolveRoleConfig, validateHostDecision, validateTaskPlan } from '../templates/schema.mjs';
 import { renderInputs } from './inputs.mjs';
+import { assertClaudePermissionMode } from '../claude-permissions.mjs';
+import { assertClaudeLiveCommand } from '../claude-commands.mjs';
 
 const clone = value => structuredClone(value);
 const freeze = value => { if (value && typeof value === 'object') { for (const item of Object.values(value)) freeze(item); Object.freeze(value); } return value; };
@@ -9,7 +11,7 @@ const frozen = value => freeze(clone(value));
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const errorText = error => error instanceof Error ? error.message : String(error);
 const settled = new Set(['completed', 'failed', 'interrupted', 'cancelled', 'blocked']);
-const resultFields = new Set(['id', 'engine', 'roleId', 'stepId', 'attempt', 'round', 'status', 'requestedModel', 'cwd', 'text', 'structuredOutput', 'nativeSessionId', 'actualModel', 'usage', 'error']);
+const resultFields = new Set(['id', 'engine', 'roleId', 'stepId', 'attempt', 'round', 'status', 'requestedModel', 'permissionMode', 'actualPermissionMode', 'cwd', 'text', 'structuredOutput', 'nativeSessionId', 'actualModel', 'usage', 'error', 'nativeTasks']);
 const stoppedError = () => new Error('Workflow interrupted.');
 const roleKey = ({ stepId, roleId, round = 0 }) => JSON.stringify([stepId, roleId, round]);
 const bound = (value, parameters) => typeof value === 'number' ? value : parameters[value.parameter];
@@ -94,7 +96,7 @@ class WorkflowExecution {
     for (const run of this.latestRuns()) if (run.status !== 'completed') this.blockers.add(run.id);
     if (previous && supplied.resume === true && supplied.retryRunId === undefined && this.blockers.size) throw new Error('An unsuccessful role requires an explicit retryRunId before this workflow can resume.');
     if (previous && supplied.resume === true && !this.blockers.size) this.activated = true;
-    this.handle = { done: this.completed.promise, interrupt: id => this.interrupt(id), retry: id => this.retry(id), snapshot: () => clone(this.state) };
+    this.handle = { done: this.completed.promise, interrupt: id => this.interrupt(id), retry: id => this.retry(id), snapshot: () => clone(this.state), control: (id, command, options) => this.control(id, command, options) };
     this.abortListener = () => { this.stop(); };
     supplied.signal?.addEventListener('abort', this.abortListener, { once: true });
     this.externalSignal = supplied.signal;
@@ -148,6 +150,13 @@ class WorkflowExecution {
     if (!active) return Promise.resolve(false);
     active.controller.abort(); this.cancelNative(active); this.pump();
     return active.finished.promise.then(() => true);
+  }
+  async control(id, command, options) {
+    const selected = assertClaudeLiveCommand(command);
+    const active = this.active.get(id), run = this.state.runs.find(run => run.id === id);
+    if (this.stopping || this.terminal || !active || active.controller.signal.aborted || !['running', 'awaitingApproval'].includes(run?.status)) throw new Error('Claude control requires an active owned role run.');
+    if (run.engine !== 'claude' || typeof active.handle?.control !== 'function') throw new Error('Live controls require a Claude role with an updated native adapter.');
+    return active.handle.control(selected, options);
   }
   retry(id) {
     if (this.terminal || this.stopping || !this.blockers.has(id)) return false;
@@ -338,6 +347,7 @@ class WorkflowExecution {
     const nativeOptions = Object.hasOwn(slots, 'codex') || Object.hasOwn(slots, 'claude') ? slots[role.engine] ?? {} : slots;
     const proposed = frozen({ roleId: input.roleId, stepId: input.stepId, round, engine: role.engine,
       prompt: input.prompt, cwd, access, instructions: input.instructions ?? role.prompt, requestedModel: role.model, nativeOptions,
+      ...(role.engine === 'claude' ? { permissionMode: role.permissionMode } : {}),
       purpose: input.purpose ?? 'default', ...(input.outputSchema === undefined ? {} : { outputSchema: input.outputSchema }),
       ...(input.inputValues === undefined ? {} : { inputValues: input.inputValues }),
     });
@@ -365,6 +375,8 @@ class WorkflowExecution {
           ...(acknowledgedHistorySeq === undefined ? {} : { acknowledgedHistorySeq }) });
         this.state.invocations[key] = clone(descriptor); this.notify();
       }
+      // Older snapshots predate per-role modes and ran Claude with default.
+      if (descriptor.engine === 'claude' && descriptor.permissionMode === undefined) descriptor = { ...descriptor, permissionMode: 'default' };
       return await this.invokeUntilSuccess(key, frozen(descriptor), input.validateResult);
     })();
     this.jobs.set(key, job);
@@ -414,7 +426,8 @@ class WorkflowExecution {
 
   async attempt(descriptor, attempt, validateResult) {
     const { engine, roleId, stepId, round, requestedModel, cwd } = descriptor;
-    const run = { id: randomUUID(), engine, roleId, stepId, attempt, round, status: 'queued', requestedModel, cwd };
+    const run = { id: randomUUID(), engine, roleId, stepId, attempt, round, status: 'queued', requestedModel, cwd,
+      ...(engine === 'claude' ? { permissionMode: descriptor.permissionMode } : {}) };
     const active = { controller: new AbortController(), handle: null, finished: deferred(), permissions: new Set(), acknowledged: false };
     this.state.runs.push(run); this.active.set(run.id, active); this.notify();
     let release, summary;
@@ -451,7 +464,7 @@ class WorkflowExecution {
     const status = summary.status === 'completed' ? 'completed' : ['interrupted', 'cancelled'].includes(summary.status) ? summary.status : 'failed';
     // Runtime attribution cannot be overwritten by native/operation output.
     const { status: ignoredStatus, id: ignoredId, engine: ignoredEngine, roleId: ignoredRole, stepId: ignoredStep, attempt: ignoredAttempt, round: ignoredRound,
-      requestedModel: ignoredModel, cwd: ignoredCwd, ...publicResult } = summary;
+      requestedModel: ignoredModel, permissionMode: ignoredPermissionMode, cwd: ignoredCwd, ...publicResult } = summary;
     Object.assign(run, publicResult, { status });
     if (status !== 'completed' && !this.stopping) this.blockers.add(run.id);
     this.notify();
@@ -463,6 +476,8 @@ class WorkflowExecution {
     if (this.terminal || settled.has(run.status)) return;
     // Only the scheduler's validated terminal result is published as completion.
     if (event.type === 'result') return;
+    if (event.type === 'native-tasks' && run.engine === 'claude' && Array.isArray(event.nativeTasks)) run.nativeTasks = clone(event.nativeTasks);
+    if (run.engine === 'claude' && event.type === 'permission-mode') run.actualPermissionMode = assertClaudePermissionMode(event.actualMode);
     if (event.type === 'session' && typeof event.sessionId === 'string' && event.sessionId) {
       run.nativeSessionId = event.sessionId;
       const { key, value } = this.binding(descriptor);

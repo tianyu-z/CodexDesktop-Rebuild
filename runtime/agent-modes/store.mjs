@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, unlink
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { validateRoleOverrides } from './templates/schema.mjs';
+import { assertClaudePermissionMode } from './claude-permissions.mjs';
 
 const clone = value => structuredClone(value);
 const engines = new Set(['codex', 'claude']);
@@ -69,6 +70,7 @@ export class ConversationStore {
       }
       value.roleBindings ??= {};
       value.roleOverrides ??= {};
+      value.claudePermissionMode = assertClaudePermissionMode(value.claudePermissionMode === undefined ? 'default' : value.claudePermissionMode);
       value.nextEventSeq ??= 1;
       legacyAlias(value);
       this.records.set(value.id, value);
@@ -95,7 +97,15 @@ export class ConversationStore {
       try { unlinkSync(path); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
   }
+  has(id) { return this.records.has(id); }
+  hasActiveRun() { return [...this.records.values()].some(value => value.activeTurn || value.activeRun); }
   get(id) { return this.records.has(id) ? clone(this.records.get(id)) : null; }
+  replaceIdleHistory(snapshot) {
+    if (this.require(snapshot.id).activeRun || snapshot.activeRun || snapshot.activeTurn) throw new Error('Cannot replace active conversation history.');
+    const next = legacyAlias(clone(snapshot));
+    this.save(next);
+    this.records.set(next.id, next);
+  }
   list() { return [...this.records.values()].map(clone); }
   require(id) {
     const value = this.records.get(id);
@@ -127,14 +137,15 @@ export class ConversationStore {
     }
   }
 
-  ensureThread(thread, { mode = 'codex' } = {}) {
+  ensureThread(thread, { mode = 'codex', claudePermissionMode = 'default' } = {}) {
     if (typeof thread?.id !== 'string' || !thread.id) throw new Error('Thread id is required.');
+    assertClaudePermissionMode(claudePermissionMode);
     if (!this.records.has(thread.id)) {
       assertMode(mode);
       const { turns = [], ...metadata } = thread;
       this.records.set(thread.id, legacyAlias({
         schemaVersion: 2, id: thread.id, mode, cwd: thread.cwd,
-        thread: clone(metadata), models: { codex: thread.model ?? null, claude: 'default' },
+        thread: clone(metadata), models: { codex: thread.model ?? null, claude: 'default' }, claudePermissionMode,
         bindings: {
           codex: { sessionId: thread.id, consumedSeq: 0 },
           claude: { sessionId: null, consumedSeq: 0 },
@@ -153,6 +164,7 @@ export class ConversationStore {
     value.cwd = thread.cwd ?? value.cwd;
     if (value.mode !== 'both' && !value.explicitModels?.codex && thread.model && !thread.model.startsWith('claude-code/')) value.models.codex = thread.model;
     for (const turn of turns) {
+      if (value.discardedNativeTurnIds?.includes(turn.id)) continue;
       const existing = value.turns.find(row => row.turn.id === turn.id);
       if (existing && existing.turn.status !== 'inProgress' && turn.status === 'inProgress') continue;
       this.putTurn(thread.id, turn, { engine: 'codex', save: false });
@@ -161,12 +173,13 @@ export class ConversationStore {
     return clone(value);
   }
 
-  setMode(id, mode, { model, models, template, roleOverrides } = {}) {
+  setMode(id, mode, { model, models, template, roleOverrides, claudePermissionMode } = {}) {
     assertMode(mode);
     if (model) assertEngine(mode);
     const nextModels = models === undefined ? null : selectedModels(models);
     const nextTemplate = template === undefined ? undefined : selectedTemplate(template);
     const nextOverrides = roleOverrides === undefined ? undefined : validateRoleOverrides(roleOverrides);
+    if (claudePermissionMode !== undefined) assertClaudePermissionMode(claudePermissionMode);
     const value = this.require(id);
     if (value.activeRun) throw new Error('Finish or interrupt the active run before switching engines.');
     value.mode = mode;
@@ -177,6 +190,10 @@ export class ConversationStore {
     }
     if (nextTemplate !== undefined) value.template = nextTemplate;
     if (nextOverrides !== undefined) value.roleOverrides = nextOverrides;
+    if (claudePermissionMode !== undefined) {
+      if (value.claudePermissionMode !== claudePermissionMode) delete value.claudeActualPermissionMode;
+      value.claudePermissionMode = claudePermissionMode;
+    }
     this.save(value);
     return clone(value);
   }
@@ -241,6 +258,8 @@ export class ConversationStore {
     const template = selectedTemplate({ id: frozen.template.id, revision: frozen.template.revision, parameters: frozen.parameters ?? {} });
     const roleOverrides = validateRoleOverrides(frozen.roleOverrides ?? {}, frozen.template.roles);
     frozen.roleOverrides = roleOverrides;
+    frozen.claudePermissionMode = assertClaudePermissionMode(frozen.claudePermissionMode === undefined ? value.claudePermissionMode : frozen.claudePermissionMode);
+    for (const role of Object.values(frozen.template.roles ?? {})) if (role.permissionMode !== undefined) assertClaudePermissionMode(role.permissionMode);
     this.putTurn(id, turn, { engine: 'both', runId: workflowId, save: false });
     const row = value.turns.at(-1);
     row.workflow = { id: workflowId, status: 'running', config: frozen, events: [], state: null };
@@ -249,6 +268,7 @@ export class ConversationStore {
     value.explicitModels = { ...value.explicitModels, ...Object.fromEntries(Object.keys(models).map(engine => [engine, true])) };
     value.template = template;
     value.roleOverrides = clone(roleOverrides);
+    value.claudePermissionMode = frozen.claudePermissionMode;
     value.activeTurn = { id: workflowId, turnId: turn.id, mode: 'both' };
     this.save(value);
     return clone(row);
@@ -270,6 +290,7 @@ export class ConversationStore {
     value.models = { ...value.models, ...clone(row.workflow.config.models) };
     value.template = { id: row.workflow.config.template.id, revision: row.workflow.config.template.revision, parameters: clone(row.workflow.config.parameters) };
     value.roleOverrides = clone(row.workflow.config.roleOverrides ?? {});
+    value.claudePermissionMode = row.workflow.config.claudePermissionMode ?? 'default';
     value.mode = 'both'; row.workflow.status = 'running'; row.turn.status = 'inProgress';
     delete row.turn.completedAt; delete row.turn.durationMs; row.turn.error = null;
     this.save(value);
@@ -285,9 +306,15 @@ export class ConversationStore {
     const expectedModel = role && Object.hasOwn(role, 'model') ? role.model : row.workflow.config.models[run.engine];
     if ((role && Object.hasOwn(role, 'model') ? run.requestedModel !== expectedModel : run.requestedModel != null && expectedModel != null && run.requestedModel !== expectedModel)) throw new Error('Run model ownership mismatch.');
     if (role && role.engine !== run.engine) throw new Error('Role engine ownership mismatch.');
+    if (run.engine === 'claude') {
+      const permissionMode = assertClaudePermissionMode(run.permissionMode === undefined ? 'default' : run.permissionMode);
+      if (permissionMode !== (role?.permissionMode ?? 'default')) throw new Error('Run permission mode ownership mismatch.');
+      if (run.actualPermissionMode !== undefined) assertClaudePermissionMode(run.actualPermissionMode);
+    }
     const index = row.runs.findIndex(current => current.id === run.id);
     const previousAttempts = row.runs.filter(previous => roleAttemptKey(previous) === roleAttemptKey(run));
     if (previousAttempts.some(previous => previous.engine !== run.engine || previous.requestedModel !== run.requestedModel)) throw new Error('Retry engine/model ownership mismatch.');
+    if (run.engine === 'claude' && previousAttempts.some(previous => (previous.permissionMode ?? 'default') !== (run.permissionMode ?? 'default'))) throw new Error('Retry permission mode ownership mismatch.');
     if (index < 0 && row.runs.some(previous => roleAttemptKey(previous) === roleAttemptKey(run) && previous.attempt >= run.attempt)) throw new Error('Duplicate or stale role attempt.');
     if (index >= 0) {
       const previous = row.runs[index];

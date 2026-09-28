@@ -19,6 +19,8 @@ const appFixture = [
 
   'H=!P&&(0,H2.jsx)(`span`,{ref:S,children:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:F,permissionsCwdOverride:i,permissionsHostId:a})})',
   'async sendRequest(e,t,n){return this.requestClient.sendRequest(e,t,n)}',
+  'function TPc(e){let t=(0,kPc.c)(102),',
+  'E=Y(LXs),D=d?E.filter(xZs):E',
   'HV.FooterInlineControls,{ref:x,children:[V,H,r,U]}',
   'let W;return t[35]!==r||t[36]!==V||t[37]!==H||t[38]!==U?',
   'j=async(n,r,i,a,s)=>{let{context:c,memoryPreferences:l}=await A(n)',
@@ -58,6 +60,9 @@ test('exact replacement is idempotent even when replacement contains original te
 test('app patch is idempotent and captures engine settings before preparation', () => {
   const patched = patchAppBundle(appFixture);
   assert.equal(patchAppBundle(patched), patched);
+  assert.match(patched, /__cdxEngineModes\.PermissionControls/);
+  assert.match(patched, /__cdxEngineModes\.useClaudeCommands/);
+  assert.match(patched, /useClaudeCommands\(\{React:F\$,scope:m,threadId:FB\(m\)/);
   assert.match(patched, /j=async\(n,r,i,a,s\)=>\{let __cdxEngineSelection=globalThis\.__cdxEngineModes.capture\(e,a\?\.hostId\?\?S\);let\{context:c/);
   assert.match(patched, /let W;return !0\|\|/);
   assert.match(patched, /busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H/);

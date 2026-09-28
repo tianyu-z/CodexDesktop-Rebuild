@@ -68,3 +68,15 @@ test('Claude default and absent selections resolve only in Claude without mutati
   }
   assert.deepEqual(models, [undefined, undefined, undefined, 'claude-exact-deployment']);
 });
+
+test('generated Claude role prompts cannot become slash commands while native attachments remain enabled', async () => {
+  const calls = [];
+  const runner = new RoleRunner({ claudeAdapter: { start(options) { calls.push(options); return { done: Promise.resolve({ status: 'completed' }), interrupt: async () => {} }; } } });
+  for (const prompt of ['/clear', '  /config model=sonnet', '/custom:skill arbitrary input', 'Normal instructions']) {
+    const options = { runId: 'role', engine: 'claude', access: 'read', cwd: '/repo', prompt };
+    await runner.start(options).done;
+    assert.equal(calls.at(-1).prompt, `[Workflow role input]\n${prompt}`);
+    assert.equal(options.prompt, prompt);
+    assert.notEqual(calls.at(-1).verbatimPrompts, true);
+  }
+});

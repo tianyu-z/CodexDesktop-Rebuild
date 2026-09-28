@@ -1,3 +1,23 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdirSync, writeFileSync, readFileSync, renameSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
+
+// Native sessions can keep this reference across forks. Never replace a file
+// already referenced by a prompt with another version's conversation history.
+export function writeHistorySnapshot(directory, text) {
+  const snapshots = join(directory, 'history-snapshots');
+  mkdirSync(snapshots, { recursive: true, mode: 0o700 });
+  const path = join(snapshots, `${createHash('sha256').update(text).digest('hex')}.txt`);
+  try { if (readFileSync(path, 'utf8') === text) return path; }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, text, { mode: 0o600, flag: 'wx' });
+    renameSync(temporary, path);
+  } finally { try { unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; } }
+  return path;
+}
+
 export function inputText(input) {
   if (!Array.isArray(input)) throw new Error('Expected a list of user inputs.');
   return input.map(item => {
@@ -35,8 +55,8 @@ function publicItem(item) {
 }
 
 export function publicHistory(conversation, afterSeq = 0) {
-  return conversation.turns.filter(row => row.seq > afterSeq).map(row => {
-    const items = row.turn.items.map(item => {
+  return conversation.turns.filter(row => row.seq > afterSeq && !row.claudeCommand?.local).map(row => {
+    const items = row.turn.items.filter(item => !item.cdxClaudeLocalCommand).map(item => {
       const text = publicItem(item);
       if (!text || !item.cdxRunId) return text;
       return `[Run ${item.cdxRunId}; engine ${item.cdxEngineSource}; role ${item.cdxRoleId}]\n${text}`;
@@ -45,7 +65,7 @@ export function publicHistory(conversation, afterSeq = 0) {
       const header = `[Run ${run.id}; engine ${run.engine}; role ${run.roleId}; step ${run.stepId}; round ${run.round}; attempt ${run.attempt}; status ${run.status}; requested model ${run.requestedModel ?? 'default'}; actual model ${run.actualModel ?? 'unknown'}]`;
       // Only public outcomes belong in a handoff. Never serialize native event
       // envelopes, private reasoning, settings, or internal session metadata.
-      const displayed = row.turn.items.filter(item => item.cdxRunId === run.id && item.type === 'agentMessage').map(item => item.text);
+      const displayed = row.turn.items.filter(item => item.cdxRunId === run.id && item.type === 'agentMessage' && !item.cdxClaudeLocalCommand).map(item => item.text);
       const parts = [run.text, run.structuredOutput ? JSON.stringify(run.structuredOutput) : ''].filter(Boolean);
       const outcome = [...new Set(parts)].filter(text => !displayed.includes(text)).join('\n');
       items.push(`${header}${outcome ? `\n${outcome}` : ''}`);

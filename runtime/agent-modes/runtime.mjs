@@ -39,7 +39,7 @@ export function createEngineRuntime({ command, args = ['app-server'], codexRoleA
     // Explicit runtime ownership, rather than an untrusted wire host parameter.
     router.remote = remote;
     return { router, native,
-      isBusy: () => store.list().some(chat => chat.activeTurn || chat.activeRun),
+      isBusy: () => store.hasActiveRun(),
       request: (method, params) => router.request(method, params),
       respond: message => router.respond(message) || native.respond(message),
       notify: message => native.notify(message),

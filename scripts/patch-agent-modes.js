@@ -25,6 +25,12 @@ function withHelper(source) {
 // Keep the separately rendered dual picker tied to the known native constructor.
 // This identity seam validates its props without changing the only-mode width gate.
 const APP_PATCHES = [
+  ['native Claude permission controls',
+    'function TPc(e){let t=(0,kPc.c)(102),',
+    'function TPc(e){let __cdxScope=us(LB);return(0,z2.jsx)(globalThis.__cdxEngineModes.PermissionControls,{React:APc,jsx:z2,scope:__cdxScope,threadId:e.conversationId,hostId:e.hostId,cwd:e.cwdOverride,getHost:(e,t)=>e.get(Rk,t),getManager:zg,nativePicker:(0,z2.jsx)(__cdxNativePermissions,e)})}function __cdxNativePermissions(e){let t=(0,kPc.c)(102),'],
+  ['native Claude slash catalog',
+    'E=Y(LXs),D=d?E.filter(xZs):E',
+    'E=globalThis.__cdxEngineModes.useClaudeCommands({React:F$,scope:m,threadId:FB(m),cwd:Y(CS),composer:g,nativeCommands:Y(LXs),getHost:(e,t)=>e.get(Rk,t),getManager:zg}),D=d?E.filter(xZs):E'],
   ['native model picker contract',
     'H=!P&&(0,H2.jsx)(`span`,{ref:S,children:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:F,permissionsCwdOverride:i,permissionsHostId:a})})',
     'H=!P&&(0,H2.jsx)(`span`,{ref:S,children:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:F,permissionsCwdOverride:i,permissionsHostId:a})})'],
@@ -178,6 +184,7 @@ function patchAssets(assetsDir) {
   const nextApp = patchAppBundle(fs.readFileSync(app, 'utf8'));
   const nextTurn = patchTurnBundle(fs.readFileSync(turn, 'utf8'));
   fs.copyFileSync(path.join(__dirname, 'assets', HELPER_NAME), path.join(assetsDir, HELPER_NAME));
+  if (fs.existsSync(path.join(assetsDir, 'cdx-branch.js'))) fs.copyFileSync(path.join(__dirname, 'assets', 'cdx-branch.js'), path.join(assetsDir, 'cdx-branch.js'));
   fs.writeFileSync(app, nextApp);
   fs.writeFileSync(turn, nextTurn);
   return { app, turn, helper: path.join(assetsDir, HELPER_NAME) };

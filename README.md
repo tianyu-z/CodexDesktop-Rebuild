@@ -2,6 +2,8 @@
 
 Cross-platform Electron build for OpenAI Codex Desktop App.
 
+The agent-mode build adds native Claude commands and permission modes, including per-role controls in multi-agent chats. See [usage and validation](docs/agent-modes.md).
+
 ## Supported Platforms
 
 | Platform | Architecture | Status |

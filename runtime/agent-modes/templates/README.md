@@ -57,7 +57,7 @@ scopes is intentional. Roles and parameters have independent namespaces.
 | `revision` | Positive safe integer; omitted input defaults to `1`. Assigned locally on save. |
 | `name` | Nonempty string, at most 200 characters. |
 | `description` | Required string, may be empty, at most 5,000 characters. |
-| `roles` | Object with 1–64 named roles, each `{engine, prompt, access, session, model?}`. |
+| `roles` | Object with 1–64 named roles, each `{engine, prompt, access, session, model?, permissionMode?}`. |
 | `parameters` | Named typed definitions; defaults to `{}`, maximum 32 definitions. |
 | `limits` | Defaults to `{concurrency:2,tasks:8,rounds:2}`; partial objects fill defaults. |
 | `steps` | Nonempty root scope; DAG rules below. |
@@ -72,8 +72,8 @@ actually enforce read-only roles. `reuse` allows a role's separate native sessio
 to resume under the same template revision and workspace; `fresh` requires a new
 role session. Sessions are not shared between roles or concurrent tasks. Engine,
 model and prompt are part of binding identity. Top-level `roleOverrides` on
-conversation/turn selection accepts existing role IDs mapped to `{engine?,model?,prompt?}`;
-it cannot change access or session policy. Omitted overrides preserve selection,
+conversation/turn selection accepts existing role IDs mapped to `{engine?,model?,prompt?,permissionMode?}`.
+For Claude roles, `permissionMode` accepts `default`, `acceptEdits`, `plan`, `auto`, `bypassPermissions`, or `dontAsk`; it defaults to `default`. The native harness decides effective policy, while `access: read` continues to restrict the tool set. A permission override does not affect Codex. Overrides cannot change access or session policy. Omitted overrides preserve selection,
 `{}` clears them, and changing template resets omitted overrides. The effective
 configuration is frozen for retry and resume.
 

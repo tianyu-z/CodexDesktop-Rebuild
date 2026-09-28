@@ -49,12 +49,40 @@ Claude 使用自己的用户、项目、本地配置和工具权限策略。Code
 | Claude Code | 官方 Agent SDK 驱动所选主机上的 Claude 可执行文件；支持公开文本、工具事件、单次权限确认、中断、原生会话恢复 |
 | 历史 | 合并线程读取、恢复、轮次分页、消息分页，保留引擎来源、模式和模型选择 |
 | Claude 当前输入 | 文本；不支持的附件、结构化输出、工具续传明确报错 |
-| 混合历史的 fork / rollback / revert | 暂不可用；原生 Codex-only 会话保留这些操作 |
+| 混合历史的 fork / rollback / revert | 支持 Claude、混合和多代理历史；默认编辑先保存旧版本，再从编辑位置重新生成 |
 | Claude 专有能力缺口 | Codex compact、realtime、review 等没有等价实现的请求明确报错 |
 | 自动标题 | Claude 会话使用首条消息生成标题，不额外调用 Codex 推理 |
 | 多代理 | 本地和 SSH 主机均可运行 Polly、Debby、自定义声明式模板；每个角色独立选择引擎及模型 |
 
 切换不转移隐藏推理。长历史按有界输入传递，并提供本地完整公开历史文件的引用。Claude 的通用工具卡片保留实际输入和输出；补丁不会从工具名称猜测或伪造文件 diff。
+
+## Claude 命令与权限
+
+Claude 历史消息也可使用消息旁的编辑按钮。默认先创建旧版本快照，编辑成功后可通过消息旁的版本箭头切换；快照失败会停止编辑，保留原历史。原地编辑则沿用原有截断行为。这些操作只改变对话历史，不撤销已经写入项目的文件。
+
+编辑和版本分支保留当前引擎、模型、角色与权限选择。Claude 及各角色在下一条普通消息中用保留的公开历史建立独立原生会话；不会继续使用包含已删除消息的旧会话。旧工作流结果仍可查看，编辑后需要发送新消息再次运行，不能重试旧快照中的任务。长历史引用使用不可变快照；旧格式引用会在分支时重建所需上下文。若编辑期间连接或写盘中断，下次读取或提交前先核对原生历史并恢复已完成的编辑。
+
+选择 **Only Claude Code** 后，在原输入框键入 `/` 可搜索当前主机、项目中的 Claude 原生命令、技能和插件命令。目录来自已安装 Claude Code 的初始化结果，数量随项目和插件变化；命令栏的刷新按钮重新读取目录。Codex-only 保留原有 Codex 菜单。
+
+多代理模板中有 Claude 角色时，**Claude / commands →** 选择命令作用的角色，默认选 Claude host，否则选第一个 Claude 角色。发送命令只操作该角色的原生会话，不启动整个模板。任务运行中支持 `/status`、`/permissions`、`/tasks` 和 `/btw <问题>`，使用该任务已有的 Claude 进程；同一角色同时运行多个任务时，再选择 **Claude command task**。其他命令在当前任务结束或停止后执行。相同引擎、相同模型的两个角色仍各自持有独立会话。
+
+- `/model <模型 ID>` 调用原生模型命令，并将选择保存到 Claude-only 或选中的 Claude 角色。
+- `/context`、`/compact`、`/config` 以及原生技能命令交给 Claude；`/config key=value` 遵循 Claude 自己的配置作用域，会修改原生设置。
+- `/permissions` 显示原生权限规则；`/permissions default|acceptEdits|plan|auto|bypassPermissions` 设置选中会话或角色的模式。`/plan` 开启计划模式，`/plan open` 查看计划。
+- `/clear` 重置选中角色的原生上下文，保留 App 公开历史，并阻止旧历史自动重新导入。
+- `/resume` 列出当前工作目录中的原生会话；`/resume <session-id>` 明确选定要继续的会话。同一个原生会话不能同时分配给其他聊天或角色。
+- `/copy [N]` 复制第 N 条最近的 Claude 回复；`/export [filename]` 下载完整原生会话文本。剪贴板不可用时显示重试按钮。
+- `/status`、`/skills`、`/memory`、`/hooks`、`/plugins`、`/mcp`、`/sandbox`、`/chrome` 使用原生控制接口显示对应信息。插件管理命令只列出已配置插件；安装和账户配置仍由原生工具管理。
+- `/tasks` 显示原生后台任务状态与工作流角色记录，原生进程结束后明确标记，不把旧任务显示为仍在运行。
+- `/btw <问题>` 使用 Claude 的旁支问答接口；`/rewind <user-message-uuid>` 默认预览文件恢复，显式加 `--apply` 才恢复文件，暂不回滚 App 的混合引擎历史。
+- `/remote-control`（或 `/rc`）成功后保留当前原生会话进程，并显示远程控制链接；点击 Stop 结束。它遵循原生账号与组织策略，不会在启动后立即关闭进程。
+- `/feedback <报告>` 将报告文字发送给 Anthropic，默认不附带会话记录。
+
+命令参数按当前安装的 Claude 版本解析。需要该版本未提供的交互界面或控制接口时会明确报错，不把命令伪装成普通模型请求。
+
+Claude 权限菜单与 VS Code Insiders 的 Claude 扩展对齐：**Manual** (`default`)、**Edit automatically** (`acceptEdits`)、**Plan** (`plan`)、**Auto** (`auto`)、**Bypass permissions** (`bypassPermissions`)。高级 API 保存的 `dontAsk` 也能继续使用。Claude-only 隐藏 Codex 的权限选择器，多代理为每个 Claude 角色提供独立选择；模板中有 Codex 角色时保留 Codex 权限。
+
+选择值会传给 Claude 原生 harness，由原生策略决定实际模式。界面显示最后报告的不同模式，工作流详情保留各角色的实际权限。成功的 Plan 退出等原生转换会影响下一轮；当前工作流的固定配置与失败重试仍保持原选择。只读角色继续受工具集限制，即使其模式是 Bypass permissions。
 
 ## Claude 模型列表
 
@@ -139,7 +167,7 @@ CDX_LIVE_REMOTE=1 node tests/agent-modes/live-remote.mjs rno mixed
 CDX_LIVE_REMOTE=1 node tests/agent-modes/live-remote-lifecycle.mjs rno
 ```
 
-远程网关数据独立于 Mac，位于 `~/.local/share/codex-desktop-rebuild/<appName>-<sshIdentityHash>/conversations/`。重新连接同一 SSH 身份会恢复原网关；断线不取消任务，挂起审批以原 ID 重放。另一个活动控制端不会接管现有任务。运行时升级只在该网关空闲时进行，不杀死其他 Codex 进程。原生受限环境的 sandbox 失败会明确报告，不自动改为 Full access。
+远程网关数据独立于 Mac，位于 `~/.local/share/codex-desktop-rebuild/<appName>-<sshIdentityHash>/conversations/`。重新连接同一 SSH 身份会恢复原网关；断线不取消任务，挂起审批以原 ID 重放。另一个活动控制端不会接管现有任务。运行时版本不同时，协议兼容的忙碌网关仍可重连，任务和待审批请求保持原状；下次空闲重连时再升级，不杀死其他 Codex 进程。原生受限环境的 sandbox 失败会明确报告，不自动改为 Full access。
 
 此前单引擎版本验证：172 项自动化测试通过，覆盖流式事件、SDK 契约、配置隔离、审批归属、取消通知、退出清理、异步响应竞态、重启、分页、模式重试、提供方目录分页和凭据隔离、项目连接配置覆盖、自定义代理请求头、动态模型目录、RPC 代理边界和补丁幂等。真实 Foundry Claude 推理成功，连接配置安装版界面返回 `CLAUDE_DESKTOP_OK`，该轮只有 Claude 执行；同一会话 Codex → Claude → Codex 的双向事实回忆、文件读取、网关重启和历史分页通过。真实 Bash 权限允许后写入成功，拒绝后没有写入，取消待审批任务后未写入且拥有的 Claude 进程退出。预览版界面已验证错误结束后控件恢复、原会话切换到 Codex、回复引擎标记，以及应用重启后的混合历史和模式恢复。
 
@@ -187,9 +215,17 @@ GUI 发现并修复了两个集成缺口：原生回合归一化后，首个子�
 
 本分支已实现 SSH 多代理运行时。桌面端上传经过哈希校验的私有运行时包，通过既有 SSH 连接控制远程持久网关；Codex、Claude、文件工具和 API 请求都在所选集群执行。远程已有的 Claude 配置优先；仅对已识别的 Foundry 同源服务复用远程 Codex 连接配置，凭据不复制到 Mac。
 
-远程附加数据位于 `~/.local/share/codex-desktop-rebuild/<appName>-<sshIdentityHash>/`，运行时包按内容哈希存储。SSH 断开不停止工作；重连恢复历史及原审批 ID。网关重启会把未完成执行标记为中断，用户可显式继续或重试。另一活动控制端不能接管同一网关；升级仅自动替换空闲网关，不终止其他 Codex 服务。
+远程附加数据位于 `~/.local/share/codex-desktop-rebuild/<appName>-<sshIdentityHash>/`，运行时包按内容哈希存储。SSH 断开不停止工作；重连恢复历史及原审批 ID。网关重启会把未完成执行标记为中断，用户可显式继续或重试。另一活动控制端不能接管同一网关；升级仅自动替换空闲网关；忙碌且协议兼容时先连接原网关，下次空闲重连再升级，不终止其他 Codex 服务。
 
 原生 Codex 默认沙箱受集群容器限制时，仅针对已识别的 bwrap 权限错误检测其 Landlock 后端；只读及禁网络约束继续生效，不修改用户配置或关闭沙箱。具体主机验收和剩余连接限制见[远程验证记录](remote-claude-validation.md)。上面的安装段落按日期保留历史版本记录，最新安装状态以该记录为准。
+
+2026-09-28 11:03 UTC 已安装忙碌网关重连修复。rno 上运行中的旧网关保留原 PID 和活动 turn，App 内 safety 项目由升级失败恢复为 Connected；安装未重启 App，12 个原进程均保留。测试覆盖忙碌旧网关重连、原审批重放、空闲检查后的并发任务、协议不兼容拒绝，以及关闭期间的连接重置。完整套件 604 项通过，最后的远程相关检查 18 项通过。六个集群的网关回归用例均通过，测试使用隔离 scope 和确定性原生进程替身，不代表重新验证了所有模型推理。最终运行时 SHA-256 为 `6fef1d28beb933e4f04ab16c4ebd1b52db844480c36fa3d411f309b56728666b`；安装及恢复证据见 `.artifacts/gateway-upgrade-install.json` 和 `.artifacts/gateway-upgrade-status.json`。
+
+本次还观察到 bar 新建隔离网关时偶发 `Remote Codex read-only sandbox probe timed out`。已有生产连接及进程正常；bar 的最终网关回归用例复用了已上传运行时，跳过该真实原生启动步骤。这是独立于忙碌升级阻断的启动限制，未通过放宽权限或终止已有服务规避。
+
+2026-09-28 11:47 UTC 进一步安装长历史流式处理修复：原实现对每段原生工具输出复制整条聊天历史，rno 的约 29 MB、277 轮聊天因此阻塞健康检查、分支查询和引擎发现。现在只读取归属信息；需要更新时仅复制目标轮次。忙碌检查也不再复制聊天正文。完整测试 606 项通过，原版本实例的 100 次输出回放由约 4.6 秒降至约 1 毫秒。为保留正在执行的任务，11:49 UTC 对 rno 既有网关仅应用了相同的三处读取优化，校验原函数和模块路径后替换其方法；临时调试监听已确认关闭，网关 PID、原生 Codex PID 及活动轮次保留。正式安装包包含完整修复，远程运行时 SHA-256 为 `180f1491f2b0ca0aba47a1f7a3539a9df519017e8c24dff90b2784ab1dcc54b1`。
+
+在用户原来的 learn / rno 页面实际验证：`Loading branch…` 和模型发现错误消失，依次选中了 Only Claude Code、Multi-agent、Only Codex，模型和权限控件可用，最后恢复为 Only Codex，未提交新任务。记录见 `.artifacts/stream-responsive-install.json`、`.artifacts/stream-responsive-status.json` 和 `.artifacts/stream-responsive-gui-*.txt`。
 
 
 ## 远程角色版本验证（2026-09-28）
@@ -202,3 +238,29 @@ GUI 发现并修复了两个集成缺口：原生回合归一化后，首个子�
 远程角色版本已安装到 `/Applications/chatgpt-dev.app`，运行时代码修订 `ddf6f03`。已安装 ASAR SHA-256 为 `3c4c63f9bd1045560807c1a595528a2752f0d3f94a7d9a5f6904959013869e70`，远程运行时归档为 `7fb4f4a225fdccde8e81ba93efac7fbf30f1dfb9a32dbf8093acfb8759cdb829`。31 个运行时源文件、ASAR 头完整性和严格签名校验通过，与最终验收候选一致。
 
 应用及配套会话数据备份：`/Users/tianyu.zhang/.codex/backups/agent-modes/remote-roles-2026-09-28T05-44-37Z/`。安装保留了现有 12 个 App/网关/原生服务及辅助进程；重启 `chatgpt-dev` 后新版本生效。安装与校验记录为 `.artifacts/remote-install-manifest.json`、`.artifacts/remote-installed-verification.json`。代码没有推送到远程仓库。
+
+## Claude 命令与权限验证（2026-09-28）
+
+本机 VS Code Insiders 的 Claude 扩展为 2.1.283，运行时使用官方 Agent SDK 0.3.282。签名预览的真实界面已验证原生斜杠菜单、菜单插入后发送 `/context`、五种权限、Plan 选择保存，以及多代理每个 Claude 角色独立的权限和命令目标。当前本地项目读取 92 个目录条目；数字随项目/插件变化，不是固定白名单。
+
+真实原生 Write 测试中，Manual 和 Plan 经一次审批拒绝后没有写文件；Edit automatically、Auto、Bypass 各完成一次写入，无 App 审批回调。Bypass 加只读角色只提供 Read/Grep/Glob，无法写入。所有子进程退出，一次性文件已清理，原有 Claude 和 VS Code 设置字节不变。证据：`.artifacts/native-claude-permissions-20260928-0744/report.json`。
+
+577 项全量自动化检查通过；随后补充的界面、任务归属和失败会话恢复修复均通过专项回归与独立复查。六个集群 rno、bar、ala、blc、blc-2、sko 完成目录、模型切换、清空和角色会话隔离验证，共 54 次命令执行成功。30 次权限初始化成功，27 次同模式控制成功：bar、blc、blc-2 的原生 Claude 拒绝 Auto，App 不绕过该限制。四个集群实际验证运行中 `/status`、`/permissions`、`/tasks` 使用同一原生进程。
+
+各集群的原生 `/context` 统计均出现等待不返回，直接 SDK 也复现。App 在 60 秒截止后退出该命令，显示明确失败，保留有效旧会话并丢弃未落盘的新会话 ID。最终 rno 实测约 62.2 秒（含进程退出）恢复空闲，同一聊天随后的 `/status` 和 `/model` 成功。该限制仍存在于原生统计能力，不声称已经取得远程上下文统计。六主机矩阵与最终修复分别记录于 `.artifacts/remote-claude-controls-pDH5D1/acceptance.md`、`.artifacts/remote-claude-controls-Ay7d4B/acceptance.md`；最终针对性验收的运行时 SHA-256 为 `39cba0d35365e772ed972d266a4ae40ecb427c2b4708c82965928ac95b78aad8`。
+
+命令只接收原生会话已有上下文与角色指令；不会把尚未交接的公开历史追加到系统指令。未交接历史留待下一条普通消息作为用户上下文传递。同名项目技能优先按原生目录解析；只读角色不能通过配置管理或文件 rewind 绕过限制。测试网关、数据和临时原生项目记录已清理，原有远程网关均保留。
+
+Claude 命令与权限版本已于 2026-09-28T08:14:27.800Z 安装到正式 App，重启后生效。ASAR SHA-256：`93b7764f7ce37c77fb632300198dd5670ab76b9189ea0a1f2aaca9e10ee7bdd4`；远程归档与上述最终 rno 验收一致。38 个运行时源文件、渲染器辅助脚本、ASAR 头完整性和严格签名均已核对。安装保留了原有 19 个 App/网关及相关进程。完整程序与附加会话数据备份：`/Users/tianyu.zhang/.codex/backups/agent-modes/claude-controls-2026-09-28T08-12-26-369Z`。记录见 `.artifacts/claude-controls-install-manifest.json`。本次没有推送。
+
+## Claude 历史编辑修复（2026-09-28）
+
+已修复 Claude / 混合历史编辑时 `thread/fork` 和 `thread/rollback` 被拒绝的问题。599 项全量检查通过，后续长历史和恢复边界改动通过 24 项专项检查与独立复查。本地真实引擎验证了编辑、旧版本独立续聊、首条消息重写、混合引擎上下文及网关重启；rno 验证了远程编辑、旧版本隔离和独立测试网关重启，原有网关保持运行。
+
+最终签名预览中，将较早的 `12 + 7` 改为 `12 + 8` 后，Claude 返回 `20`；版本箭头可切回保留了 `19`、随后 `4 + 4 → 8` 的旧版本，也能返回新版。模型和原生权限选择保持不变。记录为 `.artifacts/history-edit-gui-old.png`、`.artifacts/history-edit-gui-new.png`、`.artifacts/history-edit-live-KErlja/report.json` 和 `.artifacts/remote-history-edit-zLb3s3/history-report.json`。
+
+修复版本已于 2026-09-28T09:40:42.985Z 安装到 `/Applications/chatgpt-dev.app`，重启后生效。ASAR SHA-256：`c8db66b958f9028a92e338cbf4928b56b0d82ec4e0e953f3a3af50703d8c1cf3`；远程运行包 SHA-256：`4018a7663f21b49b9da85c4249ffb9fd71d7bc3ad9e1b5be7936966261278c6f`，与 rno 验收一致。34 个 `.mjs` 源文件、两份渲染器辅助脚本、ASAR 头及严格签名均已核对。安装保留原有 12 个 App/网关进程，完整备份位于 `/Users/tianyu.zhang/.codex/backups/agent-modes/history-edit-2026-09-28T09-40-06.573Z`。记录见 `.artifacts/history-edit-install-manifest.json`。本次没有推送。
+
+2026-09-28 20:11 UTC 已确认并解决生产 rno 仍拒绝历史编辑的问题：此前的远程编辑验收使用独立测试网关，生产网关为保留活动任务仍运行旧版本；11:49 UTC 的流式性能修复没有加入历史编辑支持。确认生产网关空闲、备份附加会话数据后，通过正常 `ensure` 升级到 `180f1491f2b0ca0aba47a1f7a3539a9df519017e8c24dff90b2784ab1dcc54b1`，未强制停止网关或重启 App。
+
+随后直接在 App 中分支用户既有的 rno Claude 会话，编辑历史消息并由 `claude-opus-5-5` 返回验证文本；`1/2 ↔ 2/2` 双向版本切换通过。核对持久化记录确认原会话 11 轮正文未改动，编辑副本保留前缀，旧版本保留完整原问答，新回复使用独立 Claude 原生会话。两个测试副本已归档。记录见 `.artifacts/rno-history-activate.json`、`.artifacts/rno-history-verification.json` 和 `.artifacts/rno-history-gui-*.txt`。这些验收日志及会话数据仅保存在本机，不随源码发布。
