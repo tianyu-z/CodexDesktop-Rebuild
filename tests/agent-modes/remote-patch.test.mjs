@@ -14,6 +14,9 @@ test('pinned remote transport connects the private gateway and never executes up
   assert.match(patched, /__cdxRemoteEngineModes.proxyCommand/);
   const method = patched.slice(patched.indexOf('async startRemoteAppServer(e)'), patched.indexOf('createSshSetupError(e,t)'));
   assert.doesNotMatch(method, /pkill|nohup|SKIP_APP_SERVER_BOOT/);
+  const stop = patched.slice(patched.indexOf('async killCodexProcess()'), patched.indexOf('async runRemoteLoginShellCommand('));
+  assert.doesNotMatch(stop, /pkill/);
+  assert.match(stop, /__cdxRemoteEngineModes.stop/);
 });
 test('unsupported upstream remote seams fail closed', () => {
   assert.throws(() => patchRemoteMain('unsupported source'), /expected/);
