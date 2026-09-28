@@ -226,17 +226,18 @@ export class EngineRouter {
       this.store.remove(id);
       if (method !== 'thread/delete') { if (result.thread) this.store.ensureThread(result.thread); else await this.hydrate(id); }
     }
-    if (method === 'thread/list') {
-      let visible = result.data.filter(thread => !this.workflow.internal.has(thread.id));
+    if (method === 'thread/list' || method === 'thread/search') {
+      const isPublic = entry => !this.workflow.internal.has(method === 'thread/search' ? entry.thread.id : entry.id);
+      let visible = result.data.filter(isPublic);
       const visited = new Set(), limit = params.limit ?? 50;
       while (visible.length < limit && result.nextCursor) {
         if (visited.has(result.nextCursor)) throw new Error('Native thread pagination repeated its cursor.');
         visited.add(result.nextCursor);
         const next = await this.native.request(method, { ...nativeParams(params), cursor: result.nextCursor, limit: limit - visible.length });
-        visible.push(...next.data.filter(thread => !this.workflow.internal.has(thread.id)));
+        visible.push(...next.data.filter(isPublic));
         result.nextCursor = next.nextCursor;
       }
-      result.data = visible.map(thread => {
+      result.data = method === 'thread/search' ? visible : visible.map(thread => {
       if (!this.store.get(thread.id)) return thread;
       this.store.mergeNativeThread(thread);
       return { ...thread, ...this.thread(thread.id, { includeTurns: false }) };

@@ -19,7 +19,13 @@ const frame = (path, value, inputs) => ({ path, round: 0, resolve: () => value, 
 const passed = { passed: true, issues: [] };
 const verified = { passed: true, checks: [{ description: 'Fixture check', status: 'passed' }], issues: [] };
 const tick = () => new Promise(resolve => setTimeout(resolve, 10));
-async function until(predicate) { for (let n = 0; n < 700; n++) { if (predicate()) return; await tick(); } assert.fail('Condition did not settle'); }
+async function until(predicate) {
+  // These tests create real Git snapshots; a seven-second polling budget is
+  // too short when the desktop and release build are exercising the same disk.
+  const deadline = performance.now() + 60_000;
+  while (performance.now() < deadline) { if (predicate()) return; await tick(); }
+  assert.fail('Condition did not settle within 60 seconds');
+}
 
 async function fixture(t, responder, { subdirectory = '' } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'polly-')); t.after(async () => { await exec('chmod', ['-R', 'u+w', root]); await rm(root, { recursive: true, force: true }); });

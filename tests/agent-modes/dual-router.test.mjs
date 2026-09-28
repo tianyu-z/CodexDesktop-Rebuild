@@ -158,6 +158,36 @@ test('sidebar pagination fills past internal-only pages without losing public cu
   assert.equal(result.nextCursor, 'after-public');
 });
 
+test('search filters persisted internal ownership using nested thread IDs and preserves public snippets', async t => {
+  const f = fixture(t); f.router.workflow.registerInternal('child');
+  const publicHit = { thread: { id: 'user-chat', name: 'Original user request: an ordinary user title' }, snippet: { text: 'public match', ranges: [{ start: 0, end: 6 }] } };
+  f.native.request = async () => ({ data: [{ thread: { id: 'child' }, snippet: { text: 'private role prompt' } }, publicHit], nextCursor: null });
+  const restarted = new EngineRouter({ store: f.store, native: f.native, adapter: f.router.adapter, emit: () => {}, templates: f.templates, workflowFactory: () => {} });
+  const result = await restarted.request('thread/search', { searchTerm: 'request', limit: 20 });
+  assert.deepEqual(result.data, [publicHit]);
+  assert.equal(result.nextCursor, null);
+  assert.ok(restarted.workflow.internal.has('child'));
+});
+
+test('search pagination fills past private pages and retains search filters and the public cursor', async t => {
+  const f = fixture(t); f.router.workflow.registerInternal('child');
+  const requests = [], publicHit = { thread: { id: 'public-later' }, snippet: { text: 'matching answer' } };
+  f.native.request = async (method, params) => {
+    requests.push({ method, params });
+    return params.cursor === 'after-second-child' ? { data: [publicHit], nextCursor: 'after-public' }
+      : { data: [{ thread: { id: 'child' }, snippet: { text: 'private' } }], nextCursor: params.cursor ? 'after-second-child' : 'after-first-child' };
+  };
+  const filters = { limit: 1, searchTerm: 'answer', archived: false, sortKey: 'updated_at', sourceKinds: ['vscode'] };
+  const result = await f.router.request('thread/search', filters);
+  assert.deepEqual(result.data, [publicHit]);
+  assert.equal(result.nextCursor, 'after-public');
+  assert.deepEqual(requests.map(({ method, params }) => ({ method, ...params })), [
+    { method: 'thread/search', ...filters },
+    { method: 'thread/search', ...filters, cursor: 'after-first-child' },
+    { method: 'thread/search', ...filters, cursor: 'after-second-child' },
+  ]);
+});
+
 test('explicit retry reopens the latest interrupted workflow using its frozen configuration', async t => {
   const f = fixture(t), { turn } = await started(f), w = f.workflows[0];
   w.state.runs = roles(); w.publish(); w.finish('interrupted'); await tick();

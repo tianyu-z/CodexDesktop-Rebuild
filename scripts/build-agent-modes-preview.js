@@ -18,6 +18,7 @@ function patchBootstrap(code) {
 async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = path.join(ROOT, '.artifacts', 'ChatGPT Engines Preview.app'), appName = 'chatgpt-dev-engines-preview' } = {}) {
   const asar = await import('@electron/asar');
   const { patchAssets } = require('./patch-agent-modes.js');
+  const { patchCatalogBuild } = require('./patch-agent-catalog.js');
   const source = path.join(ROOT, 'src', 'mac-arm64', '_asar');
   const version = JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8')).version;
   if (version !== VERSION) throw new Error(`Unsupported source version ${version}; expected ${VERSION}.`);
@@ -25,6 +26,7 @@ async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = pat
   const stagedAsar = path.join(staging, 'asar');
   execFileSync('/bin/cp', ['-cR', source, stagedAsar]);
   patchAssets(path.join(stagedAsar, 'webview', 'assets'));
+  patchCatalogBuild(path.join(stagedAsar, '.vite', 'build'));
   const bootstrap = path.join(stagedAsar, '.vite', 'build', 'early-bootstrap.js');
   fs.writeFileSync(bootstrap, patchBootstrap(fs.readFileSync(bootstrap, 'utf8')));
   fs.copyFileSync(path.join(ROOT, 'scripts', 'assets', 'agent-modes-bootstrap.cjs'), path.join(stagedAsar, '.vite', 'build', 'agent-modes-bootstrap.cjs'));
