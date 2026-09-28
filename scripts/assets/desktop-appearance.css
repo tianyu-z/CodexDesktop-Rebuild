@@ -1,0 +1,95 @@
+/* Codex 26.924.22138 appearance, adapted to the 26.820.71523 DOM.
+ * Intentionally no :root token overrides, composer selectors, or utility rewrites.
+ * Existing theme, font/zoom preferences, engine controls and transcripts retain their styles.
+ */
+.cdx-nav-rail {
+  display: flex; flex-direction: column; align-items: center; flex: 0 0 52px;
+  width: 52px; min-height: 0; padding: 2px 8px 8px; gap: 8px;
+  user-select: none; -webkit-app-region: no-drag;
+}
+.cdx-nav-rail-items, .cdx-nav-rail-footer { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.cdx-nav-rail-items { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: none; }
+.cdx-nav-rail-footer { flex-shrink: 0; }
+.cdx-nav-rail button {
+  width: 36px; min-width: 36px; height: 36px; min-height: 36px; padding: 8px;
+  border-radius: 10px; color: var(--color-text-secondary); border: 0;
+  background: transparent; box-shadow: none;
+}
+.cdx-nav-rail button svg { width: 20px; height: 20px; flex-shrink: 0; }
+.cdx-nav-rail button[aria-current="page"], .cdx-nav-more[data-active] button {
+  color: var(--color-text); background: color-mix(in srgb, var(--color-text) 6%, transparent);
+}
+.cdx-nav-rail button:hover { background: color-mix(in srgb, var(--color-text) 8%, transparent); color: var(--color-text); }
+.cdx-nav-rail button:focus-visible, .cdx-context-panel :is(button,input,select):focus-visible {
+  outline: 2px solid var(--color-token-focus-border, var(--color-text)); outline-offset: -2px;
+}
+.cdx-context-panel {
+  display: flex; flex: 1; flex-direction: column; gap: 1px; min-width: 0; min-height: 0;
+  padding: 0 8px calc(var(--sidebar-footer-height, 0px) + 8px);
+  color: var(--color-text); font-family: var(--font-sans); font-size: var(--text-base); line-height: 1.5;
+}
+.cdx-context-header { display: flex; align-items: center; min-height: 36px; gap: 4px; padding: 0 6px 0 8px; }
+.cdx-context-header h1 { flex: 1; margin: 0; font-family: var(--font-openai-sans); font-size: 18px; line-height: 24px; font-weight: 600; }
+.cdx-icon-button { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 8px; }
+.cdx-context-row {
+  display: flex; align-items: center; flex-shrink: 0; gap: 8px; width: 100%; min-height: 30px;
+  border-radius: 10px; padding: 4px 8px; text-align: start; border: 0; background: transparent;
+}
+.cdx-context-row svg { flex-shrink: 0; width: 18px; height: 18px; }
+.cdx-context-row:hover, .cdx-icon-button:hover { background: color-mix(in srgb, var(--color-text) 5%, transparent); }
+.cdx-context-row[aria-current="page"] { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+.cdx-context-row:disabled { opacity: .45; cursor: default; }
+.cdx-context-row-text { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cdx-context-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 4px; margin: 16px 8px 4px; color: var(--color-text-secondary); font-size: 14px; font-weight: 500; }
+.cdx-context-section-heading select { max-width: 100px; color: inherit; background: transparent; border: 0; font: inherit; border-radius: 6px; }
+.cdx-context-scroll { overflow-y: auto; flex: 1; min-height: 0; scrollbar-width: thin; }
+.cdx-context-search { width: calc(100% - 8px); margin: 0 4px 8px; padding: 6px 8px; background: transparent; border: .5px solid var(--color-border-strong); border-radius: 8px; }
+.cdx-context-hint { padding: 12px 8px; margin: 0; color: var(--color-text-secondary); font-size: 12px; }
+.cdx-context-error { margin: 8px; font-size: 12px; color: var(--color-text-secondary); }
+.cdx-context-error button { text-decoration: underline; margin-inline-start: 6px; }
+.cdx-task-row { align-items: flex-start; padding-block: 8px; }
+.cdx-task-title, .cdx-task-description { display: block; overflow: hidden; text-overflow: ellipsis; }
+.cdx-task-description { margin-top: 2px; font-size: 11px; color: var(--color-text-secondary); }
+.cdx-task-status { padding-top: 2px; color: var(--color-text-secondary); }
+.cdx-task-status[data-status="paused"] { opacity: .5; }
+.cdx-task-status[data-status="running"] { color: var(--color-text-info); }
+.cdx-task-run { min-height: 28px; width: calc(100% - 28px); margin-inline-start: 28px; font-size: 12px; color: var(--color-text-secondary); }
+.cdx-unread-dot { width: 5px; height: 5px; margin-top: 8px; border-radius: 50%; background: var(--color-text-info); flex-shrink: 0; }
+.cdx-host-label { max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--color-text-secondary); }
+
+/* Main shell: match the newer content card and thin, continuous separators.
+ * Only the shell itself changes. Its child composer/Claude styles are untouched.
+ */
+:root[data-cdx-appearance] [data-app-shell-main-surface="default"] {
+  background-clip: padding-box; min-width: 0;
+  border-left-width: .5px; border-left-color: var(--color-border);
+  border-start-start-radius: var(--radius-xl-base, 12px);
+}
+:root[data-cdx-appearance] ._Navigation_1ej6d_2 {
+  --color-text-primary-ghost: var(--color-text);
+  --color-text-primary-ghost-hover: var(--color-text);
+  --color-text-secondary-ghost-hover: var(--color-text);
+}
+/* The new toolbar/strip uses the same 52px height and 14px font as this build.
+ * Align its button geometry without changing model or permission pickers.
+ */
+:root[data-cdx-appearance] [data-app-shell-tab-row] { border-bottom-color: var(--color-border); }
+:root[data-cdx-appearance] :is([data-app-shell-sidebar-trigger],[data-app-shell-tab-close-button]) {
+  border-radius: 8px;
+}
+/* Native directory/settings pages inherit the newer restrained heading treatment.
+ * Conversation routes are excluded, including user messages and Claude controls.
+ */
+:root[data-cdx-appearance]:is([data-cdx-area="scheduled"],[data-cdx-area="customize"]) [data-app-shell-focus-area="main"] h1 {
+  font-family: var(--font-openai-sans); font-size: 24px; line-height: 28px; font-weight: 600; letter-spacing: 0;
+}
+:root[data-cdx-appearance]:is([data-cdx-area="scheduled"],[data-cdx-area="customize"]) [data-app-shell-main-surface] {
+  border-start-start-radius: 0;
+}
+@media (max-width: 640px) {
+  .cdx-nav-rail { flex-basis: 44px; width: 44px; padding-inline: 4px; }
+  :root[data-cdx-appearance] .compact-window [data-app-shell-main-surface] { border-start-start-radius: 0; }
+}
+@media (forced-colors: active) {
+  .cdx-nav-rail button[aria-current="page"], .cdx-context-row[aria-current="page"] { outline: 1px solid Highlight; }
+}

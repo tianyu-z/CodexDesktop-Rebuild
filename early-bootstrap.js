@@ -1,0 +1,3 @@
+/* chatgpt-dev isolation: force distinct app name + userData so it never collides with the official Codex/ChatGPT app */(()=>{try{const{app}=require("electron"),path=require("path"),NAME="chatgpt-dev",_sn=app.setName.bind(app),_sp=app.setPath.bind(app),dir=()=>path.join(app.getPath("appData"),NAME);app.setName=()=>_sn(NAME);app.setPath=(k,p)=>k==="userData"?_sp("userData",dir()):_sp(k,p);_sn(NAME);try{_sp("userData",dir())}catch(e){}}catch(e){}})();
+require("./src-KMpTO78a.js"),require("./desktop-open-path-queue-BtqbTQxD.js").r(process.platform===`darwin`),Promise.resolve().then(()=>require("./bootstrap-Dk_d-XQN.js"));
+//# sourceMappingURL=early-bootstrap.js.map
