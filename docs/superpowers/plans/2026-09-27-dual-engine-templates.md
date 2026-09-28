@@ -163,6 +163,8 @@ Use independently scoped implementers, then independent spec and quality review.
 
 All six tasks are necessary for the requested first release. The task is not complete when only the selector or Debby works.
 
+Publication update: the user subsequently explicitly requested pushing the current dual-engine version to `tianyu-z/CodexDesktop-Rebuild`. Publish the existing `codex/claude-code-modes` branch with the documented installation and outstanding GUI verification status preserved.
+
 
 ## Execution checkpoint
 

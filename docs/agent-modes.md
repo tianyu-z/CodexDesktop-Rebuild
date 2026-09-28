@@ -174,7 +174,7 @@ GUI 发现并修复了两个集成缺口：原生回合归一化后，首个子�
 
 替换前的程序和配套 `engine-conversations` 数据保存在 `/Users/tianyu.zhang/.codex/backups/agent-modes/dual-2026-09-28T02-08-06Z/`，安装时另存一份数据快照。当前开发对话由正式 App 的旧进程承载，因此替换的是磁盘上的程序包，没有终止正在使用的 App 或网关；**重启 App 后新版本才生效**。锁屏期间无法完成正式 App 重启和最终侧栏界面复验。回退时应同时使用这次备份中的旧程序与对应附加数据；原生 Codex 历史不变。
 
-源代码在 `codex/claude-code-modes` 分支。先前单引擎版本已按要求推送；双引擎改动目前保留在本地，未另行推送。
+源代码发布分支为 [CodexDesktop-Rebuild / codex/claude-code-modes](https://github.com/tianyu-z/CodexDesktop-Rebuild/tree/codex/claude-code-modes)。本次按用户要求同步当前双引擎版本；安装和验证状态以上述记录为准。
 
 ## 远程验证进展
 
