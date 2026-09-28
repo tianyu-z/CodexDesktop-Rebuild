@@ -52,6 +52,7 @@ export class ConversationStore {
   constructor(directory) {
     this.directory = directory;
     this.records = new Map();
+    this.pendingSaves = new Map();
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     for (const file of readdirSync(directory).filter(name => /^[a-f0-9]{64}\.json$/.test(name))) {
       const original = readFileSync(join(directory, file), 'utf8');
@@ -102,11 +103,28 @@ export class ConversationStore {
     return value;
   }
   save(value) {
+    const pending = this.pendingSaves.get(value.id);
+    if (pending) { pending.value = value; return; }
     const path = this.path(value.id);
     const temporary = `${path}.${randomUUID()}.tmp`;
     const { activeRun, ...persistent } = value;
     writeFileSync(temporary, JSON.stringify(persistent), { mode: 0o600 });
     renameSync(temporary, path);
+  }
+
+  /** Persist synchronous mutations once, before the caller can publish them. */
+  batch(id, update) {
+    this.require(id);
+    if (this.pendingSaves.has(id)) return update();
+    const pending = {};
+    this.pendingSaves.set(id, pending);
+    try { return update(); }
+    finally {
+      this.pendingSaves.delete(id);
+      // Preserve already-validated progress if a later callback fails, as the
+      // individual synchronous saves did. Write failures still reach callers.
+      if (pending.value) this.save(pending.value);
+    }
   }
 
   ensureThread(thread, { mode = 'codex' } = {}) {

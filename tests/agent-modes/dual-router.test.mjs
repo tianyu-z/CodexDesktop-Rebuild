@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import fs, { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ConversationStore } from '../../runtime/agent-modes/store.mjs';
@@ -38,6 +39,73 @@ async function started(f) {
   await tick(); return result;
 }
 const roles = () => ['codex', 'claude'].map(engine => ({ id: `${engine}-run`, roleId: engine, stepId: `answers.${engine}`, round: 0, attempt: 1, status: 'running', engine, requestedModel: engine === 'codex' ? 'codex-current' : 'claude-y', cwd: '/fixture' }));
+
+function trackSnapshotCommits(t, store) {
+  const destination = store.path('chat'), original = fs.renameSync;
+  const commits = { count: 0, failure: null };
+  fs.renameSync = (from, to) => {
+    if (to === destination) {
+      if (commits.failure) throw commits.failure;
+      commits.count++;
+    }
+    return original(from, to);
+  };
+  syncBuiltinESMExports();
+  commits.restore = () => { fs.renameSync = original; syncBuiltinESMExports(); };
+  t.after(commits.restore);
+  return commits;
+}
+
+test('one workflow snapshot commits all roles, bindings and state in one atomic replacement', async t => {
+  const f = fixture(t); await started(f); const w = f.workflows[0];
+  w.state.runs = [...roles(), ...roles().map(run => ({ ...run, id: `${run.id}-second`, stepId: `${run.stepId}-second` }))];
+  w.state.bindings = Object.fromEntries(w.state.runs.map(run => [run.id, { engine: run.engine, sessionId: `${run.id}-session`, consumedSeq: 0 }]));
+  const commits = trackSnapshotCommits(t, f.store);
+  w.publish();
+  assert.equal(commits.count, 1, 'A growing role list must not multiply full-conversation writes');
+  const disk = JSON.parse(readFileSync(f.store.path('chat'), 'utf8'));
+  assert.deepEqual(disk.turns[0].runs, w.state.runs);
+  assert.deepEqual(disk.roleBindings, w.state.bindings);
+  assert.deepEqual(disk.turns[0].workflow.state, w.state);
+  assert.equal(disk.turns[0].workflow.status, 'running');
+});
+
+test('each event commits its journal and public output once before sending any notification', async t => {
+  const f = fixture(t); await started(f); const w = f.workflows[0]; w.state.runs = roles(); w.publish();
+  const commits = trackSnapshotCommits(t, f.store), notifications = [];
+  const event = { type: 'text-delta', id: 'first-message', eventId: 'first-delta', runId: 'codex-run', roleId: 'codex', engine: 'codex', delta: 'durable text' };
+  const notify = f.router.notify.bind(f.router);
+  f.router.notify = (method, params) => {
+    if (method.startsWith('item/')) {
+      const row = JSON.parse(readFileSync(f.store.path('chat'), 'utf8')).turns[0];
+      assert.equal(row.workflow.events.at(-1).eventId, event.eventId);
+      assert.equal(row.turn.items.at(-1).text, event.delta);
+      notifications.push(method);
+    }
+    notify(method, params);
+  };
+  w.callbacks.onEvent(event);
+  assert.equal(commits.count, 1);
+  assert.deepEqual(notifications, ['item/started', 'item/agentMessage/delta']);
+  w.callbacks.onEvent(event);
+  assert.equal(commits.count, 1, 'Duplicate events do not create another snapshot');
+});
+
+test('a batched persistence failure propagates before notifications and does not retain the batch', async t => {
+  const f = fixture(t); await started(f); const w = f.workflows[0]; w.state.runs = roles(); w.publish();
+  const before = readFileSync(f.store.path('chat'), 'utf8'), events = f.events.length;
+  const commits = trackSnapshotCommits(t, f.store);
+  try {
+    commits.failure = Error('fixture persistence failed');
+    assert.throws(() => w.callbacks.onEvent({ type: 'text-delta', id: 'message', eventId: 'failed-write', runId: 'codex-run', roleId: 'codex', engine: 'codex', delta: 'partial' }), /fixture persistence failed/);
+    assert.equal(f.events.length, events);
+    assert.equal(readFileSync(f.store.path('chat'), 'utf8'), before);
+    commits.failure = null;
+    w.publish();
+    assert.equal(commits.count, 1, 'A later lifecycle snapshot must still persist synchronously');
+    assert.equal(JSON.parse(readFileSync(f.store.path('chat'), 'utf8')).turns[0].workflow.events.at(-1).eventId, 'failed-write');
+  } finally { commits.restore(); }
+});
 
 test('both capabilities and template APIs are local and backed by versioned storage', async t => {
   const f = fixture(t);

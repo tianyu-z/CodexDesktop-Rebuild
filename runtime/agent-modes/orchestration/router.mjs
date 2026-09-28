@@ -145,40 +145,48 @@ export class WorkflowRouter {
   }
   snapshot(run, snapshot) {
     if (this.store.get(run.threadId)?.activeTurn?.id !== run.id) return;
-    for (const child of snapshot.runs ?? []) {
-      this.store.putWorkflowRun(run.threadId, run.id, child);
-      if (child.engine === 'codex' && child.nativeSessionId) this.registerInternal(child.nativeSessionId);
-    }
-    for (const [key, binding] of Object.entries(snapshot.bindings ?? {})) this.store.setRoleBinding(run.threadId, key, binding);
-    this.store.setWorkflowState(run.threadId, run.id, snapshot);
-    const { value, row } = this.store.workflowRecord(run.threadId, run.id);
-    row.workflow.status = snapshot.status; this.store.save(value);
+    this.store.batch(run.threadId, () => {
+      for (const child of snapshot.runs ?? []) {
+        this.store.putWorkflowRun(run.threadId, run.id, child);
+        if (child.engine === 'codex' && child.nativeSessionId) this.registerInternal(child.nativeSessionId);
+      }
+      for (const [key, binding] of Object.entries(snapshot.bindings ?? {})) this.store.setRoleBinding(run.threadId, key, binding);
+      this.store.setWorkflowState(run.threadId, run.id, snapshot);
+      const { value, row } = this.store.workflowRecord(run.threadId, run.id);
+      row.workflow.status = snapshot.status; this.store.save(value);
+    });
   }
   event(run, event) {
     if (this.store.get(run.threadId)?.activeTurn?.id !== run.id) return;
     const history = this.store.workflowRecord(run.threadId, run.id).row.workflow.events;
     if (history.some(previous => previous.eventId === event.eventId && previous.runId === event.runId)) return;
-    this.store.appendWorkflowEvent(run.threadId, run.id, event);
-    if (event.type === 'session' && event.engine === 'codex') this.registerInternal(event.sessionId);
-    const source = { cdxEngineSource: event.engine, cdxRunId: event.runId, cdxRoleId: event.roleId, cdxStepId: event.stepId };
-    const id = run.threadId, turn = run.turn;
-    const update = (item, complete) => {
-      item = { ...item, ...source };
-      const index = turn.items.findIndex(current => current.id === item.id);
-      if (index < 0) turn.items.push(item); else turn.items[index] = item;
-      this.store.putTurn(id, turn, { engine: 'both', runId: run.id });
-      if (index < 0) this.router.notify('item/started', { threadId: id, turnId: turn.id, item: presentItem(item, 'both') });
-      if (complete) this.router.notify('item/completed', { threadId: id, turnId: turn.id, item: presentItem(item, 'both') });
-    };
-    if (event.type === 'message-start') update({ id: event.id, type: 'agentMessage', text: '', phase: 'commentary' }, false);
-    if (event.type === 'message-completed') update({ id: event.id, type: 'agentMessage', text: event.text, phase: event.nativeItem?.phase ?? 'final_answer' }, true);
-    if (event.type === 'text-delta') {
-      let item = turn.items.find(item => item.id === event.id);
-      if (!item) { update({ id: event.id, type: 'agentMessage', text: '', phase: 'commentary' }, false); item = turn.items.at(-1); }
-      item.text += event.delta; this.store.putTurn(id, turn, { engine: 'both', runId: run.id });
-      this.router.notify('item/agentMessage/delta', { threadId: id, turnId: turn.id, itemId: event.id, delta: event.delta, ...source });
-    }
-    if (['tool-start', 'tool-completed'].includes(event.type)) update(event.nativeItem ? { ...event.nativeItem, id: event.id } : toolItem(event, this.store.get(id).turns.find(row => row.workflow?.id === run.id)?.runs.find(child => child.id === event.runId)?.cwd ?? this.store.get(id).cwd), event.type === 'tool-completed');
+    const notifications = [];
+    const notify = (method, params) => notifications.push([method, params]);
+    this.store.batch(run.threadId, () => {
+      this.store.appendWorkflowEvent(run.threadId, run.id, event);
+      if (event.type === 'session' && event.engine === 'codex') this.registerInternal(event.sessionId);
+      const source = { cdxEngineSource: event.engine, cdxRunId: event.runId, cdxRoleId: event.roleId, cdxStepId: event.stepId };
+      const id = run.threadId, turn = run.turn;
+      const update = (item, complete) => {
+        item = { ...item, ...source };
+        const index = turn.items.findIndex(current => current.id === item.id);
+        if (index < 0) turn.items.push(item); else turn.items[index] = item;
+        this.store.putTurn(id, turn, { engine: 'both', runId: run.id });
+        if (index < 0) notify('item/started', { threadId: id, turnId: turn.id, item: presentItem(item, 'both') });
+        if (complete) notify('item/completed', { threadId: id, turnId: turn.id, item: presentItem(item, 'both') });
+      };
+      if (event.type === 'message-start') update({ id: event.id, type: 'agentMessage', text: '', phase: 'commentary' }, false);
+      if (event.type === 'message-completed') update({ id: event.id, type: 'agentMessage', text: event.text, phase: event.nativeItem?.phase ?? 'final_answer' }, true);
+      if (event.type === 'text-delta') {
+        let item = turn.items.find(item => item.id === event.id);
+        if (!item) { update({ id: event.id, type: 'agentMessage', text: '', phase: 'commentary' }, false); item = turn.items.at(-1); }
+        item.text += event.delta; this.store.putTurn(id, turn, { engine: 'both', runId: run.id });
+        notify('item/agentMessage/delta', { threadId: id, turnId: turn.id, itemId: event.id, delta: event.delta, ...source });
+      }
+      if (['tool-start', 'tool-completed'].includes(event.type)) update(event.nativeItem ? { ...event.nativeItem, id: event.id } : toolItem(event, this.store.get(id).turns.find(row => row.workflow?.id === run.id)?.runs.find(child => child.id === event.runId)?.cwd ?? this.store.get(id).cwd), event.type === 'tool-completed');
+    });
+    // A failed snapshot must never be advertised as durable public output.
+    for (const [method, params] of notifications) this.router.notify(method, params);
   }
   permission(run, request) {
     const child = this.store.get(run.threadId)?.turns.find(row => row.workflow?.id === run.id)?.runs.find(child => child.id === request.runId);

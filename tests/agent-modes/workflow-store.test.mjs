@@ -19,6 +19,25 @@ function start(store, id = 'workflow', turnId = 'both-turn') {
 }
 const roleRun = (id = 'codex-run', engine = 'codex') => ({ id, engine, roleId: engine, stepId: `answers.${engine}`, attempt: 1, round: 0, status: 'running', requestedModel: `${engine}-selected` });
 
+test('synchronous batches publish all mutations together and preserve validated progress on callback errors', () => {
+  const { store } = setup();
+  const disk = () => JSON.parse(readFileSync(store.path('chat'), 'utf8'));
+  store.batch('chat', () => {
+    store.setRoleBinding('chat', 'codex', { engine: 'codex', consumedSeq: 1 });
+    store.batch('chat', () => store.setRoleBinding('chat', 'claude', { engine: 'claude', consumedSeq: 2 }));
+    assert.deepEqual(disk().roleBindings, {}, 'Nested writes remain atomic until the outer callback returns');
+  });
+  assert.deepEqual(disk().roleBindings, { codex: { engine: 'codex', consumedSeq: 1 }, claude: { engine: 'claude', consumedSeq: 2 } });
+  const failure = Error('later validation failed');
+  assert.throws(() => store.batch('chat', () => {
+    store.setRoleBinding('chat', 'codex', { consumedSeq: 3 });
+    throw failure;
+  }), error => error === failure);
+  assert.equal(disk().roleBindings.codex.consumedSeq, 3);
+  store.setRoleBinding('chat', 'claude', { consumedSeq: 4 });
+  assert.equal(disk().roleBindings.claude.consumedSeq, 4, 'Callback errors cannot leave later writes deferred');
+});
+
 test('mode and harness validation are separate; v2 stores one canonical active turn', () => {
   assert.doesNotThrow(() => assertMode('both'));
   assert.throws(() => assertEngine('both'), /engine|harness/i);
