@@ -460,3 +460,19 @@ test('adapter exposes lazy model discovery and rejects invalid explicit models b
   await adapter.close();
   await assert.rejects(adapter.listModels(), /closed/i);
 });
+
+test('mixed native Foundry and Vertex flags return the provider catalog without changing SDK environment', async () => {
+  const env = Object.freeze({ ...foundry, CLAUDE_CODE_USE_VERTEX: '1' }), sdkRequests = {};
+  const models = catalog(metadataQuery([{ value: 'default', resolvedModel: 'claude-api-model' }], sdkRequests), {
+    environment: () => env, fetchImpl: async () => Response.json({ data: [{ id: 'claude-api-model' }, { id: 'claude-future-model' }] }),
+  });
+  try {
+    const result = await models.listCatalog({ cwd: '/fixture/learn' });
+    assert.equal(result.provider, 'foundry');
+    assert.equal(result.source, 'provider-api+sdk');
+    assert.equal(result.apiModelCount, 2);
+    assert.equal(result.warning, null);
+    assert.deepEqual(result.models.map(model => model.value), ['default', 'claude-api-model', 'claude-future-model']);
+    assert.deepEqual(sdkRequests.request.options.env, env);
+  } finally { await models.close(); }
+});

@@ -24,6 +24,9 @@ function configuration(env) {
   // These providers use different authentication/protocols. Never redirect
   // their credentials to an Anthropic-compatible endpoint by guesswork.
   for (const [flag, provider] of [['CLAUDE_CODE_USE_BEDROCK', 'bedrock'], ['CLAUDE_CODE_USE_VERTEX', 'vertex'], ['CLAUDE_CODE_USE_MANTLE', 'mantle'], ['CLAUDE_CODE_USE_ANTHROPIC_AWS', 'anthropic-aws'], ['CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD', 'anthropic-google-cloud'], ['CLAUDE_CODE_USE_GATEWAY', 'gateway']]) {
+    // Native Claude accountInfo selects Foundry when both Foundry and Vertex
+    // flags are enabled. Preserve the environment and all other provider guards.
+    if (provider === 'vertex' && enabled(env.CLAUDE_CODE_USE_FOUNDRY)) continue;
     if (enabled(env[flag])) return { provider };
   }
   if (enabled(env.CLAUDE_CODE_USE_FOUNDRY)) {

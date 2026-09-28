@@ -137,3 +137,27 @@ test('provider requests honor cancellation without exposing raw provider errors'
   await assert.rejects(promise, /cancelled/);
   assert.equal(observedSignal, controller.signal);
 });
+
+test('Foundry takes precedence over a simultaneously enabled Vertex flag, matching native Claude', async () => {
+  for (const value of ['1', 'TRUE', 'yes']) {
+    const env = Object.freeze({ ...foundry, CLAUDE_CODE_USE_FOUNDRY: value, CLAUDE_CODE_USE_VERTEX: '1' });
+    const requests = [];
+    const result = await discoverProviderModels({ env, fetchImpl: async (url, options) => { requests.push({ url, headers: options.headers }); return page([{ id: 'claude-api-model' }]); } });
+    assert.equal(result.provider, 'foundry');
+    assert.equal(result.apiStatus, 'success');
+    assert.deepEqual(result.models.map(model => model.value), ['claude-api-model']);
+    assert.equal(requests[0].url, 'https://provider.test/openai/v1/models');
+    assert.equal(requests[0].headers['api-key'], 'fixture-foundry-key');
+    assert.equal(env.CLAUDE_CODE_USE_VERTEX, '1');
+  }
+});
+
+test('disabled Foundry flags never redirect an enabled Vertex configuration to Foundry', async () => {
+  for (const value of ['0', 'false', 'no', '']) {
+    let requests = 0;
+    const result = await discoverProviderModels({ env: { ...foundry, CLAUDE_CODE_USE_FOUNDRY: value, CLAUDE_CODE_USE_VERTEX: 'true' }, fetchImpl: async () => { requests++; return page([]); } });
+    assert.equal(result.provider, 'vertex');
+    assert.equal(result.apiStatus, 'unsupported');
+    assert.equal(requests, 0);
+  }
+});
