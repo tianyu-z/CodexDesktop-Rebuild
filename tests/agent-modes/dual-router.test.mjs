@@ -519,3 +519,31 @@ test('mixed steering uses the owned scheduler and correlates the public prompt',
   assert.equal(f.store.get('chat').turns[0].turn.items.at(-1).clientId, 'mixed-steer');
   assert.equal(f.calls.some(call => call.method === 'turn/steer'), false);
 });
+
+for (const status of ['interrupted', 'completed', 'failed']) {
+  test(`late mixed steering preserves the ${status} turn and its recovery state`, async t => {
+    const f = fixture(t), { turn } = await started(f), workflow = f.workflows[0];
+    let accept;
+    workflow.handle.steer = () => new Promise(resolve => { accept = resolve; });
+    const sending = f.router.request('turn/steer', { threadId: 'chat', expectedTurnId: turn.id,
+      clientUserMessageId: 'late-steer', input: [{ type: 'text', text: 'Keep this guidance' }] });
+    await tick(); assert.equal(typeof accept, 'function');
+    if (status === 'interrupted') await f.router.request('turn/interrupt', { threadId: 'chat', turnId: turn.id });
+    else { workflow.finish(status); await tick(); }
+    const before = structuredClone(f.store.get('chat').turns[0].turn);
+    assert.equal(before.status, status);
+    accept({ accepted: [], failures: [{ roleId: 'claude', error: 'Native turn ended' }] });
+    assert.deepEqual(await sending, { turnId: turn.id });
+    const stored = f.store.get('chat'), after = stored.turns[0].turn;
+    assert.equal(after.status, status);
+    assert.deepEqual({ ...after, items: before.items }, before, 'Late input must not overwrite terminal metadata');
+    assert.equal(after.items.filter(item => item.clientId === 'late-steer').length, 1);
+    assert.match(after.items.at(-1).text, /Native turn ended/);
+    assert.equal(stored.activeTurn, null);
+    assert.deepEqual(new ConversationStore(f.store.directory).get('chat').turns[0].turn, after);
+    if (status !== 'completed') {
+      await f.router.request('engine/runs/retry', { threadId: 'chat', turnId: turn.id });
+      await tick(); assert.equal(f.workflows.length, 2);
+    }
+  });
+}

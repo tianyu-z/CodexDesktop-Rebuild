@@ -18,6 +18,11 @@ export async function steerManagedTurn(router, params) {
     ...(params.clientUserMessageId ? { clientId: params.clientUserMessageId } : {}) };
   // Acceptance can race completion; retain the accepted message in its original
   // turn, never whichever turn happens to be active when the receipt arrives.
+  // Workflow completion settles the stored clone, so refresh the owner's object
+  // before appending instead of restoring its stale in-progress status.
+  const storedTurn = router.store.require(chat.id).turns.find(row => row.turn.id === active.turnId)?.turn;
+  if (!storedTurn) throw new Error('The steered turn is no longer available.');
+  Object.assign(owner.turn, structuredClone(storedTurn));
   owner.turn.items.push(item);
   const engine = mixed ? 'both' : 'claude';
   router.store.putTurn(chat.id, owner.turn, { engine, runId: active.id });
