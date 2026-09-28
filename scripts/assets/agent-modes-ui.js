@@ -211,7 +211,7 @@
     const sources = { ...row.snapshot.turnEngines, ...(response?.turnEngines ?? {}), ...(method === 'engine/turns/read' ? response?.turns : {}) };
     const rawTurns = response?.thread?.turns ?? (Array.isArray(response?.turns) ? response.turns : []);
     for (const turn of rawTurns) {
-      const engine = turn.cdxEngineSource ?? turn.items?.find(item => item.cdxEngineSource)?.cdxEngineSource;
+      const engine = turnSource(turn, sources[turn.id ?? turn.turnId]);
       if (['codex', 'claude', 'both'].includes(engine)) sources[turn.id ?? turn.turnId] = engine;
     }
     update(row, { turnEngines: sources });
@@ -269,11 +269,17 @@
       return state.engineMode === 'codex';
     } catch { return false; }
   }
+  function turnSource(raw, known) {
+    if (['codex', 'claude', 'both'].includes(raw?.cdxEngineSource)) return raw.cdxEngineSource;
+    // Native turn normalization can keep item annotations while dropping the
+    // turn extension. A workflow child's engine describes that child only.
+    if (raw?.items?.some(item => item.cdxRunId)) return 'both';
+    if (['codex', 'claude', 'both'].includes(known)) return known;
+    return raw?.items?.find(item => ['codex', 'claude', 'both'].includes(item.cdxEngineSource))?.cdxEngineSource;
+  }
   function sourceFor(threadId, hostId, turnId, raw) {
-    const explicit = raw?.cdxEngineSource ?? raw?.items?.find(item => item.cdxEngineSource)?.cdxEngineSource;
-    if (['codex', 'claude', 'both'].includes(explicit)) return explicit;
-    if (!local(hostId)) return 'codex';
-    return record(null, threadId, hostId).snapshot.turnEngines[turnId] ?? 'codex';
+    const known = local(hostId) ? record(null, threadId, hostId).snapshot.turnEngines[turnId] : undefined;
+    return turnSource(raw, known) ?? 'codex';
   }
   async function refreshSources(threadId, hostId) {
     const manager = managers.get(hostId ?? 'local');

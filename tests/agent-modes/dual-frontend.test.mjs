@@ -65,6 +65,27 @@ test('both capability and source labels require authoritative engine values', as
   assert.throws(() => api.requestFields({ ...selection(), engineModels: { claude: 'bad model' } }), /model/i);
 });
 
+test('dual turn provenance wins over its first child message after native normalization', () => {
+  const { api } = setup();
+  const manager = { getHostId: () => 'local' };
+  const raw = { id: 't', items: [{ cdxEngineSource: 'claude', cdxRunId: 'child' }] };
+  api.observe(manager, 'engine/turns/read', { threadId: 'chat' }, { turns: { t: 'both' } });
+  assert.equal(api.sourceFor('chat', 'local', 't', raw), 'both');
+  // Native normalization keeps item annotations but drops turn extensions.
+  api.observe(manager, 'thread/read', { threadId: 'chat' }, { thread: { turns: [raw] } });
+  assert.equal(api.getSnapshot(null, 'chat', 'local').turnEngines.t, 'both');
+  assert.equal(ui(api, 'SourceBadge', { threadId: 'chat', turnId: 't', raw }).render().props['data-cdx-engine-source'], 'both');
+});
+
+test('dual child attribution identifies the workflow before its source read completes', () => {
+  const { api } = setup(), manager = { getHostId: () => 'local' };
+  const raw = { id: 't', items: [{ cdxEngineSource: 'codex', cdxRunId: 'child' }] };
+  assert.equal(api.sourceFor('chat', 'local', 't', raw), 'both');
+  api.observe(manager, 'thread/read', { threadId: 'chat' }, { thread: { turns: [raw] } });
+  assert.equal(api.sourceFor('chat', 'local', 't'), 'both');
+  assert.equal(api.sourceFor('chat', 'local', 'single', { items: [{ cdxEngineSource: 'claude' }] }), 'claude');
+});
+
 const jsx = { jsx: (type, props, key) => ({ type, props, key }), jsxs: (type, props, key) => ({ type, props, key }) };
 function ui(api, component, props = {}) {
   const slots = []; let index = 0;
