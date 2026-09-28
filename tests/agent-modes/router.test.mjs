@@ -16,6 +16,64 @@ function fixture(t) {
   t.after(async()=>{await router.close();rmSync(dir,{recursive:true,force:true});});return {dir,thread,calls,events,runs,store,router};
 }
 async function start(f,engineMode='codex'){return f.router.request('thread/start',{cwd:f.dir,engineMode,model:'codex-model',agentMode:'guardian-approvals'});}
+for (const mode of ['claude', 'both']) {
+  for (const remote of [false, true]) {
+    test(`native goal activation cannot launch Codex in ${mode} mode (${remote ? 'remote' : 'local'})`, async t => {
+      const f = fixture(t); await start(f, 'claude');
+      f.router.remote = remote; f.store.setMode('thread-1', mode);
+      const count = f.calls.length;
+      for (const params of [{ objective: 'work', status: 'active' }, { status: 'active' }, { objective: 'work' }]) {
+        await assert.rejects(f.router.request('thread/goal/set', { threadId: 'thread-1', ...params }), /goal.*Only Codex/i);
+      }
+      assert.equal(f.calls.length, count, 'No native goal RPC or inference may be started');
+      assert.equal(f.store.get('thread-1').activeRun, null);
+      await f.router.request('thread/goal/set', { threadId: 'thread-1', status: 'paused' });
+      await f.router.request('thread/goal/clear', { threadId: 'thread-1' });
+      assert.deepEqual(f.calls.slice(count).map(call => call.method), ['thread/goal/set', 'thread/goal/clear']);
+    });
+  }
+}
+test('Only Codex retains native goal activation', async t => {
+  const f = fixture(t); await start(f);
+  const params = { threadId: 'thread-1', objective: 'work', status: 'active' };
+  await f.router.request('thread/goal/set', params);
+  assert.deepEqual(f.calls.at(-1), { method: 'thread/goal/set', params });
+});
+test('stopping an overlapping native turn also stops its chat-owned Claude run and pending approval', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  const { turn } = await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'work' }] }); await tick();
+  const permission = f.runs[0].options.onPermission({ name: 'Bash', input: { command: 'echo approval' }, id: 'tool', signal: new AbortController().signal }); await tick();
+  const nativeTurn = { id: 'unexpected-native-turn', items: [], status: 'inProgress' };
+  f.router.nativeNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn: nativeTurn } });
+  f.store.putTurn('thread-1', { id: 'finished-native-turn', items: [], status: 'completed' }, { engine: 'codex' });
+  await assert.rejects(f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: 'unrelated-turn' }), /ownership/);
+  await assert.rejects(f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: 'finished-native-turn' }), /ownership/);
+  assert.equal(f.runs[0].options.signal.aborted, false);
+  await f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: nativeTurn.id });
+  assert.equal((await permission).decision, 'decline');
+  assert.equal(f.store.get('thread-1').activeRun, null);
+  assert.equal(f.store.get('thread-1').turns.find(row => row.turn.id === turn.id).turn.status, 'interrupted');
+  assert.deepEqual(f.calls.filter(call => call.method === 'turn/interrupt').map(call => call.params), [{ threadId: 'thread-1', turnId: nativeTurn.id }]);
+});
+test('stopping the Claude turn also interrupts an overlapping native turn without touching another chat', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  const { turn } = await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'work' }] }); await tick();
+  f.store.ensureThread({ ...f.thread, id: 'other-chat', turns: [{ id: 'other-turn', items: [], status: 'inProgress' }] });
+  f.router.nativeNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'overlap', items: [], status: 'inProgress' } } });
+  await f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: turn.id });
+  assert.deepEqual(f.calls.filter(call => call.method === 'turn/interrupt').map(call => call.params), [{ threadId: 'thread-1', turnId: 'overlap' }]);
+  assert.equal(f.store.get('other-chat').turns[0].turn.status, 'inProgress');
+});
+test('overlap recovery delegates the exact managed turn to the multi-agent scheduler', async t => {
+  const f = fixture(t); await start(f, 'claude'); f.store.setMode('thread-1', 'both');
+  f.store.beginRun('thread-1', { id: 'workflow', turnId: 'workflow-turn', mode: 'both', engine: 'codex' });
+  f.store.putTurn('thread-1', { id: 'unexpected-native-turn', items: [], status: 'inProgress' }, { engine: 'codex' });
+  const stops = []; f.router.workflow.interrupt = async (...args) => { stops.push(args); f.store.finishRun('thread-1', 'workflow'); return {}; };
+  await f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: 'unexpected-native-turn' });
+  assert.deepEqual(stops, [['thread-1', 'workflow-turn']]);
+  assert.deepEqual(f.calls.filter(call => call.method === 'turn/interrupt').map(call => call.params), [{ threadId: 'thread-1', turnId: 'unexpected-native-turn' }]);
+  assert.equal(f.store.get('thread-1').activeRun, null);
+});
 test('Claude permission selections persist through thread creation, mode changes, and same-mode turns', async t => {
   const f = fixture(t);
   const created = await f.router.request('thread/start', { cwd: f.dir, engineMode: 'claude', claudePermissionMode: 'acceptEdits', approvalPolicy: 'never' });
@@ -249,4 +307,26 @@ test('cancelling a pending Claude permission resolves the exact frontend request
   assert.equal((await pending).decision, 'decline');
   assert.deepEqual(f.events.filter(event => event.method === 'serverRequest/resolved').map(event => event.params), [{ threadId: 'thread-1', requestId: request.id }]);
   assert.equal(f.router.respond({ id: request.id, result: { decision: 'accept' } }), false);
+});
+
+test('plain steering reaches the owned Claude run and persists a correlated user item', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  const { turn } = await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'initial' }] }); await tick();
+  const inputs = []; f.runs[0].steer = async input => { inputs.push(input); };
+  const params = { threadId: 'thread-1', expectedTurnId: turn.id, clientUserMessageId: 'client-steer', input: [{ type: 'text', text: 'new constraint' }] };
+  await assert.rejects(f.router.request('turn/steer', { ...params, expectedTurnId: 'other-turn' }), /ownership/);
+  assert.deepEqual(await f.router.request('turn/steer', params), { turnId: turn.id });
+  assert.deepEqual(inputs, ['new constraint']);
+  const users = f.store.get('thread-1').turns[0].turn.items.filter(item => item.type === 'userMessage');
+  assert.equal(users.length, 2); assert.equal(users[1].clientId, 'client-steer');
+  assert.equal(f.calls.some(call => call.method === 'turn/steer'), false);
+  await f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: turn.id });
+  await assert.rejects(f.router.request('turn/steer', params), /active|running/);
+});
+
+test('unmanaged Codex chats retain native steering without requiring an engine sidecar', async t => {
+  const f = fixture(t);
+  const params = { threadId: 'native-only-chat', expectedTurnId: 'native-turn', input: [{ type: 'text', text: 'follow up' }] };
+  await f.router.request('turn/steer', params);
+  assert.deepEqual(f.calls.at(-1), { method: 'turn/steer', params });
 });

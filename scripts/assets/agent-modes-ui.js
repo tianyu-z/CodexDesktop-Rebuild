@@ -254,6 +254,14 @@
     if (state.engineMode === 'claude') return { ...requestFields({ engineMode: 'claude', engineModel: state.models.claude ?? 'default', claudePermissionMode: state.claudePermissionMode }), skipAutoTitleGeneration: true };
     return { engineMode: 'codex' };
   }
+  function nativeGoalError(scope, threadId, hostId) {
+    const state = record(scope, threadId, hostId).snapshot;
+    if (state.engineMode !== 'codex') return 'Native /goal requires Only Codex. Remove /goal to send a regular turn to the selected engine.';
+    return null;
+  }
+  function canManageFollowUps(scope, threadId, hostId) {
+    return threadId != null && ['claude', 'both'].includes(record(scope, threadId, hostId).snapshot.engineMode);
+  }
   function registerManager(manager, hostId = managerHost(manager)) {
     if (manager && managers.get(hostId) !== manager) managers.set(hostId, manager);
   }
@@ -865,7 +873,7 @@
   }
   globalThis.__cdxEngineModes = {
     Selector, SourceBadge, TemplateControls, TemplateManager, RoleControls, refreshTemplates, refreshRuns, capture, requestFields, turnRequestFields, registerManager, noteStarted, observe,
-    PermissionControls, useClaudeCommands, refreshClaudeCommands,
+    PermissionControls, useClaudeCommands, refreshClaudeCommands, nativeGoalError, canManageFollowUps,
     deliverClaudeClientActions, retryClaudeClientAction,
     permitsNativeMetadata, permitsNativeModelSelection, sourceFor, setDraftSelection, changeSelection, refreshThread, refreshCapabilities,
     getCapabilities: (manager, context) => catalogRecord(manager, context).snapshot,

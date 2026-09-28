@@ -66,6 +66,25 @@ export class ClaudeAdapter {
     const inputClosed = new Promise((resolve) => { releaseInput = resolve; });
     let resolveQuery;
     const queryReady = new Promise(resolve => { resolveQuery = resolve; });
+    const initialMessageId = randomUUID();
+    const inputs = [], pendingInputs = new Map();
+    let wakeInput, ending = false;
+    const steer = async text => {
+      if (typeof text !== 'string' || !text.trim()) throw new Error('Steering requires a nonempty text prompt.');
+      if (settled || ending || cancellation.signal.aborted || options.command) throw new Error('Claude steering requires an active model turn.');
+      const id = randomUUID();
+      let resolve, reject;
+      const written = new Promise((yes, no) => { resolve = yes; reject = no; });
+      const entry = { id, text, resolve, reject };
+      pendingInputs.set(id, entry); inputs.push(entry); wakeInput?.();
+      await written;
+      return { messageId: id };
+    };
+    const closeInputs = () => {
+      ending = true; wakeInput?.();
+      for (const entry of pendingInputs.values()) entry.reject(new Error('Claude steering interrupted or its native process ended.'));
+      inputs.length = 0;
+    };
     if (interrupted) cancellation.abort();
 
     // Side controls share the owned worker, never its model-output normalizer.
@@ -226,6 +245,7 @@ export class ClaudeAdapter {
       if (!settled) {
         interrupted = true;
         cancellation.abort();
+        closeInputs();
         releaseInput();
         try { await shutdown(true); } catch { /* run.done records cleanup failures */ }
       }
@@ -267,12 +287,25 @@ export class ClaudeAdapter {
             const prompt = (async function* () {
               if (cancellation.signal.aborted) return;
               if (!controlOnly) yield {
-                type: 'user', message: { role: 'user', content: options.command?.execution === 'native' && typeof options.command.input === 'string' ? options.command.input : options.prompt },
+                type: 'user', uuid: initialMessageId, message: { role: 'user', content: options.command?.execution === 'native' && typeof options.command.input === 'string' ? options.command.input : options.prompt },
                 parent_tool_use_id: null, ...(options.nativeSessionId ? { session_id: options.nativeSessionId } : {}),
                 ...(options.synthetic === true ? { isSynthetic: true } : {}),
               };
-              // Keep stdin open so permission replies can still use the control protocol.
-              await inputClosed;
+              // A single SDK stream owns stdin. streamInput() on a second iterable
+              // closes that stdin and breaks permissions when its iterable ends.
+              while (!ending && !cancellation.signal.aborted) {
+                const entry = inputs.shift();
+                if (!entry) {
+                  await Promise.race([new Promise(resolve => { wakeInput = resolve; }), inputClosed]);
+                  wakeInput = undefined;
+                  continue;
+                }
+                yield { type: 'user', uuid: entry.id, priority: 'now', parent_tool_use_id: null,
+                  ...(normalizer.nativeSessionId ? { session_id: normalizer.nativeSessionId } : {}),
+                  message: { role: 'user', content: entry.text } };
+                // The SDK requests another input only after transport.write.
+                if (!ending && !cancellation.signal.aborted) entry.resolve();
+              }
             })();
             query = queryImpl({ prompt, options: {
               cwd: options.cwd,
@@ -329,6 +362,8 @@ export class ClaudeAdapter {
               const terminal = normalizer.consume(next.value);
               if (terminal) {
                 summary = terminal;
+                const answered = next.value.user_message_uuids ?? (next.value.user_message_uuid ? [next.value.user_message_uuid] : []);
+                for (const id of answered) pendingInputs.delete(id);
                 // /model only changes a headless process. Read the accepted
                 // native value before shutdown so the host can carry it forward.
                 const changesModel = terminal.localCommand === 'model' || (terminal.localCommand === 'config' && /(?:^|\s)model\s*=/i.test(options.command?.args ?? options.prompt));
@@ -342,7 +377,8 @@ export class ClaudeAdapter {
                   summary.settingsPatch = { ...summary.settingsPatch, model };
                   summary.actualModel = normalizer.actualModel = model;
                 }
-                if (!keepControlAlive) break;
+                if (!keepControlAlive && (terminal.status !== 'completed' || pendingInputs.size === 0)) { ending = true; break; }
+                if (pendingInputs.size && !answered.length) throw new Error('This Claude version did not acknowledge live steering. Stop and resend the follow-up as a new turn.');
               }
             }
           }
@@ -350,6 +386,7 @@ export class ClaudeAdapter {
       } catch (error) { failure = errorText(error); }
       finally {
         clearTimeout(contextTimeout);
+        closeInputs();
         releaseInput();
         cancellation.abort();
         resolveQuery(undefined);
@@ -373,6 +410,6 @@ export class ClaudeAdapter {
       try { options.onEvent({ type: 'result', ...summary }); } catch { /* completion remains available through done */ }
       return summary;
     });
-    return { done, interrupt, control };
+    return { done, interrupt, control, steer };
   }
 }

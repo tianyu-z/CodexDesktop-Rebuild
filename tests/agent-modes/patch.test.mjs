@@ -8,6 +8,9 @@ const { patchAppBundle, patchTurnBundle, replaceExactOnce } = require('../../scr
 
 // Deliberately literal upstream seams: a renamed binding must fail a build.
 const appFixture = [
+  'FKs(at,!ht&&!bo);',
+  'Lee,(0,Y3.jsx)(AZc,{conversationId:le,children:vte??(0,Y3.jsx)(sFc,{',
+
   'function fNc(e){let t=(0,_Nc.c)(167),',
   'Ie=function(e,t){return(w?.selectModelAndReasoningEffort??x)',
   'function Le(e,t){return w==null?S(e,t):w.setModelAndReasoningEffort(e,t)}',
@@ -43,6 +46,8 @@ const appFixture = [
   'async function Izn(e,t,n){try{let r=e.getConversation(t)',
   'async function Lzn(e,t,n,r){let i=e.getConversation(t)',
   'async function Bkl(e,t){let n=ik(e,t),r=n?.getConversation(t);if(n==null||r==null)return null;try{',
+  'k=async(t,n)=>{if(t.threadGoalDraft==null)return{context:t,goal:void 0};return UAn({scope:e,draft:t.threadGoalDraft,hostId:n})}',
+  'async function zAn({scope:e,appendTranscriptItem:t,conversationId:n,hostId:r,intl:i,objective:a,threadSettings:o}){try{return await zg(e,r).setThreadGoal(n,{objective:a})}catch{return false}}',
 ].join('\n');
 const turnFixture = 't[71]=i,t[72]=N):N=t[72],N})}));';
 
@@ -51,6 +56,29 @@ test('exact replacement rejects missing, ambiguous, and mixed upstream anchors',
   for (const text of ['none', 'target target', 'patched-target target', 'patched-target patched-target']) {
     assert.throws(() => replaceExactOnce(text, 'target', 'patched-target', 'seam'), /seam/);
   }
+});
+
+test('goal submissions fail before creating a managed chat or starting its native goal', async () => {
+  const context = {}, calls = [], notices = [];
+  vm.runInNewContext(readFileSync(new URL('../../scripts/assets/agent-modes-ui.js', import.meta.url), 'utf8'), context);
+  const api = context.__cdxEngineModes, scope = { node: {}, get: () => ({ danger: text => notices.push(text) }) };
+  const lines = patchAppBundle(appFixture).split('\n');
+  const prepare = new Function('e', 'globalThis', 'UAn', `return (${lines.find(line => line.startsWith('k=async')).slice(2)})`)(scope, context, async () => { calls.push('materialize'); });
+  const setGoal = new Function('globalThis', 'Dg', 'zg', `${lines.find(line => line.startsWith('async function zAn('))};return zAn`)(context, {}, () => ({ setThreadGoal: async () => { calls.push('set-goal'); return true; } }));
+  for (const engineMode of ['claude', 'both']) {
+    api.setDraftSelection(scope, { engineMode }, 'local');
+    await assert.rejects(prepare({ threadGoalDraft: { objective: 'work' } }, 'local'), /goal.*Only Codex/i);
+    api.noteStarted({ getHostId: () => 'local' }, 'chat', { engineMode });
+    assert.equal(await setGoal({ scope, conversationId: 'chat', hostId: 'local', objective: 'work' }), false);
+  }
+  assert.equal(calls.length, 0);
+  assert.equal(notices.length, 2);
+  assert.match(notices[0], /Only Codex/);
+  await prepare({ threadGoalDraft: { objective: 'work' } }, 'rno');
+  assert.deepEqual(calls, ['materialize'], 'The guard must respect the selected host');
+  api.setDraftSelection(scope, { engineMode: 'codex' }, 'local');
+  await prepare({ threadGoalDraft: { objective: 'work' } }, 'local');
+  assert.deepEqual(calls, ['materialize', 'materialize']);
 });
 
 test('exact replacement is idempotent even when replacement contains original text', () => {
@@ -270,4 +298,29 @@ test('busy Both chats disable actual native model shortcuts and reject cached se
   render({ conversationId: 'busy' }); // Ordinary native instances retain their behavior.
   commands.get('composer.increaseReasoningEffort').callback();
   assert.equal(changes.length, 1);
+});
+
+
+test('managed chats retain the composer beside pending approval while Codex keeps native behavior', () => {
+  const context = {};
+  vm.runInNewContext(readFileSync(new URL('../../scripts/assets/agent-modes-ui.js', import.meta.url), 'utf8'), context);
+  const api = context.__cdxEngineModes;
+  assert.equal(typeof api.canManageFollowUps, 'function');
+  const scope = { node: {} };
+  for (const engineMode of ['claude', 'both']) {
+    api.noteStarted({ getHostId: () => 'rno' }, 'chat', { engineMode });
+    assert.equal(api.canManageFollowUps(scope, 'chat', 'rno'), true);
+    assert.equal(api.canManageFollowUps(scope, 'chat', 'local'), false);
+  }
+  assert.equal(api.canManageFollowUps(scope, null, 'rno'), false);
+  const lines = patchAppBundle(appFixture).split('\n');
+  const input = lines.find(line => line.includes('FKs(at,')).replace('import"./agent-modes-ui.js";', '');
+  const enabled = new Function('globalThis', 'U', 'le', 'me', 'ht', 'bo', 'FKs', 'at', input);
+  let editable;
+  enabled(context, scope, 'chat', 'rno', true, false, (_, value) => { editable = value; }, {});
+  assert.equal(editable, true);
+  enabled(context, scope, 'chat', 'rno', true, true, (_, value) => { editable = value; }, {});
+  assert.equal(editable, false, 'In-flight submission still prevents duplicate send');
+  assert.match(lines.find(line => line.startsWith('Lee,')), /canManageFollowUps.*vte:null/);
+  assert.match(lines.find(line => line.startsWith('Lee,')), /children:\(globalThis.*\?null:vte\)\?\?/);
 });

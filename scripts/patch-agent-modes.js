@@ -25,6 +25,18 @@ function withHelper(source) {
 // Keep the separately rendered dual picker tied to the known native constructor.
 // This identity seam validates its props without changing the only-mode width gate.
 const APP_PATCHES = [
+  ['managed composer remains editable during approval',
+    'FKs(at,!ht&&!bo);',
+    'FKs(at,(!ht||globalThis.__cdxEngineModes.canManageFollowUps(U,le,me))&&!bo);'],
+  ['managed approval and composer coexist',
+    'Lee,(0,Y3.jsx)(AZc,{conversationId:le,children:vte??(0,Y3.jsx)(sFc,{',
+    'Lee,globalThis.__cdxEngineModes.canManageFollowUps(U,le,me)?vte:null,(0,Y3.jsx)(AZc,{conversationId:le,children:(globalThis.__cdxEngineModes.canManageFollowUps(U,le,me)?null:vte)??(0,Y3.jsx)(sFc,{'],
+  ['new conversation goal guard',
+    'k=async(t,n)=>{if(t.threadGoalDraft==null)return{context:t,goal:void 0};',
+    'k=async(t,n)=>{if(t.threadGoalDraft==null)return{context:t,goal:void 0};let __cdxGoalError=globalThis.__cdxEngineModes.nativeGoalError(e,null,n);if(__cdxGoalError)throw Error(__cdxGoalError);'],
+  ['existing conversation goal guard',
+    'async function zAn({scope:e,appendTranscriptItem:t,conversationId:n,hostId:r,intl:i,objective:a,threadSettings:o}){try{',
+    'async function zAn({scope:e,appendTranscriptItem:t,conversationId:n,hostId:r,intl:i,objective:a,threadSettings:o}){let __cdxGoalError=globalThis.__cdxEngineModes.nativeGoalError(e,n,r);if(__cdxGoalError){e.get(Dg).danger(__cdxGoalError);return!1}try{'],
   ['native Claude permission controls',
     'function TPc(e){let t=(0,kPc.c)(102),',
     'function TPc(e){let __cdxScope=us(LB);return(0,z2.jsx)(globalThis.__cdxEngineModes.PermissionControls,{React:APc,jsx:z2,scope:__cdxScope,threadId:e.conversationId,hostId:e.hostId,cwd:e.cwdOverride,getHost:(e,t)=>e.get(Rk,t),getManager:zg,nativePicker:(0,z2.jsx)(__cdxNativePermissions,e)})}function __cdxNativePermissions(e){let t=(0,kPc.c)(102),'],

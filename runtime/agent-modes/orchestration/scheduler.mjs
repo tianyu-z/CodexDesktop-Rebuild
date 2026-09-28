@@ -80,6 +80,7 @@ class WorkflowExecution {
       version: 1, id: supplied.runId, status: previous ? 'blocked' : 'running', config: clone(this.options),
       runs: previous?.runs ?? [], events: previous?.events ?? [], bindings: clone(previous?.bindings ?? {}),
       cache: previous?.cache ?? { steps: {}, roles: {} }, invocations: previous?.invocations ?? {}, checkpoints: previous?.checkpoints ?? {},
+      guidance: previous?.guidance ?? [],
       ...(previous?.outputs ? { outputs: previous.outputs } : {}),
     };
     for (const [key, value] of Object.entries(supplied.bindings ?? {})) {
@@ -96,7 +97,7 @@ class WorkflowExecution {
     for (const run of this.latestRuns()) if (run.status !== 'completed') this.blockers.add(run.id);
     if (previous && supplied.resume === true && supplied.retryRunId === undefined && this.blockers.size) throw new Error('An unsuccessful role requires an explicit retryRunId before this workflow can resume.');
     if (previous && supplied.resume === true && !this.blockers.size) this.activated = true;
-    this.handle = { done: this.completed.promise, interrupt: id => this.interrupt(id), retry: id => this.retry(id), snapshot: () => clone(this.state), control: (id, command, options) => this.control(id, command, options) };
+    this.handle = { done: this.completed.promise, interrupt: id => this.interrupt(id), retry: id => this.retry(id), snapshot: () => clone(this.state), control: (id, command, options) => this.control(id, command, options), steer: text => this.steer(text) };
     this.abortListener = () => { this.stop(); };
     supplied.signal?.addEventListener('abort', this.abortListener, { once: true });
     this.externalSignal = supplied.signal;
@@ -127,6 +128,30 @@ class WorkflowExecution {
 
   latestRuns() { const runs = new Map(); for (const run of this.state.runs) if ((runs.get(roleKey(run))?.attempt ?? 0) < run.attempt) runs.set(roleKey(run), run); return [...runs.values()]; }
   alive() { if (this.stopping) throw stoppedError(); }
+  async steer(text) {
+    this.alive();
+    if (this.terminal) throw new Error('Workflow ended. Send the prompt as a new turn.');
+    if (typeof text !== 'string' || !text.trim()) throw new Error('Steering requires a nonempty text prompt.');
+    // Save before fan-out so recovery and roles waiting for a concurrency slot
+    // see the same user guidance. Completed roles are never replayed.
+    const guidance = { id: randomUUID(), text, deliveries: [] };
+    this.state.guidance.push(guidance); this.notify(); this.alive();
+    const targets = [...this.active.entries()].filter(([, active]) => active.handle && !active.controller.signal.aborted);
+    const receipt = { accepted: [], failures: [] };
+    await Promise.all(targets.map(async ([id, active]) => {
+      const run = this.state.runs.find(run => run.id === id);
+      try {
+        if (typeof active.handle.steer !== 'function') throw new Error('Native role does not support live steering.');
+        await active.handle.steer(text);
+        receipt.accepted.push(id); guidance.deliveries.push({ runId: id, status: 'accepted' });
+      } catch (error) {
+        const failure = { runId: id, roleId: run.roleId, error: errorText(error) };
+        receipt.failures.push(failure); guidance.deliveries.push({ ...failure, status: 'failed' });
+      }
+    }));
+    this.notify();
+    return receipt;
+  }
   notify() {
     if (!this.terminal && !this.stopping) this.state.status = this.blockers.size ? 'blocked' : this.state.status === 'blocked' && !this.activated ? 'blocked' : 'running';
     if (this.callbackError) return;
@@ -438,7 +463,10 @@ class WorkflowExecution {
       const binding = this.binding(descriptor);
       const role = this.options.template.roles[roleId];
       if (binding.value && binding.value.engine !== engine) throw new Error('Native session binding engine does not match this role.');
-      active.handle = this.owner.runner.start({ ...clone(descriptor), runId: run.id, model: requestedModel,
+      const guidance = this.state.guidance.map(entry => entry.text);
+      active.handle = this.owner.runner.start({ ...clone(descriptor),
+        ...(guidance.length ? { prompt: `${descriptor.prompt}\n\n[Additional user guidance]\n${guidance.join('\n\n')}` } : {}),
+        runId: run.id, model: requestedModel,
         ...(role.session === 'reuse' && binding.value?.sessionId ? { nativeSessionId: binding.value.sessionId } : {}),
         signal: active.controller.signal,
         onEvent: event => this.nativeEvent(run, active, descriptor, event),

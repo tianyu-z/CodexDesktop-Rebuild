@@ -509,3 +509,13 @@ test('changing template resets omitted overrides while selecting the same templa
   const changed = await f.router.request('engine/mode/set', { engineMode: 'both', threadId: 'chat', template: { id: 'polly', revision: 1, parameters: {} } });
   assert.deepEqual(changed.roleOverrides, {});
 });
+
+test('mixed steering uses the owned scheduler and correlates the public prompt', async t => {
+  const f = fixture(t), { turn } = await started(f); await tick();
+  const inputs = []; f.workflows[0].handle.steer = async text => { inputs.push(text); return { accepted: [], failures: [] }; };
+  const params = { threadId: 'chat', expectedTurnId: turn.id, clientUserMessageId: 'mixed-steer', input: [{ type: 'text', text: 'New shared guidance' }] };
+  assert.deepEqual(await f.router.request('turn/steer', params), { turnId: turn.id });
+  assert.deepEqual(inputs, ['New shared guidance']);
+  assert.equal(f.store.get('chat').turns[0].turn.items.at(-1).clientId, 'mixed-steer');
+  assert.equal(f.calls.some(call => call.method === 'turn/steer'), false);
+});

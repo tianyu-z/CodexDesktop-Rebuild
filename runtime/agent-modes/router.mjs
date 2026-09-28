@@ -8,6 +8,7 @@ import { assertClaudeModel } from './claude-models.mjs';
 import { assertClaudePermissionMode } from './claude-permissions.mjs';
 import { ClaudeCommandRouter } from './claude-command-router.mjs';
 import { liveClaudeControl } from './claude-live-controls.mjs';
+import { steerManagedTurn } from './steering.mjs';
 import { validateRoleOverrides } from './templates/schema.mjs';
 import { editManagedHistory, recoverHistoryEdit } from './history.mjs';
 
@@ -37,6 +38,28 @@ export class EngineRouter {
       engines: ['codex', 'claude'], bothAvailable: this.workflow.available, roleOverrides: value?.roleOverrides ?? {}, template: value?.template ?? { id: 'polly', revision: 1, parameters: {} }, turnEngines: Object.fromEntries((value?.turns ?? []).map(row => [row.turn.id, row.engine])) };
   }
   notify(method, params) { this.emit({ method, params }); }
+  async interruptManagedTurn(id, turnId) {
+    const value = this.store.require(id), active = value.activeRun;
+    // Older clients could activate a native goal during a managed turn. The
+    // visible turn can then be native while the gateway still owns Claude.
+    // Only accept a live turn recorded in this chat; stale/arbitrary IDs fail.
+    const nativeTurns = value.turns.filter(row => row.engine === 'codex' && row.turn.status === 'inProgress').map(row => row.turn.id);
+    if (turnId !== active.turnId && !nativeTurns.includes(turnId)) throw new Error('Turn ownership mismatch.');
+    const stopManaged = async () => {
+      if (active.mode === 'both') return this.workflow.interrupt(id, active.turnId);
+      const run = this.runs.get(active.id);
+      run.controller.abort(); this.cancelApprovals(active.id);
+      if (run.adapterRun) await run.adapterRun.interrupt();
+      await run.done;
+    };
+    const results = await Promise.allSettled([
+      stopManaged(),
+      ...nativeTurns.map(nativeTurnId => this.native.request('turn/interrupt', { threadId: id, turnId: nativeTurnId })),
+    ]);
+    const failure = results.find(result => result.status === 'rejected');
+    if (failure) throw failure.reason;
+    return {};
+  }
   request(method, params = {}) {
     const id = params.threadId;
     // Read-only catalog discovery can wait on a subprocess. It must not queue
@@ -129,6 +152,9 @@ export class EngineRouter {
     if (params.claudePermissionMode !== undefined) assertClaudePermissionMode(params.claudePermissionMode);
     if (params.roleOverrides !== undefined) validateRoleOverrides(params.roleOverrides);
     const id = params.threadId;
+    if (method === 'thread/goal/set' && (params.status == null || params.status === 'active') && this.store.get(id)?.mode !== undefined && this.store.get(id).mode !== 'codex') {
+      throw new Error('Native /goal requires Only Codex. Remove /goal to send a regular turn to the selected engine.');
+    }
     if (id && this.store.get(id)?.pendingHistoryEdit && !['engine/capabilities', 'engine/claude/commands', 'turn/interrupt', 'engine/runs/interrupt'].includes(method)) await this.hydrate(id);
     if (id && this.workflow.internal.has(id)) throw new Error('Internal workflow sessions are not public chats.');
     if (method === 'engine/claude/commands') return this.claudeCommands.list(params);
@@ -237,15 +263,8 @@ export class EngineRouter {
       return this.startCodex(id, params);
     }
     if (method === 'turn/steer' && this.store.get(id)?.mode !== 'codex' && this.store.get(id)?.activeRun && inputText(params.input).trim().startsWith('/')) return liveClaudeControl(this, method, params);
-    if (method === 'turn/interrupt' && this.store.get(id)?.activeTurn?.mode === 'both') return this.workflow.interrupt(id, params.turnId);
-    if (method === 'turn/interrupt' && this.store.get(id)?.activeRun?.engine === 'claude') {
-      const active = this.store.get(id).activeRun, run = this.runs.get(active.id);
-      if (params.turnId !== active.turnId) throw new Error('Turn ownership mismatch.');
-      run.controller.abort(); this.cancelApprovals(active.id);
-      if (run.adapterRun) await run.adapterRun.interrupt();
-      await run.done;
-      return {};
-    }
+    if (method === 'turn/steer' && ['claude', 'both'].includes(this.store.get(id)?.mode)) return steerManagedTurn(this, params);
+    if (method === 'turn/interrupt' && (this.store.get(id)?.activeTurn?.mode === 'both' || this.store.get(id)?.activeRun?.engine === 'claude')) return this.interruptManagedTurn(id, params.turnId);
     const value = id && this.store.get(id);
     if ((value?.activeRun?.engine === 'claude' || value?.activeTurn?.mode === 'both') && ['thread/delete', 'thread/archive', 'thread/stop'].includes(method)) throw new Error('Finish or interrupt the active engine run before this action.');
     if (method === 'thread/read' || method === 'thread/resume') {

@@ -629,3 +629,33 @@ test('legacy bindings are never adopted by new turns with changed role configura
     assert.equal((await finishRemaining(run, runner)).status, 'completed');
   }
 });
+
+test('workflow steering reaches live roles and is persisted for later synthesis and recovery', async () => {
+  const runner = harness(), sends = [], start = runner.start;
+  runner.start = function(options) { const handle = start.call(this, options); return { ...handle, steer: async text => { sends.push({ roleId: options.roleId, text }); } }; };
+  const run = new WorkflowScheduler({ runner }).start(options()); await until(() => runner.calls.length === 2);
+  assert.equal(typeof run.steer, 'function');
+  await run.steer('Use the new constraint');
+  assert.deepEqual(sends.map(x => x.roleId).sort(), ['a', 'c']);
+  assert.equal(run.snapshot().guidance[0].text, 'Use the new constraint');
+  runner.calls.slice(0, 2).forEach(call => call.complete()); await until(() => runner.calls.length === 3);
+  assert.match(runner.calls[2].prompt, /Use the new constraint/);
+  await run.interrupt(); const saved = run.snapshot(), failed = saved.runs.at(-1);
+  const resumedRunner = harness();
+  const resumed = new WorkflowScheduler({ runner: resumedRunner }).start(options({ previousSnapshot: saved, retryRunId: failed.id }));
+  await until(() => resumedRunner.calls.length === 1);
+  assert.match(resumedRunner.calls[0].prompt, /Use the new constraint/);
+  assert.equal((await finishRemaining(resumed, resumedRunner)).status, 'completed');
+  await assert.rejects(run.steer('Too late'), /interrupt|ended/);
+});
+
+test('workflow steering reports partial delivery instead of duplicating accepted input on retry', async () => {
+  const runner = harness(), start = runner.start;
+  runner.start = function(options) { return { ...start.call(this, options), steer: async () => { if (options.engine === 'claude') throw Error('Native turn ended'); } }; };
+  const run = new WorkflowScheduler({ runner }).start(options()); await until(() => runner.calls.length === 2);
+  assert.equal(typeof run.steer, 'function');
+  const receipt = await run.steer('Important follow-up');
+  assert.equal(receipt.accepted.length, 1); assert.equal(receipt.failures[0].roleId, 'a');
+  assert.equal(run.snapshot().guidance.length, 1);
+  await run.interrupt();
+});

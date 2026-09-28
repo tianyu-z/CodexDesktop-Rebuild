@@ -260,3 +260,14 @@ test('a stuck native process is killed within the transport deadline and done aw
   assert.equal(client.child.signalCode, 'SIGKILL');
   assert.equal(client.child.stdout.destroyed, true);
 });
+
+test('steer targets the live native role turn and cannot restart a stopped role', async () => {
+  const f = fixture(); await tick();
+  assert.equal(typeof f.run.steer, 'function');
+  await f.run.steer('New user constraint');
+  assert.deepEqual(f.requests.at(-1), { method: 'turn/steer', params: { threadId: 'session-1', expectedTurnId: 'turn-1', input: [{ type: 'text', text: 'New user constraint', text_elements: [] }] } });
+  await f.run.interrupt();
+  const count = f.requests.length;
+  await assert.rejects(f.run.steer('late'), /interrupt|active/i);
+  assert.equal(f.requests.length, count);
+});

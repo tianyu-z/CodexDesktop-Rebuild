@@ -432,3 +432,45 @@ test('resolves connection environment separately for each SDK run without alteri
   assert.equal(observed.request.options.permissionMode, 'default');
   assert.equal(observed.request.options.allowDangerouslySkipPermissions, undefined);
 });
+
+test('steering enters the same native input stream and waits for its own result before cleanup', async () => {
+  const first = deferred(), emitResult = deferred(), followResult = deferred(); let prompt, firstId, steerId;
+  const queryImpl = request => {
+    prompt = request.prompt;
+    const iterator = (async function* () {
+      const initial = await prompt.next(); firstId = initial.value.uuid;
+      yield init; first.resolve(); await emitResult.promise;
+      yield result({ user_message_uuid: firstId });
+      await followResult.promise;
+      yield result({ uuid: 'second-result', user_message_uuids: [steerId], result: 'Steered answer' });
+    })();
+    iterator.close = () => {}; iterator.interrupt = async () => { emitResult.resolve(); followResult.resolve(); };
+    return iterator;
+  };
+  const { run } = startWith(queryImpl); await first.promise;
+  assert.equal(typeof run.steer, 'function');
+  const sending = run.steer('Use the new constraint');
+  const next = await prompt.next(); steerId = next.value.uuid;
+  assert.equal(next.value.message.content, 'Use the new constraint');
+  assert.equal(next.value.priority, 'now');
+  // The generator resumes only after the SDK has written the previous message.
+  const waiting = prompt.next(); await sending;
+  let finished = false; run.done.then(() => { finished = true; });
+  emitResult.resolve(); await tick(); assert.equal(finished, false);
+  followResult.resolve(); assert.equal((await run.done).text, 'Steered answer'); await waiting;
+  await assert.rejects(run.steer('Too late'), /active|ended/i);
+});
+
+test('stop rejects steering waiting for native transport and never consumes it later', async () => {
+  const ready = deferred(), finish = deferred(); let prompt;
+  const queryImpl = request => {
+    prompt = request.prompt;
+    const iterator = (async function* () { await prompt.next(); yield init; ready.resolve(); await finish.promise; })();
+    iterator.close = () => finish.resolve(); iterator.interrupt = async () => finish.resolve(); return iterator;
+  };
+  const { run } = startWith(queryImpl); await ready.promise;
+  assert.equal(typeof run.steer, 'function');
+  const rejected = assert.rejects(run.steer('Must not run'), /interrupt|ended/i);
+  await run.interrupt(); await rejected;
+  assert.equal((await prompt.next()).done, true);
+});

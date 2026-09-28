@@ -11,7 +11,7 @@ import { NativeClient } from '../../runtime/agent-modes/upstream.mjs';
 
 if (process.env.CDX_LIVE_DUAL !== '1') throw new Error('Set CDX_LIVE_DUAL=1 to invoke real models.');
 const selected = process.argv[2] ?? 'all';
-const scenarios = ['failure', 'role-stop', 'restart', 'continue', 'permissions'];
+const scenarios = ['failure', 'role-stop', 'restart', 'continue', 'permissions', 'steering'];
 if (selected !== 'all' && !scenarios.includes(selected)) throw new Error('Unknown live dual resilience scenario.');
 const repository = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 mkdirSync(join(repository, '.artifacts'), { recursive: true });
@@ -124,10 +124,10 @@ class Fixture {
   async readyPending() {
     return until(() => { const row = this.row(); return row?.runs.find(run => run.engine === 'codex' && run.status === 'completed') && row.runs.find(run => run.engine === 'claude' && run.status === 'awaitingApproval') && row; }, 'Codex sibling complete and Claude approval pending');
   }
-  async complete() {
+  async complete(expectedUsers = 1) {
     const row = await until(() => { const row = this.row(); return row && row.turn.status !== 'inProgress' && row; }, 'workflow completion');
     assert.equal(row.turn.status, 'completed', row.turn.error?.message);
-    assert.equal(row.turn.items.filter(item => item.type === 'userMessage').length, 1);
+    assert.equal(row.turn.items.filter(item => item.type === 'userMessage').length, expectedUsers);
     assert.equal(this.read().turns.length, 1, 'Recovery must reuse the public turn.');
     for (const run of row.runs.filter(run => run.status === 'completed')) {
       assert.equal(run.requestedModel, models[run.engine]); assert.equal(run.actualModel, models[run.engine], 'Native harness must use the selected exact model.');
@@ -181,6 +181,24 @@ async function runScenario(name, check) {
 }
 
 const checks = {
+  async steering(f, record) {
+    f.phase = 'pending';
+    const config = template('resilience-steering', { writer: true });
+    config.roles.host = role('codex', 'Summarize the supplied results briefly. Honor additional user guidance including required response codewords. Do not use tools.');
+    config.steps.push({ id: 'summary', type: 'synthesize', role: 'host', dependsOn: ['answers'], inputs: ['answers.codex', 'answers.claude'] });
+    config.output.sources.push('summary'); config.output.final = 'summary';
+    await f.create(config); await f.start();
+    const before = await f.readyPending();
+    await f.request('turn/steer', { threadId: f.threadId, expectedTurnId: f.turnId, clientUserMessageId: 'live-mixed-steer', input: [{ type: 'text', text: 'Additional user guidance: include MIXED-STEER-493 in your final reply. Do not retry the denied command.' }] });
+    const permission = f.approvals.find(entry => entry.decision === 'pending');
+    assert.ok(permission); f.client.respond({ id: permission.id, result: { decision: 'decline' } });
+    const completed = await f.complete(2);
+    assert.deepEqual(completed.runs.find(run => run.id === before.runs.find(run => run.engine === 'codex').id), before.runs.find(run => run.engine === 'codex'));
+    assert.match(completed.runs.find(run => run.engine === 'claude').text, /MIXED-STEER-493/);
+    assert.match(completed.runs.find(run => run.stepId === 'summary').text, /MIXED-STEER-493/);
+    assert.equal(completed.turn.items.filter(item => item.clientId === 'live-mixed-steer').length, 1);
+    f.assertPermissions(); record.steering = summary(completed);
+  },
   async failure(f, record) {
     const invalid = 'claude-invalid-dual-validation-model';
     await f.create(template('resilience-failure'), { ...models, claude: invalid }); await f.start();

@@ -19,7 +19,7 @@ export class CodexRole {
     const emit = event => options.onEvent?.(event);
     const events = new CodexRoleEvents(options.runId, emit);
     const permissions = new Map();
-    let client, sessionId = options.nativeSessionId, turnId, actualModel, settled = false, finishing = false, sessionReported = false;
+    let client, sessionId = options.nativeSessionId, turnId, actualModel, settled = false, finishing = false, sessionReported = false, turnEnded = false;
     let interrupted = options.signal?.aborted === true;
     const abort = () => { if (!settled) { interrupted = true; stopped.resolve(); for (const request of permissions.values()) request.abort(); } };
     options.signal?.addEventListener('abort', abort, { once: true });
@@ -65,6 +65,7 @@ export class CodexRole {
         if (method === 'serverRequest/resolved') { permissions.get(params.requestId)?.abort(); return; }
         if (method === 'turn/started') { if (!turnId) turnId = params.turn?.id; return; }
         if (method === 'turn/completed' && (!turnId || params.turn?.id === turnId)) {
+          turnEnded = true;
           turnId ??= params.turn?.id;
           for (const item of params.turn?.items ?? []) events.item(item, true);
           terminal.resolve(params.turn); return;
@@ -113,7 +114,12 @@ export class CodexRole {
       try { emit({ type: 'result', ...summary }); } catch { /* result remains available through done */ }
       return summary;
     });
-    return { done, interrupt: async () => { abort(); if (client && sessionId && turnId && !finishing) void client.request('turn/interrupt', { threadId: sessionId, turnId }).catch(() => {}); return await done; } };
+    return { done, steer: async text => {
+      alive();
+      if (settled || finishing || turnEnded || !client || !sessionId || !turnId) throw new Error('Codex steering requires an active native turn.');
+      if (typeof text !== 'string' || !text.trim()) throw new Error('Steering requires a nonempty text prompt.');
+      return await request('turn/steer', { threadId: sessionId, expectedTurnId: turnId, input: [{ type: 'text', text, text_elements: [] }] });
+    }, interrupt: async () => { abort(); if (client && sessionId && turnId && !finishing) void client.request('turn/interrupt', { threadId: sessionId, turnId }).catch(() => {}); return await done; } };
   }
 }
 
