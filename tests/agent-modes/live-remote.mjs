@@ -2,6 +2,8 @@
 // Optional CDX_LIVE_PARTICIPANT_A_MODEL / CDX_LIVE_PARTICIPANT_B_MODEL,
 // CDX_LIVE_HOST_ENGINE / CDX_LIVE_HOST_MODEL / CDX_LIVE_HOST_MODE,
 // CDX_LIVE_ROUNDS and CDX_LIVE_CASE select independent, retained cases.
+// CDX_LIVE_SANDBOX=danger-full-access explicitly tests the desktop Full access
+// selection on this script's newly created, isolated acceptance fixture.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { Duplex, Transform } from 'node:stream';
@@ -22,10 +24,12 @@ const connection = { ssh: '/usr/bin/ssh', args: ['-T', '-o', 'BatchMode=yes', '-
 const caseName = process.env.CDX_LIVE_CASE ?? scenario;
 const hostMode = process.env.CDX_LIVE_HOST_MODE ?? 'per-round';
 const rounds = Number(process.env.CDX_LIVE_ROUNDS ?? 1);
+const sandbox = process.env.CDX_LIVE_SANDBOX ?? 'workspace-write';
+if (!['workspace-write', 'danger-full-access'].includes(sandbox)) throw Error('Invalid live sandbox selection.');
 const hostEngine = process.env.CDX_LIVE_HOST_ENGINE ?? (scenario === 'codex' ? 'codex' : 'claude');
 if (!/^[a-z0-9-]+$/.test(caseName) || !['per-round', 'final-only'].includes(hostMode) || !['codex', 'claude'].includes(hostEngine) || !Number.isInteger(rounds) || rounds < 0 || rounds > 5) throw Error('Invalid live role configuration.');
 const transport = {};
-const evidence = { host, scenario, caseName, hostMode, rounds, startedAt: new Date().toISOString(), approvals: [], stages: [] };
+const evidence = { host, scenario, caseName, hostMode, rounds, sandbox, startedAt: new Date().toISOString(), approvals: [], stages: [] };
 const stage = (name, value = {}) => { evidence.stages.push({ name, ...value }); console.log(JSON.stringify({ host, scenario, stage: name, ...value })); };
 
 const fixtureCode = [
@@ -146,7 +150,7 @@ try {
   const created = await client.rpc('thread/start', { cwd: fixture.cwd, model: codexModel, engineMode: 'both', engineModels: models,
     roleOverrides: roles, template: scenario === 'polly' ? { id: 'polly', revision: 1, parameters: {} } : { id: 'debby', revision: 2, parameters: { rounds, host_mode: hostMode } } });
   chatId = created.thread.id; evidence.threadId = chatId;
-  const result = await client.rpc('turn/start', { threadId: chatId, cwd: fixture.cwd, model: codexModel, approvalPolicy: 'on-request', sandbox: 'workspace-write',
+  const result = await client.rpc('turn/start', { threadId: chatId, cwd: fixture.cwd, model: codexModel, approvalPolicy: 'on-request', sandbox,
     input: [{ type: 'text', text: scenario === 'polly' ? 'Validate the collaboration workflow with exactly one implementation task, assigned to Codex, changing only result.txt from BEFORE to exactly REMOTE_POLLY_OK followed by a newline. Run node verify.mjs before editing to observe its expected failure, then edit result.txt and rerun the same check. verify.mjs already checks exact contents and preservation of marker.txt. Keep both marker.txt and verify.mjs unchanged. The opposite engine must review each immutable result. After integration, run node verify.mjs and the final independent review, then apply the accepted result to this original fixture. No packages, installs, network, new tests, or extra files are needed. Keep reports concise.' : 'Read marker.txt in this directory using your native file tool. Reply with its exact content and one short sentence identifying your tool. Do not modify files or read anything else. The host should compare the independent readings and finish once they agree.' }] });
   turnId = result.turn.id; evidence.turnId = turnId; stage('workflow-started', { threadId: chatId, turnId });
   // Exercise a real desktop transport loss immediately after submission.
