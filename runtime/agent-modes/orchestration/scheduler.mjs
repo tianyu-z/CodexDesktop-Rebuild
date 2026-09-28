@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
-import { resolveParameters, validateTaskPlan, validateTemplate } from '../templates/schema.mjs';
+import { resolveParameters, resolveRoleConfig, validateHostDecision, validateTaskPlan } from '../templates/schema.mjs';
 import { renderInputs } from './inputs.mjs';
 
 const clone = value => structuredClone(value);
@@ -19,9 +19,16 @@ const needsWorkspace = (steps, template, parameters) => steps.some(step =>
   (step.type === 'repeat' && bound(step.count, parameters) > 0 && needsWorkspace(step.steps, template, parameters)));
 
 /** Stable across turns, distinct across revisions, roles, workspaces and task purposes. */
-export function roleBindingKey({ template, roleId, cwd, purpose = 'default' }) {
-  const scope = createHash('sha256').update(JSON.stringify([cwd, purpose])).digest('hex');
+export function roleBindingKey({ template, roleId, cwd, purpose = 'default', requestedModel = template.roles[roleId]?.model ?? null }) {
+  const role = template.roles[roleId];
+  const scope = createHash('sha256').update(JSON.stringify([cwd, purpose, role?.engine, requestedModel, role?.prompt])).digest('hex');
   return `${template.id}@${template.revision ?? 1}/${roleId}/${scope}`;
+}
+
+export function hostDecisionSchema() {
+  return { type: 'object', additionalProperties: false, required: ['continue', 'guidance'], properties: {
+    continue: { type: 'boolean' }, guidance: { type: 'string', maxLength: 10000 },
+  } };
 }
 
 export function taskPlanSchema(maxTasks) {
@@ -56,12 +63,13 @@ class WorkflowExecution {
     const previous = supplied.previousSnapshot ? clone(supplied.previousSnapshot) : null;
     if (previous && previous.id !== supplied.runId) throw new Error('Workflow recovery ID does not match the saved snapshot.');
     // Snapshot all caller-owned execution data before scheduling even one microtask.
-    const data = previous?.config ?? { runId: supplied.runId, template: supplied.template, parameters: supplied.parameters ?? {}, models: supplied.models ?? {},
+    const data = previous?.config ?? { runId: supplied.runId, template: supplied.template, roleOverrides: supplied.roleOverrides ?? {}, parameters: supplied.parameters ?? {}, models: supplied.models ?? {},
       nativeOptions: supplied.nativeOptions ?? {}, cwd: supplied.cwd, input: supplied.input ?? '', history: supplied.history ?? [], ...(supplied.throughSeq !== undefined ? { throughSeq: supplied.throughSeq } : {}) };
-    const template = validateTemplate(data.template), parameters = resolveParameters(template, data.parameters);
+    const { template, roleOverrides } = resolveRoleConfig(data.template, data.roleOverrides ?? {}, data.models);
+    const parameters = resolveParameters(template, data.parameters);
     if (typeof data.cwd !== 'string' || !isAbsolute(data.cwd)) throw new TypeError('Workflow requires an absolute working directory.');
     if (!data.models || typeof data.models !== 'object' || Array.isArray(data.models) || Object.keys(data.models).some(key => !['codex', 'claude'].includes(key))) throw new TypeError('Invalid workflow model slots.');
-    this.options = frozen({ ...data, runId: supplied.runId, template, parameters });
+    this.options = frozen({ ...data, runId: supplied.runId, template, roleOverrides, parameters });
     this.onSnapshot = supplied.onSnapshot;
     this.controller = new AbortController(); this.completed = deferred(); this.activation = deferred();
     this.active = new Map(); this.waiters = new Map(); this.retries = new Set(); this.blockers = new Set(); this.jobs = new Map(); this.bindingJobs = new Map();
@@ -194,6 +202,7 @@ class WorkflowExecution {
     const exports = new Map([[prefix, result]]);
     if (step.type === 'parallel') for (const child of step.steps) for (const [name, value] of this.exports(child, result[child.id], `${prefix}.${child.id}`)) exports.set(name, value);
     if (step.type === 'repeat') for (const alias of Object.keys(step.yields)) exports.set(`${prefix}.${alias}`, result[alias]);
+    if (step.type === 'hostedDebate') for (const alias of [...Object.keys(step.participants), 'sources', 'assessments']) exports.set(`${prefix}.${alias}`, result[alias]);
     if (['planTasks', 'executeTasks', 'crossReview'].includes(step.type)) exports.set(`${prefix}.tasks`, result.tasks);
     if (step.type === 'crossReview') { exports.set(`${prefix}.reviews`, result.reviews); if (step.workspace) exports.set(`${prefix}.integration`, result.integration); }
     return exports;
@@ -209,6 +218,8 @@ class WorkflowExecution {
     if (step.type === 'parallel') {
       const nested = await this.scope(step.steps, path, available, round);
       result = Object.fromEntries(step.steps.map(child => [child.id, nested.get(child.id)]));
+    } else if (step.type === 'hostedDebate') {
+      result = await this.hostedDebate(step, path, resolve);
     } else if (step.type === 'repeat') {
       let previous = Object.fromEntries(Object.entries(step.initial).map(([alias, ref]) => [alias, resolve(ref)]));
       for (let iteration = 1; iteration <= bound(step.count, this.options.parameters); iteration++) {
@@ -236,6 +247,43 @@ class WorkflowExecution {
       });
     }
     this.alive(); this.state.cache.steps[path] = clone(result); this.notify(); return clone(result);
+  }
+  async hostedDebate(step, path, resolve) {
+    const participants = Object.entries(step.participants), sources = [], assessments = [];
+    const inputs = frozen(Object.fromEntries(step.inputs.map(ref => [ref, resolve(ref)])));
+    const limit = bound(step.count, this.options.parameters);
+    const mode = typeof step.mode === 'string' ? step.mode : this.options.parameters[step.mode.parameter];
+    const invoke = (roleId, stepId, round, inputValues, extras = {}) => this.invoke({ roleId, stepId, round,
+      prompt: renderInputs(Object.keys(inputValues), ref => inputValues[ref]), inputValues, ...extras });
+    let previous, guidance;
+    for (let round = 0; round <= limit; round++) {
+      this.alive();
+      // Both peers receive the same immutable completed-round snapshot. The
+      // normal role cache makes restart/retry replay this loop without work.
+      const roundInputs = round === 0 ? inputs : frozen({
+        ...Object.fromEntries(Object.entries(inputs).filter(([name]) => name !== 'history')),
+        previousRound: previous, ...(guidance === undefined ? {} : { hostGuidance: guidance }),
+      });
+      const outcomes = await Promise.allSettled(participants.map(async ([alias, roleId]) => [alias,
+        await invoke(roleId, `${path}.${round === 0 ? 'answers' : `$round${round}`}.${alias}`, round, roundInputs,
+          round === 0 ? {} : { instructions: `${this.options.template.roles[roleId].prompt}\n\nCritique the fixed previous-round answers and respond to host guidance when supplied. Return your updated complete answer.` }),
+      ]));
+      const failure = outcomes.find(outcome => outcome.status === 'rejected');
+      if (failure) throw failure.reason;
+      previous = frozen(Object.fromEntries(outcomes.map(outcome => outcome.value)));
+      sources.push(...Object.values(previous));
+      if (mode === 'per-round') {
+        const assessment = await invoke(step.host, `${path}.$assessment${round}`, round,
+          frozen({ ...Object.fromEntries(Object.entries(inputs).filter(([name]) => name !== 'history')), answers: previous, sources, assessments, roundsRemaining: limit - round }), {
+            instructions: `${this.options.template.roles[step.host].prompt}\n\nAssess whether another critique round would materially improve these answers. Return only JSON {"continue":boolean,"guidance":string}. Use false only when further critique is unnecessary; missing evidence is never agreement. The runtime enforces the remaining round limit.`,
+            outputSchema: hostDecisionSchema(), validateResult: result => ({ decision: validateHostDecision(result.structuredOutput) }),
+          });
+        assessments.push(frozen(assessment));
+        guidance = assessment.decision.guidance;
+        if (!assessment.decision.continue) break;
+      }
+    }
+    return { ...previous, sources, assessments };
   }
   operations() {
     if (!this.operationPromise) {
@@ -271,7 +319,7 @@ class WorkflowExecution {
     const slots = this.options.nativeOptions;
     const nativeOptions = Object.hasOwn(slots, 'codex') || Object.hasOwn(slots, 'claude') ? slots[role.engine] ?? {} : slots;
     const proposed = frozen({ roleId: input.roleId, stepId: input.stepId, round, engine: role.engine,
-      prompt: input.prompt, cwd, access, instructions: input.instructions ?? role.prompt, requestedModel: this.options.models[role.engine], nativeOptions,
+      prompt: input.prompt, cwd, access, instructions: input.instructions ?? role.prompt, requestedModel: role.model, nativeOptions,
       purpose: input.purpose ?? 'default', ...(input.outputSchema === undefined ? {} : { outputSchema: input.outputSchema }),
       ...(input.inputValues === undefined ? {} : { inputValues: input.inputValues }),
     });

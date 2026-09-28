@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import { validateRoleOverrides } from './templates/schema.mjs';
 
 const clone = value => structuredClone(value);
 const engines = new Set(['codex', 'claude']);
@@ -66,6 +67,7 @@ export class ConversationStore {
         value.schemaVersion = 2;
       }
       value.roleBindings ??= {};
+      value.roleOverrides ??= {};
       value.nextEventSeq ??= 1;
       legacyAlias(value);
       this.records.set(value.id, value);
@@ -119,7 +121,7 @@ export class ConversationStore {
           codex: { sessionId: thread.id, consumedSeq: 0 },
           claude: { sessionId: null, consumedSeq: 0 },
         },
-        nextSeq: 1, nextEventSeq: 1, turns: [], activeTurn: null, roleBindings: {},
+        nextSeq: 1, nextEventSeq: 1, turns: [], activeTurn: null, roleBindings: {}, roleOverrides: {},
       }));
     }
     return this.mergeNativeThread(thread);
@@ -141,11 +143,12 @@ export class ConversationStore {
     return clone(value);
   }
 
-  setMode(id, mode, { model, models, template } = {}) {
+  setMode(id, mode, { model, models, template, roleOverrides } = {}) {
     assertMode(mode);
     if (model) assertEngine(mode);
     const nextModels = models === undefined ? null : selectedModels(models);
     const nextTemplate = template === undefined ? undefined : selectedTemplate(template);
+    const nextOverrides = roleOverrides === undefined ? undefined : validateRoleOverrides(roleOverrides);
     const value = this.require(id);
     if (value.activeRun) throw new Error('Finish or interrupt the active run before switching engines.');
     value.mode = mode;
@@ -155,6 +158,7 @@ export class ConversationStore {
       value.explicitModels = { ...value.explicitModels, ...Object.fromEntries(Object.keys(nextModels).map(engine => [engine, true])) };
     }
     if (nextTemplate !== undefined) value.template = nextTemplate;
+    if (nextOverrides !== undefined) value.roleOverrides = nextOverrides;
     this.save(value);
     return clone(value);
   }
@@ -217,6 +221,8 @@ export class ConversationStore {
     JSON.stringify(frozen);
     const models = selectedModels(frozen.models);
     const template = selectedTemplate({ id: frozen.template.id, revision: frozen.template.revision, parameters: frozen.parameters ?? {} });
+    const roleOverrides = validateRoleOverrides(frozen.roleOverrides ?? {}, frozen.template.roles);
+    frozen.roleOverrides = roleOverrides;
     this.putTurn(id, turn, { engine: 'both', runId: workflowId, save: false });
     const row = value.turns.at(-1);
     row.workflow = { id: workflowId, status: 'running', config: frozen, events: [], state: null };
@@ -224,6 +230,7 @@ export class ConversationStore {
     value.models = { ...value.models, ...models };
     value.explicitModels = { ...value.explicitModels, ...Object.fromEntries(Object.keys(models).map(engine => [engine, true])) };
     value.template = template;
+    value.roleOverrides = clone(roleOverrides);
     value.activeTurn = { id: workflowId, turnId: turn.id, mode: 'both' };
     this.save(value);
     return clone(row);
@@ -244,6 +251,7 @@ export class ConversationStore {
     value.activeTurn = { id: workflowId, turnId: row.turn.id, mode: 'both' };
     value.models = { ...value.models, ...clone(row.workflow.config.models) };
     value.template = { id: row.workflow.config.template.id, revision: row.workflow.config.template.revision, parameters: clone(row.workflow.config.parameters) };
+    value.roleOverrides = clone(row.workflow.config.roleOverrides ?? {});
     value.mode = 'both'; row.workflow.status = 'running'; row.turn.status = 'inProgress';
     delete row.turn.completedAt; delete row.turn.durationMs; row.turn.error = null;
     this.save(value);
@@ -255,9 +263,9 @@ export class ConversationStore {
     requiredId(run?.id, 'Run ID'); requiredId(run.roleId, 'Role ID'); requiredId(run.stepId, 'Step ID');
     assertEngine(run.engine);
     if (!Number.isSafeInteger(run.attempt) || run.attempt < 1 || !Number.isSafeInteger(run.round) || run.round < 0 || !runStates.has(run.status)) throw new Error('Invalid role run attempt, round or state.');
-    const expectedModel = row.workflow.config.models[run.engine];
-    if (run.requestedModel != null && expectedModel != null && run.requestedModel !== expectedModel) throw new Error('Run model ownership mismatch.');
     const role = row.workflow.config.template.roles?.[run.roleId];
+    const expectedModel = role && Object.hasOwn(role, 'model') ? role.model : row.workflow.config.models[run.engine];
+    if ((role && Object.hasOwn(role, 'model') ? run.requestedModel !== expectedModel : run.requestedModel != null && expectedModel != null && run.requestedModel !== expectedModel)) throw new Error('Run model ownership mismatch.');
     if (role && role.engine !== run.engine) throw new Error('Role engine ownership mismatch.');
     const index = row.runs.findIndex(current => current.id === run.id);
     const previousAttempts = row.runs.filter(previous => roleAttemptKey(previous) === roleAttemptKey(run));

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const DEFAULT_LIMITS = Object.freeze({ concurrency: 2, tasks: 8, rounds: 2 });
 const ID = /^[a-z][a-z0-9_-]{0,63}$/;
 const RESERVED = new Set(['constructor', 'prototype', '__proto__', 'request', 'history', 'parameters', 'previousRound']);
@@ -32,6 +32,36 @@ function integer(value, path, min, max) {
   if (!Number.isSafeInteger(value) || value < min || value > max) fail(path, `expected an integer between ${min} and ${max}`);
 }
 function choice(value, values, path) { if (!values.includes(value)) fail(path, `expected one of: ${values.join(', ')}`); }
+export function validateModel(value, path = '$.model') {
+  if (value !== null && (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,255}$/.test(value))) fail(path, 'expected null or a valid model identifier');
+  return value;
+}
+export function validateRoleOverrides(value, roles) {
+  json(value, '$.roleOverrides'); object(value, '$.roleOverrides');
+  if (Object.keys(value).length > 64) fail('$.roleOverrides', 'at most 64 role overrides are supported');
+  for (const [id, override] of Object.entries(value)) {
+    const path = `$.roleOverrides.${id}`; validateId(id, path);
+    if (roles && !own(roles, id)) fail(path, 'unknown role');
+    fields(override, ['engine', 'model', 'prompt'], path);
+    if (own(override, 'engine')) choice(override.engine, ENGINES, `${path}.engine`);
+    if (own(override, 'model')) validateModel(override.model, `${path}.model`);
+    if (own(override, 'prompt')) string(override.prompt, `${path}.prompt`);
+  }
+  return structuredClone(value);
+}
+/** Resolve role choices once; effective roles are safe to snapshot and retry. */
+export function resolveRoleConfig(input, overrides = {}, models = {}) {
+  const template = validateTemplate(input);
+  const roleOverrides = validateRoleOverrides(overrides, template.roles);
+  fields(models, ENGINES, '$.models');
+  for (const [engine, model] of Object.entries(models)) validateModel(model, `$.models.${engine}`);
+  for (const [id, role] of Object.entries(template.roles)) {
+    const override = roleOverrides[id] ?? {};
+    const engine = override.engine ?? role.engine;
+    template.roles[id] = { ...role, ...override, model: own(override, 'model') ? override.model : own(role, 'model') ? role.model : models[engine] ?? null };
+  }
+  return { template: validateTemplate(template), roleOverrides };
+}
 function array(value, path, { min = 0, max = 256 } = {}) {
   if (!Array.isArray(value) || value.length < min || value.length > max) fail(path, `expected an array with ${min}–${max} entries`);
 }
@@ -69,13 +99,14 @@ function parameterValue(definition, value, path) {
     if (value < definition.min || value > definition.max) fail(path, `expected a value between ${definition.min} and ${definition.max}`);
   }
   if (typeof value === 'string') string(value, path, { empty: true, max: 10000 });
+  if (definition.enum && !definition.enum.includes(value)) fail(path, `expected one of: ${definition.enum.join(', ')}`);
 }
 function parameters(value) {
   object(value, '$.parameters');
   if (Object.keys(value).length > 32) fail('$.parameters', 'at most 32 parameters are supported');
   for (const [name, definition] of Object.entries(value)) {
     const path = `$.parameters.${name}`; validateId(name, path);
-    fields(definition, ['type', 'default', 'min', 'max', 'description'], path);
+    fields(definition, ['type', 'default', 'min', 'max', 'description', 'enum'], path);
     choice(definition.type, ['integer', 'number', 'boolean', 'string'], `${path}.type`);
     if (own(definition, 'description')) string(definition.description, `${path}.description`, { empty: true, max: 2000 });
     if (['integer', 'number'].includes(definition.type)) {
@@ -84,6 +115,12 @@ function parameters(value) {
       }
       if (definition.min > definition.max) fail(`${path}.max`, 'must be greater than or equal to min');
     } else if (own(definition, 'min') || own(definition, 'max')) fail(path, 'min/max are only valid for numeric parameters');
+    if (own(definition, 'enum')) {
+      if (definition.type !== 'string') fail(`${path}.enum`, 'only string parameter choices are supported');
+      array(definition.enum, `${path}.enum`, { min: 1, max: 32 });
+      definition.enum.forEach((value, i) => string(value, `${path}.enum[${i}]`, { max: 10000 }));
+      if (new Set(definition.enum).size !== definition.enum.length) fail(`${path}.enum`, 'duplicate choices');
+    }
     parameterValue(definition, definition.default, `${path}.default`);
   }
 }
@@ -128,7 +165,15 @@ const STEP_FIELDS = {
   planTasks: ['role', 'inputs', 'prompt', 'maxTasks'],
   executeTasks: ['plan', 'roles', 'workspace'],
   crossReview: ['target', 'reviewers', 'maxRepairs', 'workspace'],
+  hostedDebate: ['participants', 'host', 'inputs', 'count', 'mode'],
 };
+const HOST_MODES = ['per-round', 'final-only'];
+function hostMode(value, path, template) {
+  if (typeof value === 'string') return choice(value, HOST_MODES, path);
+  fields(value, ['parameter'], path); validateId(value.parameter, `${path}.parameter`);
+  const definition = template.parameters[value.parameter];
+  if (!definition || definition.type !== 'string' || !definition.enum || definition.enum.some(mode => !HOST_MODES.includes(mode))) fail(path, 'host mode parameter must have per-round/final-only string choices');
+}
 function normalizeScope(steps, path, template, state, depth = 0) {
   array(steps, path, { min: 1, max: 128 });
   if (depth > 8) fail(path, 'maximum graph nesting is 8');
@@ -154,6 +199,22 @@ function normalizeScope(steps, path, template, state, depth = 0) {
     if (step.type === 'planTasks') {
       if (!own(step, 'maxTasks')) step.maxTasks = template.limits.tasks;
       bound(step.maxTasks, `${p}.maxTasks`, 1, template.limits.tasks, template);
+    }
+    if (step.type === 'hostedDebate') {
+      template.schemaVersion = SCHEMA_VERSION;
+      object(step.participants, `${p}.participants`);
+      if (Object.keys(step.participants).length !== 2) fail(`${p}.participants`, 'exactly two independent participant roles are required');
+      for (const [alias, id] of Object.entries(step.participants)) {
+        validateId(alias, `${p}.participants.${alias}`);
+        if (['sources', 'assessments'].includes(alias)) fail(`${p}.participants.${alias}`, 'reserved debate output name');
+        if (roleRef(id, `${p}.participants.${alias}`, template).access !== 'read') fail(`${p}.participants.${alias}`, 'debate requires read-only roles');
+      }
+      if (new Set([...Object.values(step.participants), step.host]).size !== 3) fail(`${p}.participants`, 'participants and host require distinct roles');
+      if (roleRef(step.host, `${p}.host`, template).access !== 'read') fail(`${p}.host`, 'host requires read-only access');
+      array(step.inputs, `${p}.inputs`, { min: 1 });
+      bound(step.count, `${p}.count`, 0, template.limits.rounds, template);
+      if (!own(step, 'mode')) step.mode = 'per-round';
+      hostMode(step.mode, `${p}.mode`, template);
     }
     if (step.type === 'executeTasks') {
       roleMap(step.roles, `${p}.roles`, template, { both: true });
@@ -203,6 +264,7 @@ function exportsFor(step, template) {
     for (const child of step.steps) for (const [suffix, meta] of exportsFor(child, template)) refs.set(`${child.id}${suffix ? `.${suffix}` : ''}`, meta);
   }
   if (step.type === 'repeat') for (const alias of Object.keys(step.yields)) refs.set(alias, { type: 'value' });
+  if (step.type === 'hostedDebate') for (const alias of [...Object.keys(step.participants), 'sources', 'assessments']) refs.set(alias, { type: 'value' });
   if (['planTasks', 'executeTasks', 'crossReview'].includes(step.type)) refs.set('tasks', { type: 'value' });
   if (step.type === 'crossReview') {
     refs.set('reviews', { type: 'value' });
@@ -224,6 +286,7 @@ function checkScope(steps, path, template, outer, engines, reachable = true) {
     for (const dependency of closure.get(step.id)) for (const [key, info] of all) if (key === dependency || key.startsWith(`${dependency}.`)) available.set(key, info);
     if (step.inputs) step.inputs.forEach((input, i) => ref(input, `${p}.inputs[${i}]`, available));
     if (step.role && reachable) engines.add(template.roles[step.role].engine);
+    if (step.type === 'hostedDebate' && reachable) for (const role of [...Object.values(step.participants), step.host]) engines.add(template.roles[role].engine);
     if (step.type === 'executeTasks') {
       if (ref(step.plan, `${p}.plan`, available).type !== 'planTasks') fail(`${p}.plan`, 'must reference a planTasks result');
       if (reachable) for (const engine of ENGINES) engines.add(engine);
@@ -260,7 +323,7 @@ export function validateTemplate(input) {
   json(input);
   fields(input, ['schemaVersion', 'id', 'revision', 'name', 'description', 'roles', 'parameters', 'limits', 'steps', 'output', 'builtin', 'contentHash'], '$');
   const value = structuredClone(input);
-  if (value.schemaVersion !== SCHEMA_VERSION) fail('$.schemaVersion', `unsupported schema; expected ${SCHEMA_VERSION}`);
+  if (![1, SCHEMA_VERSION].includes(value.schemaVersion)) fail('$.schemaVersion', `unsupported schema; expected 1 or ${SCHEMA_VERSION}`);
   validateId(value.id);
   if (!own(value, 'revision')) value.revision = 1;
   validateRevision(value.revision);
@@ -277,12 +340,14 @@ export function validateTemplate(input) {
   integer(value.limits.rounds, '$.limits.rounds', 0, 10);
   if (!own(value, 'parameters')) value.parameters = {};
   parameters(value.parameters);
+  if (Object.values(value.parameters).some(parameter => own(parameter, 'enum'))) value.schemaVersion = SCHEMA_VERSION;
   object(value.roles, '$.roles');
   if (!Object.keys(value.roles).length || Object.keys(value.roles).length > 64) fail('$.roles', 'expected 1–64 roles');
   for (const [id, role] of Object.entries(value.roles)) {
     const path = `$.roles.${id}`; validateId(id, path);
-    fields(role, ['engine', 'prompt', 'access', 'session'], path);
+    fields(role, ['engine', 'model', 'prompt', 'access', 'session'], path);
     choice(role.engine, ENGINES, `${path}.engine`);
+    if (own(role, 'model')) { validateModel(role.model, `${path}.model`); value.schemaVersion = SCHEMA_VERSION; }
     string(role.prompt, `${path}.prompt`);
     choice(role.access, ['read', 'write'], `${path}.access`);
     choice(role.session, ['reuse', 'fresh'], `${path}.session`);
@@ -292,7 +357,7 @@ export function validateTemplate(input) {
   for (const name of Object.keys(value.parameters)) global.set(`parameters.${name}`, { type: 'parameter' });
   const engines = new Set();
   const outputs = checkScope(value.steps, '$.steps', value, global, engines);
-  if (ENGINES.some(engine => !engines.has(engine))) fail('$.steps', 'both engine slots must be reachable through executable steps');
+  if (engines.size < 2) value.schemaVersion = SCHEMA_VERSION;
   fields(value.output, ['sources', 'final', 'format'], '$.output');
   array(value.output.sources, '$.output.sources', { min: 1 });
   value.output.sources.forEach((output, i) => ref(output, `$.output.sources[${i}]`, outputs));
@@ -301,6 +366,13 @@ export function validateTemplate(input) {
   choice(value.output.format, ['markdown', 'text', 'json'], '$.output.format');
   value.contentHash = templateContentHash(value);
   return value;
+}
+
+export function validateHostDecision(input) {
+  json(input, '$.hostDecision'); fields(input, ['continue', 'guidance'], '$.hostDecision');
+  if (typeof input.continue !== 'boolean') fail('$.hostDecision.continue', 'expected an explicit boolean decision');
+  string(input.guidance, '$.hostDecision.guidance', { empty: true, max: 10000 });
+  return structuredClone(input);
 }
 
 /** Planner output schema; schedulers must call this before scheduling dynamic work. */

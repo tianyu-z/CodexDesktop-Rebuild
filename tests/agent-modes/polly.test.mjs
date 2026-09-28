@@ -540,3 +540,14 @@ test('whole-turn stop retains isolated in-progress edits and never applies them'
   assert.equal(await readFile(join(cwd, 'a.txt'), 'utf8'), 'partial');
   await assert.rejects(readFile(join(f.repo, 'a.txt')), { code: 'ENOENT' });
 });
+
+test('immutable workspace evidence records the configured role model independently of engine defaults', async t => {
+  const f = await fixture(t, async d => {
+    if (d.purpose === 'task') await writeFile(join(d.cwd, 'role-model.txt'), 'verified\n');
+    return {};
+  });
+  f.options.template = structuredClone(f.options.template);
+  f.options.template.roles.codex_worker.model = 'independent-worker-model';
+  const result = await f.operations.executeTasks(executeStep, frame('implementation', { tasks: [task('role-model')] }));
+  assert.equal(result.tasks[0].artifact.checks[0].requestedModel, 'independent-worker-model');
+});

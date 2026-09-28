@@ -5,7 +5,7 @@ import { validateTemplate } from './schema.mjs';
 const role = (engine, prompt, access = 'read', session = 'fresh') => ({ engine, prompt, access, session });
 const answerPrompt = 'Answer the user request independently using the supplied public context. Read relevant reference material if needed. Do not modify the project. On a critique round, assess the supplied previous answer from the other engine, identify agreements and disagreements, and give your updated complete answer. Attribute views accurately; do not invent agreement.';
 
-const debby = {
+const debbyV1 = {
   schemaVersion: 1, id: 'debby', revision: 1, builtin: true,
   name: 'Debby · 双方讨论',
   description: 'Codex and Claude answer independently, optionally exchange critiques, then Claude summarizes the agreement and remaining differences. Read-only; the summary uses the selected Claude model.',
@@ -32,6 +32,27 @@ const debby = {
     { id: 'summary', type: 'synthesize', dependsOn: ['debate'], role: 'moderator', inputs: ['request', 'answers.codex', 'answers.claude', 'debate.codex', 'debate.claude'] },
   ],
   output: { sources: ['debate.codex', 'debate.claude', 'summary'], final: 'summary', format: 'markdown' },
+};
+
+const debby = {
+  schemaVersion: 2, id: 'debby', revision: 2, builtin: true,
+  name: 'Debby · 主持讨论',
+  description: 'Two independently configured participants answer and critique with a configurable host. The host guides each round and may stop early when evidence is sufficient. Final-only mode keeps fixed critique rounds.',
+  roles: {
+    participant_a: role('codex', 'Answer the user request independently from the supplied public context. Read relevant reference material if needed; do not modify the project. In guided critique rounds, inspect both previous answers and host guidance, identify agreements and disagreements, and return your updated complete answer. Attribute evidence and views to participant roles accurately; do not invent agreement.', 'read', 'reuse'),
+    participant_b: role('claude', 'Answer the user request independently from the supplied public context. Read relevant reference material if needed; do not modify the project. In guided critique rounds, inspect both previous answers and host guidance, identify agreements and disagreements, and return your updated complete answer. Attribute evidence and views to participant roles accurately; do not invent agreement.', 'read', 'reuse'),
+    host: role('claude', 'Host an evidence-based discussion between two independent participants. Assess their arguments fairly, identify unresolved material differences and give focused guidance when more critique would help. Base convergence only on available evidence. For final synthesis, present shared ground, changed views, remaining differences and limitations with accurate participant, engine and model attribution. Missing or failed answers are missing evidence, never agreement. Do not modify the project.'),
+  },
+  parameters: {
+    rounds: { type: 'integer', default: 2, min: 0, max: 5, description: 'Maximum guided critique rounds after the independent answers.' },
+    host_mode: { type: 'string', default: 'per-round', enum: ['per-round', 'final-only'], description: 'Guide and assess every round, or synthesize only after fixed critique rounds.' },
+  },
+  limits: { concurrency: 2, tasks: 8, rounds: 5 },
+  steps: [
+    { id: 'debate', type: 'hostedDebate', participants: { participant_a: 'participant_a', participant_b: 'participant_b' }, host: 'host', inputs: ['request', 'history'], count: { parameter: 'rounds' }, mode: { parameter: 'host_mode' } },
+    { id: 'summary', type: 'synthesize', dependsOn: ['debate'], role: 'host', inputs: ['request', 'debate.sources', 'debate.assessments'], prompt: 'Produce the final synthesis using all supplied completed sources. State remaining uncertainty and unresolved disagreement, including when the configured round limit stopped critique.' },
+  ],
+  output: { sources: ['debate.participant_a', 'debate.participant_b', 'debate.sources', 'debate.assessments', 'summary'], final: 'summary', format: 'markdown' },
 };
 
 const reviewPrompt = 'Independently review the supplied immutable result snapshot and acceptance contract. Read the fixed diff, base/head evidence, and reported checks; do not enter or change the implementer workspace. Review only, never implement. Return JSON {"passed":boolean,"issues":[{"message":string,"path"?:string}]}. Raise concrete correctness or missing acceptance issues. Do not claim checks you did not run.';
@@ -65,3 +86,6 @@ function freeze(value) {
   return value;
 }
 export const BUILTIN_TEMPLATES = freeze([polly, debby].map(validateTemplate));
+
+// Historical built-in snapshots remain addressable by their original revision.
+export const BUILTIN_TEMPLATE_REVISIONS = freeze([polly, debbyV1, debby].map(validateTemplate));

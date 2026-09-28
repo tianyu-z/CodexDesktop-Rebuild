@@ -8,7 +8,7 @@ import { assertClaudeModel } from './claude-models.mjs';
 
 const now = () => Math.floor(Date.now() / 1000);
 const messageOf = error => error instanceof Error ? error.message : String(error);
-const nativeParams = params => { const { engineMode, engineModel, engineModels, template, skipAutoTitleGeneration, ...rest } = params; return rest; };
+const nativeParams = params => { const { engineMode, engineModel, engineModels, template, roleOverrides, skipAutoTitleGeneration, ...rest } = params; return rest; };
 const deny = () => ({ decision: 'decline' });
 
 export class EngineRouter {
@@ -22,7 +22,7 @@ export class EngineRouter {
   state(id) {
     const value = this.store.get(id);
     return { threadId: id, engineMode: value?.mode ?? 'codex', models: value?.models ?? { codex: null, claude: 'default' }, busy: !!value?.activeRun,
-      engines: ['codex', 'claude'], bothAvailable: this.workflow.available, template: value?.template ?? { id: 'polly', revision: 1, parameters: {} }, turnEngines: Object.fromEntries((value?.turns ?? []).map(row => [row.turn.id, row.engine])) };
+      engines: ['codex', 'claude'], bothAvailable: this.workflow.available, roleOverrides: value?.roleOverrides ?? {}, template: value?.template ?? { id: 'polly', revision: 1, parameters: {} }, turnEngines: Object.fromEntries((value?.turns ?? []).map(row => [row.turn.id, row.engine])) };
   }
   notify(method, params) { this.emit({ method, params }); }
   request(method, params = {}) {
@@ -137,8 +137,8 @@ export class EngineRouter {
         // metadata, and let users continue with a saved model while retrying.
         modelListError = 'Could not load Claude models. Refresh models to retry.';
       }
-      const bothAvailable = this.workflow.available && (!params.hostId || params.hostId === 'local');
-      return { engines: ['codex', 'claude'], bothAvailable, ...(bothAvailable ? { templateSchemaVersion: 1, workflowVersion: 1 } : { bothUnavailableReason: 'Dual workflows require the local native engine gateway.' }), claudeModels, modelListError, modelCatalog, localOnly: true };
+      const bothAvailable = this.workflow.available && (this.remote || !params.hostId || params.hostId === 'local');
+      return { engines: ['codex', 'claude'], bothAvailable, ...(bothAvailable ? { templateSchemaVersion: 2, workflowVersion: 2 } : { bothUnavailableReason: 'Collaborative workflows require the native engine gateway on the selected host.' }), claudeModels, modelListError, modelCatalog, localOnly: !this.remote };
     }
     if (params.engineModel !== undefined && (params.engineMode === 'claude' || (params.engineMode == null && id && this.store.get(id)?.mode === 'claude'))) assertClaudeModel(params.engineModel);
     if (method === 'engine/turns/read') { if (!this.store.get(id)) await this.hydrate(id); return { turns: this.state(id).turnEngines }; }
@@ -148,7 +148,7 @@ export class EngineRouter {
       const selected = params.engineMode === 'both' ? this.workflow.selection(params, this.store.get(id)) : null;
       if (this.store.get(id)?.activeRun) throw new Error('Finish or interrupt the active run before switching engines.');
       await this.hydrate(id);
-      this.store.setMode(id, params.engineMode, selected ? { models: selected.models, template: selected.selected } : { model: params.engineModel });
+      this.store.setMode(id, params.engineMode, selected ? { models: selected.models, template: selected.selected, roleOverrides: selected.roleOverrides } : { model: params.engineModel });
       return this.state(id);
     }
     if (method === 'thread/start') {
@@ -162,7 +162,7 @@ export class EngineRouter {
       value.models.codex = result.model ?? null;
       if (params.engineModel && value.mode === 'claude') value.models.claude = params.engineModel;
       this.store.save(value);
-      if (selected) this.store.setMode(value.id, 'both', { models: selected.models, template: selected.selected });
+      if (selected) this.store.setMode(value.id, 'both', { models: selected.models, template: selected.selected, roleOverrides: selected.roleOverrides });
       return { ...result, thread: this.thread(value.id), engineState: this.state(value.id) };
     }
     if (method === 'turn/start') {
@@ -172,7 +172,7 @@ export class EngineRouter {
         const selected = params.engineMode === 'both' ? this.workflow.selection(params, this.store.get(id)) : null;
         if (params.engineMode !== this.store.get(id).mode) {
           await this.hydrate(id);
-          this.store.setMode(id, params.engineMode, selected ? { models: selected.models, template: selected.selected } : { model: params.engineModel });
+          this.store.setMode(id, params.engineMode, selected ? { models: selected.models, template: selected.selected, roleOverrides: selected.roleOverrides } : { model: params.engineModel });
         }
       }
       const value = this.store.get(id);

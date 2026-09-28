@@ -217,3 +217,31 @@ test('explicit workflow resume retains results and prevents resuming behind anot
   assert.equal(store.get('chat').turns[0].runs[0].text, 'partial');
   assert.throws(() => store.resumeWorkflow('chat', 'workflow'), /active/i);
 });
+
+test('role overrides persist, validate before mutation and restore frozen role model ownership on retry', () => {
+  const { store, directory } = setup();
+  const roleOverrides = { host: { engine: 'codex', model: 'host-special', prompt: 'Guide carefully.' } };
+  store.setMode('chat', 'both', { template: { id: 'debby', revision: 2, parameters: { rounds: 2 } }, roleOverrides });
+  roleOverrides.host.prompt = 'mutated';
+  assert.equal(new ConversationStore(directory).get('chat').roleOverrides.host.prompt, 'Guide carefully.');
+  const before = store.get('chat');
+  assert.throws(() => store.setMode('chat', 'both', { roleOverrides: { host: { access: 'write' } } }), /roleOverrides/);
+  assert.deepEqual(store.get('chat'), before);
+  const selected = config(); selected.roleOverrides = before.roleOverrides;
+  selected.template.roles = { host: { engine: 'codex', model: 'host-special' } };
+  store.beginWorkflow('chat', { id: 'workflow', turn: inputTurn('turn'), config: selected });
+  assert.doesNotThrow(() => store.putWorkflowRun('chat', 'workflow', { ...roleRun(), roleId: 'host', requestedModel: 'host-special', status: 'interrupted' }));
+  assert.throws(() => store.putWorkflowRun('chat', 'workflow', { ...roleRun('wrong'), roleId: 'host', requestedModel: 'codex-selected', status: 'completed' }), /model ownership/);
+  store.finishWorkflow('chat', 'workflow', 'interrupted');
+  store.setMode('chat', 'both', { roleOverrides: {} });
+  store.resumeWorkflow('chat', 'workflow');
+  assert.deepEqual(store.get('chat').roleOverrides, selected.roleOverrides);
+});
+
+test('explicit default-model roles reject a run claiming another requested model', () => {
+  const { store } = setup(), selected = config();
+  selected.template.roles.host = { engine: 'codex', model: null };
+  store.beginWorkflow('chat', { id: 'workflow', turn: inputTurn('turn'), config: selected });
+  assert.throws(() => store.putWorkflowRun('chat', 'workflow', { ...roleRun(), roleId: 'host', requestedModel: 'unselected' }), /model ownership/);
+  assert.doesNotThrow(() => store.putWorkflowRun('chat', 'workflow', { ...roleRun(), roleId: 'host', requestedModel: null }));
+});

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { resolveParameters } from '../templates/schema.mjs';
+import { resolveParameters, resolveRoleConfig } from '../templates/schema.mjs';
 import { assertClaudeModel } from '../claude-models.mjs';
 import { inputText, publicHistory } from '../handoff.mjs';
 import { presentItem, presentTurn, toolItem } from '../codex-events.mjs';
@@ -35,7 +35,7 @@ export class WorkflowRouter {
   }
   get available() { return !!this.templates && typeof this.factory === 'function'; }
   assertAvailable(params = {}) {
-    if (!this.available || (params.hostId && params.hostId !== 'local')) throw new Error('Codex + Claude requires the local native engine gateway.');
+    if (!this.available || (!this.router.remote && params.hostId && params.hostId !== 'local')) throw new Error('Collaborative workflows require the selected host gateway; remote requests cannot run on the local gateway.');
   }
   registerInternal(id) {
     if (typeof id !== 'string' || !id || this.internal.has(id)) return;
@@ -56,7 +56,10 @@ export class WorkflowRouter {
     const template = this.templates.read(selected.id, selected.revision);
     if (!template) throw new Error(`Template not found: ${selected.id}`);
     const parameters = resolveParameters(template, selected.parameters ?? {});
-    return { models: clone(models), template, parameters, selected: { id: template.id, revision: template.revision, parameters } };
+    const sameTemplate = current?.template?.id === template.id && current?.template?.revision === template.revision;
+    const overrides = params.roleOverrides === undefined ? (sameTemplate ? current?.roleOverrides ?? {} : {}) : params.roleOverrides;
+    const effective = resolveRoleConfig(template, overrides, models);
+    return { models: clone(models), ...effective, parameters, selected: { id: template.id, revision: template.revision, parameters } };
   }
   templateRequest(method, params) {
     this.assertAvailable(params);
@@ -93,7 +96,7 @@ export class WorkflowRouter {
     let length = fullHistory.length, omitted = false;
     while (history.length > 1 && length > 60000) { length -= history.shift().text.length; omitted = true; }
     if (history[0] && (omitted || history[0].text.length > 60000)) history[0].text = `[Earlier public history: ${historyPath}]\n${history[0].text.slice(-60000)}`;
-    const config = { mode: 'both', models: selected.models, template: selected.template, parameters: selected.parameters, nativeOptions, cwd: chat.cwd, input, history, throughSeq: chat.nextSeq - 1 };
+    const config = { mode: 'both', models: selected.models, roleOverrides: selected.roleOverrides, template: selected.template, parameters: selected.parameters, nativeOptions, cwd: chat.cwd, input, history, throughSeq: chat.nextSeq - 1 };
     this.store.beginWorkflow(id, { id: idRun, turn, config });
     this.launch(id, idRun, turn, config);
     return { turn: presentTurn(turn, 'both'), engineState: this.router.state(id) };

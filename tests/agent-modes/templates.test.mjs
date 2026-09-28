@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync, rmS
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateTemplate, resolveParameters, validateTaskPlan } from '../../runtime/agent-modes/templates/schema.mjs';
-import { BUILTIN_TEMPLATES } from '../../runtime/agent-modes/templates/builtins.mjs';
+import { BUILTIN_TEMPLATES, BUILTIN_TEMPLATE_REVISIONS } from '../../runtime/agent-modes/templates/builtins.mjs';
 import { TemplateStore } from '../../runtime/agent-modes/templates/store.mjs';
 
 const clone = value => structuredClone(value);
@@ -35,7 +35,7 @@ test('builtins expose immutable Polly and Debby revisions with exactly two engin
   assert.deepEqual(store.list().map(item => item.id).sort(), ['debby', 'polly']);
   for (const builtin of BUILTIN_TEMPLATES) {
     const value = store.read(builtin.id);
-    assert.equal(value.revision, 1);
+    assert.equal(value.revision, builtin.revision);
     assert.equal(value.builtin, true);
     assert.match(value.contentHash, /^[a-f0-9]{64}$/);
     assert.deepEqual([...new Set(Object.values(value.roles).map(role => role.engine))].sort(), ['claude', 'codex']);
@@ -43,7 +43,7 @@ test('builtins expose immutable Polly and Debby revisions with exactly two engin
     assert.throws(() => store.save(value), /immutable|built.?in/i);
     assert.throws(() => store.remove(value.id), /immutable|built.?in/i);
   }
-  assert.equal(store.read('debby').parameters.rounds.default, 0);
+  assert.equal(store.read('debby').parameters.rounds.default, 2);
   assert.equal(store.read('debby').parameters.rounds.max, 5);
   assert.equal(store.read('polly').limits.concurrency, 2);
   assert.equal(store.read('polly').limits.tasks, 8);
@@ -137,7 +137,7 @@ test('validation fills safe defaults but rejects unknown and non-serializable fi
   assert.deepEqual(normalized.limits, { concurrency: 2, tasks: 8, rounds: 2 });
   assert.deepEqual(normalized.parameters, {});
   assert.equal(normalized.revision, 1);
-  for (const field of ['model', 'models', 'env', 'credentials', 'harness', 'approvalPolicy']) {
+  for (const field of ['models', 'env', 'credentials', 'harness', 'approvalPolicy']) {
     const value = template(); value.roles.codex[field] = 'forbidden';
     assert.throws(() => validateTemplate(value), new RegExp(`roles.codex.${field}`));
   }
@@ -159,7 +159,7 @@ test('explicit null is not a substitute for omitted defaults and constant-zero b
       steps: [{ id: 'codex', type: 'run', role: 'codex', inputs: ['request'] }], yields: { result: 'codex' } },
   ];
   unused.output = { sources: ['never.result'], final: 'never.result', format: 'text' };
-  assert.throws(() => validateTemplate(unused), /both.*engine/);
+  assert.equal(validateTemplate(unused).schemaVersion, 2);
 });
 
 test('parameter values and all limit bounds are checked before execution', () => {
@@ -194,14 +194,13 @@ test('graph validation rejects duplicates, cycles, absent roles and undeclared r
     [v => v.output.sources.push('missing'), /output.sources/],
     [v => v.output.final = 'missing', /output.final/],
     [v => v.steps[0].steps[0].inputs = ['previousRound.claude'], /previousRound/],
-    [v => v.roles.codex.engine = 'claude', /both.*engine|two.*engine/i],
     [v => v.steps[0].steps[0].type = 'shell', /type/],
   ];
   for (const [change, expected] of cases) { const value = template(); change(value); assert.throws(() => validateTemplate(value), expected); }
 });
 
 test('repeat validates prior-round snapshots, bounded counts and zero-round output aliases', () => {
-  const value = clone(BUILTIN_TEMPLATES.find(item => item.id === 'debby'));
+  const value = clone(BUILTIN_TEMPLATE_REVISIONS.find(item => item.id === 'debby' && item.revision === 1));
   const repeat = value.steps.find(step => step.type === 'repeat');
   assert.equal(repeat.count.parameter, 'rounds');
   assert.deepEqual(repeat.initial, { codex: 'answers.codex', claude: 'answers.claude' });
@@ -225,7 +224,7 @@ test('all bounded parameter references require scalar valid parameter IDs', () =
     ['polly', 'crossReview', 'maxRepairs', 'repairs'],
   ];
   for (const [id, type, field, name] of cases) {
-    const value = clone(BUILTIN_TEMPLATES.find(item => item.id === id));
+    const value = clone(BUILTIN_TEMPLATE_REVISIONS.find(item => item.id === id && item.revision === 1));
     const max = field === 'maxTasks' ? 8 : 2;
     value.parameters[name] = { type: 'integer', default: 1, min: 1, max };
     const step = value.steps.find(item => item.type === type);
@@ -318,4 +317,66 @@ test('sparse arrays are rejected before save can replace a readable current revi
   const sparse = clone(saved); sparse.output.sources = Array(1);
   assert.throws(() => store.save(sparse), /output.sources\[0\].*sparse|output.sources\[0\].*missing/);
   assert.deepEqual(readdirSync(join(directory, 'custom', 'revisions')), ['1.json']);
+});
+
+test('role models and same-engine graphs are saved as v2 while unextended v1 stays readable', t => {
+  const { store } = setup(t), value = template();
+  const old = store.save(value);
+  assert.equal(old.schemaVersion, 1);
+  old.roles.claude.engine = 'codex';
+  old.roles.codex.model = 'deployment/a'; old.roles.claude.model = null;
+  const saved = store.save(old);
+  assert.equal(saved.schemaVersion, 2);
+  assert.equal(saved.roles.codex.model, 'deployment/a');
+  assert.equal(saved.roles.claude.model, null);
+  assert.equal(store.read('custom', 1).schemaVersion, 1);
+  assert.equal(store.read('custom', 1).roles.claude.engine, 'claude');
+  assert.deepEqual(store.read('custom', 2), saved);
+});
+
+test('role overrides resolve independent engine, model and prompt without changing access or session', async () => {
+  const { resolveRoleConfig } = await import('../../runtime/agent-modes/templates/schema.mjs');
+  assert.equal(typeof resolveRoleConfig, 'function');
+  const base = template(); base.roles.codex.model = 'template-model';
+  const models = { codex: 'codex-default', claude: 'claude-default' };
+  const overrides = { codex: { engine: 'claude', prompt: 'Custom perspective.' }, claude: { engine: 'codex', model: null } };
+  const resolved = resolveRoleConfig(base, overrides, models);
+  assert.equal(resolved.template.roles.codex.engine, 'claude');
+  assert.equal(resolved.template.roles.codex.model, 'template-model');
+  assert.equal(resolved.template.roles.codex.prompt, 'Custom perspective.');
+  assert.equal(resolved.template.roles.claude.model, null);
+  assert.equal(resolveRoleConfig(base, {}, models).template.roles.claude.model, 'claude-default');
+  assert.equal(resolveRoleConfig(base, { codex: { model: 'explicit' } }, models).template.roles.codex.model, 'explicit');
+  assert.deepEqual(resolved.roleOverrides, overrides);
+  assert.equal(resolved.template.roles.codex.access, 'read');
+  assert.equal(resolved.template.roles.codex.session, 'reuse');
+  assert.equal(base.roles.codex.engine, 'codex');
+  for (const invalid of [null, [], { missing: {} }, { codex: { access: 'write' } }, { codex: { session: 'reuse' } }, { codex: { engine: 'both' } }, { codex: { model: 'bad\n' } }, { codex: { prompt: '' } }, { codex: { prompt: 'x'.repeat(100001) } }]) {
+    assert.throws(() => resolveRoleConfig(base, invalid, models), /roleOverrides/);
+  }
+});
+
+test('Polly planner and summary allow overrides while worker and reviewer engine topology remains validated', async () => {
+  const { resolveRoleConfig } = await import('../../runtime/agent-modes/templates/schema.mjs');
+  assert.equal(typeof resolveRoleConfig, 'function');
+  const base = BUILTIN_TEMPLATES.find(value => value.id === 'polly');
+  const effective = resolveRoleConfig(base, { planner: { engine: 'codex', model: 'planner-model' }, summary: { model: 'summary-model', prompt: 'Summarize verified evidence.' } }, {}).template;
+  assert.equal(effective.roles.planner.engine, 'codex'); assert.equal(effective.roles.summary.model, 'summary-model');
+  assert.throws(() => resolveRoleConfig(base, { codex_worker: { engine: 'claude' } }, {}), /matching engine/);
+  assert.throws(() => resolveRoleConfig(base, { claude_reviewer: { engine: 'codex' } }, {}), /opposite engine/);
+});
+
+test('Debby current revision has stable participants and host, and retains its old immutable revision', t => {
+  const { store } = setup(t);
+  const current = store.read('debby'), old = store.read('debby', 1);
+  assert.equal(current.revision, 2); assert.equal(current.schemaVersion, 2);
+  assert.deepEqual(Object.keys(current.roles), ['participant_a', 'participant_b', 'host']);
+  assert.equal(current.roles.host.engine, 'claude');
+  assert.equal(current.parameters.host_mode.default, 'per-round');
+  assert.equal(current.steps[0].type, 'hostedDebate');
+  assert.deepEqual(Object.keys(old.roles), ['codex', 'claude', 'moderator']);
+  assert.equal(old.schemaVersion, 1); assert.equal(old.parameters.rounds.default, 0);
+  assert.throws(() => resolveParameters(current, { host_mode: 'invented' }), /host_mode/);
+  const writable = clone(current); writable.roles.host.access = 'write';
+  assert.throws(() => validateTemplate(writable), /read/);
 });

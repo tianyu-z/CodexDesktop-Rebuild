@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { isAlias, isMap, isScalar, isSeq, parseDocument, stringify } from 'yaml';
-import { BUILTIN_TEMPLATES } from './builtins.mjs';
+import { BUILTIN_TEMPLATES, BUILTIN_TEMPLATE_REVISIONS } from './builtins.mjs';
 import { TemplateValidationError, validateId, validateRevision, validateTemplate } from './schema.mjs';
 
 const MAX_IMPORT_BYTES = 2 * 1024 * 1024;
@@ -109,8 +109,8 @@ export class TemplateStore {
     validateId(id);
     if (revision !== undefined) validateRevision(revision);
     if (this.builtins.has(id)) {
-      const builtin = this.builtins.get(id);
-      return revision === undefined || revision === builtin.revision ? clone(builtin) : null;
+      const builtin = revision === undefined ? this.builtins.get(id) : BUILTIN_TEMPLATE_REVISIONS.find(value => value.id === id && value.revision === revision);
+      return builtin ? clone(builtin) : null;
     }
     const paths = this.#paths(id);
     if (!paths) return null;

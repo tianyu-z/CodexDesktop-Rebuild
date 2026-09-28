@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { WorkflowScheduler, roleBindingKey } from '../../runtime/agent-modes/orchestration/scheduler.mjs';
+import { WorkflowScheduler, roleBindingKey as bindingKey } from '../../runtime/agent-modes/orchestration/scheduler.mjs';
 import { renderInputs } from '../../runtime/agent-modes/orchestration/inputs.mjs';
-import { BUILTIN_TEMPLATES } from '../../runtime/agent-modes/templates/builtins.mjs';
+import { BUILTIN_TEMPLATES, BUILTIN_TEMPLATE_REVISIONS } from '../../runtime/agent-modes/templates/builtins.mjs';
 
+const roleBindingKey = value => bindingKey({ ...value, requestedModel: Object.hasOwn(value.template.roles[value.roleId], 'model') ? value.template.roles[value.roleId].model : value.template.roles[value.roleId].engine === 'codex' ? 'codex-exact' : 'claude-deployment' });
 const clone = value => structuredClone(value);
 const tick = () => new Promise(resolve => setImmediate(resolve));
 async function until(predicate) { for (let n = 0; n < 80; n++) { if (predicate()) return; await tick(); } assert.fail('condition did not settle'); }
@@ -103,7 +104,7 @@ test('the concurrency budget applies across nested groups and array order adds n
 });
 
 test('round peers see the whole previous completed snapshot even after a faster peer finishes', async () => {
-  const t = clone(BUILTIN_TEMPLATES.find(t => t.id === 'debby')); t.limits.concurrency = 1;
+  const t = clone(BUILTIN_TEMPLATE_REVISIONS.find(t => t.id === 'debby' && t.revision === 1)); t.limits.concurrency = 1;
   const runner = harness(), selected = options({ template: t, parameters: { rounds: 2 } }), run = new WorkflowScheduler({ runner }).start(selected);
   for (const [index, text] of ['C0', 'A0', 'C1', 'A1', 'C2', 'A2', 'SUMMARY'].entries()) {
     await until(() => runner.calls.length === index + 1);
@@ -447,4 +448,130 @@ test('resume without a chosen retry rejects unsuccessful roles before callbacks 
   let snapshots = 0;
   const nextRunner = harness(); assert.throws(() => new WorkflowScheduler({ runner: nextRunner }).start(options({ previousSnapshot, resume: true, onSnapshot() { snapshots++; } })), /retryRunId|explicit.*retry/i);
   assert.equal(snapshots, 0); assert.equal(nextRunner.calls.length, 0);
+});
+
+test('same-engine roles retain independent sessions and freeze per-role models and prompts for retries', async () => {
+  const t = template(); t.roles.c.session = 'reuse'; t.roles.a.session = 'reuse';
+  const runner = harness(), selected = options({ template: t, roleOverrides: { c: { model: 'shared-model' }, a: { engine: 'codex', model: 'shared-model', prompt: 'Other independent perspective.' } } });
+  const run = new WorkflowScheduler({ runner }).start(selected);
+  selected.roleOverrides.a.model = 'mutated';
+  await until(() => runner.calls.length === 2);
+  assert.deepEqual(runner.calls.map(call => [call.roleId, call.engine, call.model]), [['c', 'codex', 'shared-model'], ['a', 'codex', 'shared-model']]);
+  assert.ok(runner.calls.every(call => !call.nativeSessionId));
+  runner.calls[0].emit({ type: 'session', sessionId: 'session-c' });
+  runner.calls[1].emit({ type: 'session', sessionId: 'session-a' });
+  runner.calls[0].complete({ text: 'Independent C' }); runner.calls[1].complete({ status: 'failed', error: 'retry' });
+  await until(() => run.snapshot().status === 'blocked');
+  const failed = run.snapshot().runs.find(row => row.status === 'failed');
+  assert.equal(run.retry(failed.id), true); await until(() => runner.calls.length === 3);
+  assert.equal(runner.calls[2].nativeSessionId, 'session-a'); assert.equal(runner.calls[2].model, 'shared-model');
+  assert.equal(runner.calls[2].instructions, 'Other independent perspective.');
+  const result = await finishRemaining(run, runner);
+  assert.equal(result.status, 'completed');
+  assert.equal(Object.keys(result.bindings).length, 2);
+  assert.deepEqual(Object.values(result.bindings).map(value => value.sessionId).sort(), ['session-a', 'session-c']);
+});
+
+test('a changed role engine, effective model or prompt changes its reusable binding identity', () => {
+  const t = template(); t.roles.c.model = 'one';
+  const initial = roleBindingKey({ template: t, roleId: 'c', cwd: '/tmp' });
+  for (const change of [role => role.engine = 'claude', role => role.model = 'two', role => role.prompt = 'New instructions']) {
+    const changed = clone(t); change(changed.roles.c);
+    assert.notEqual(roleBindingKey({ template: changed, roleId: 'c', cwd: '/tmp' }), initial);
+  }
+});
+
+const hostedTemplate = () => ({ schemaVersion: 2, id: 'hosted', revision: 1, name: 'Hosted', description: '',
+  roles: { participant_a: { ...role('codex'), session: 'reuse' }, participant_b: { ...role('claude'), session: 'reuse' }, host: role('claude') },
+  parameters: { rounds: { type: 'integer', default: 2, min: 0, max: 5 }, host_mode: { type: 'string', default: 'per-round', enum: ['per-round', 'final-only'] } },
+  limits: { concurrency: 2, tasks: 8, rounds: 5 },
+  steps: [
+    { id: 'debate', type: 'hostedDebate', participants: { participant_a: 'participant_a', participant_b: 'participant_b' }, host: 'host', inputs: ['request', 'history'], count: { parameter: 'rounds' }, mode: { parameter: 'host_mode' } },
+    { id: 'summary', type: 'synthesize', dependsOn: ['debate'], role: 'host', inputs: ['request', 'debate.sources', 'debate.assessments'] },
+  ], output: { sources: ['debate.participant_a', 'debate.participant_b', 'debate.sources', 'debate.assessments', 'summary'], final: 'summary', format: 'markdown' } });
+
+test('host assesses independent answers and ends early only on a validated structured decision', async () => {
+  const runner = harness(), run = new WorkflowScheduler({ runner }).start(options({ template: hostedTemplate() }));
+  await until(() => runner.calls.length === 2);
+  assert.ok(runner.calls.every(call => call.round === 0 && !/previousRound/.test(call.prompt)));
+  runner.calls[0].complete({ text: 'A initial' }); await tick(); assert.equal(runner.calls.length, 2);
+  runner.calls[1].complete({ text: 'B initial' }); await until(() => runner.calls.length === 3);
+  const assessment = runner.calls[2];
+  assert.equal(assessment.roleId, 'host'); assert.deepEqual(assessment.outputSchema.required, ['continue', 'guidance']);
+  assert.match(assessment.prompt, /A initial/); assert.match(assessment.prompt, /B initial/);
+  assessment.complete({ structuredOutput: { continue: false, guidance: 'Evidence is sufficient.' }, text: 'Assessment artifact' });
+  await until(() => runner.calls.length === 4);
+  assert.equal(runner.calls[3].stepId, 'summary');
+  assert.match(runner.calls[3].prompt, /A initial/); assert.match(runner.calls[3].prompt, /Assessment artifact/);
+  runner.calls[3].complete({ text: 'Final synthesis' });
+  const result = await run.done; assert.equal(result.status, 'completed');
+  assert.equal(result.outputs.sources['debate.sources'].length, 2);
+  assert.equal(result.outputs.sources['debate.assessments'][0].decision.continue, false);
+});
+
+test('host guidance uses fixed prior-round answers, reassesses each round and obeys the hard limit', async () => {
+  const runner = harness(), run = new WorkflowScheduler({ runner }).start(options({ template: hostedTemplate(), parameters: { rounds: 1 } }));
+  await until(() => runner.calls.length === 2); runner.calls[0].complete({ text: 'A0' }); runner.calls[1].complete({ text: 'B0' });
+  await until(() => runner.calls.length === 3); runner.calls[2].complete({ structuredOutput: { continue: true, guidance: 'Check the disputed estimate.' } });
+  await until(() => runner.calls.length === 5);
+  const [a, b] = runner.calls.slice(3);
+  assert.match(a.prompt, /B0/); assert.match(b.prompt, /A0/);
+  assert.match(a.prompt, /Check the disputed estimate/); assert.match(b.prompt, /Check the disputed estimate/);
+  a.complete({ text: 'A1' }); await tick(); assert.doesNotMatch(b.prompt, /A1/);
+  b.complete({ text: 'B1' }); await until(() => runner.calls.length === 6);
+  runner.calls[5].complete({ structuredOutput: { continue: true, guidance: 'Would like another round.' } });
+  await until(() => runner.calls.length === 7); assert.equal(runner.calls[6].stepId, 'summary');
+  for (const text of ['A0', 'B0', 'A1', 'B1']) assert.ok(runner.calls[6].prompt.includes(text));
+  runner.calls[6].complete(); const result = await run.done;
+  assert.equal(result.status, 'completed'); assert.equal(result.outputs.sources['debate.sources'].length, 4);
+  assert.equal(result.outputs.sources['debate.assessments'].length, 2);
+  assert.ok(result.runs.every(row => row.round <= 1));
+});
+
+test('malformed host decisions block, survive restart and retry the same frozen assessment', async () => {
+  const runner = harness(), selected = options({ template: hostedTemplate(), roleOverrides: { host: { engine: 'codex', model: 'host-frozen', prompt: 'Host frozen instructions.' } } });
+  const run = new WorkflowScheduler({ runner }).start(selected);
+  await until(() => runner.calls.length === 2); runner.calls.forEach((call, i) => call.complete({ text: `Initial ${i}` }));
+  await until(() => runner.calls.length === 3); runner.calls[2].complete({ text: 'We agree', structuredOutput: { continue: 'false', guidance: 'Unsupported' } });
+  await until(() => run.snapshot().status === 'blocked');
+  const failed = run.snapshot().runs.find(row => row.status === 'failed'); assert.match(failed.error, /continue/);
+  const previousSnapshot = run.snapshot(); await run.interrupt();
+  const nextRunner = harness(), restarted = new WorkflowScheduler({ runner: nextRunner }).start({ ...selected, previousSnapshot, roleOverrides: { host: { engine: 'claude', model: 'changed' } }, retryRunId: failed.id });
+  await until(() => nextRunner.calls.length === 1);
+  assert.equal(nextRunner.calls[0].prompt, runner.calls[2].prompt);
+  assert.equal(nextRunner.calls[0].model, 'host-frozen'); assert.equal(nextRunner.calls[0].engine, 'codex');
+  assert.deepEqual(nextRunner.calls[0].outputSchema, runner.calls[2].outputSchema);
+  nextRunner.calls[0].complete({ structuredOutput: { continue: false, guidance: '' } });
+  await until(() => nextRunner.calls.length === 2); nextRunner.calls[1].complete();
+  const result = await restarted.done;
+  assert.equal(result.status, 'completed'); assert.equal(result.runs.filter(row => row.roleId.startsWith('participant')).length, 2);
+  assert.deepEqual(result.runs.filter(row => row.stepId === failed.stepId).map(row => row.status), ['failed', 'completed']);
+});
+
+test('final-only debate runs fixed rounds without assessments and zero rounds preserves both originals', async () => {
+  for (const rounds of [0, 2]) {
+    const runner = harness(), run = new WorkflowScheduler({ runner }).start(options({ template: hostedTemplate(), parameters: { rounds, host_mode: 'final-only' } }));
+    const result = await finishRemaining(run, runner);
+    assert.equal(result.status, 'completed'); assert.equal(runner.calls.length, 3 + 2 * rounds);
+    assert.ok(runner.calls.every(call => call.outputSchema === undefined));
+    assert.equal(result.outputs.sources['debate.sources'].length, 2 + 2 * rounds);
+    assert.deepEqual(result.outputs.sources['debate.assessments'], []);
+  }
+});
+
+test('stopping a guided host round retains answers and explicit recovery retries only the stopped assessment', async () => {
+  const runner = harness(), selected = options({ template: hostedTemplate(), parameters: { rounds: 0 } });
+  const run = new WorkflowScheduler({ runner }).start(selected);
+  await until(() => runner.calls.length === 2); runner.calls.forEach(call => call.complete());
+  await until(() => runner.calls.length === 3); runner.calls[2].emit({ type: 'text-delta', delta: 'Partial assessment' });
+  await run.interrupt(); const previousSnapshot = run.snapshot();
+  assert.equal(previousSnapshot.status, 'interrupted');
+  assert.equal(previousSnapshot.runs[2].status, 'interrupted');
+  assert.equal(previousSnapshot.runs.filter(row => row.status === 'completed').length, 2);
+  const nextRunner = harness(), restored = new WorkflowScheduler({ runner: nextRunner }).start({ ...selected, previousSnapshot, retryRunId: previousSnapshot.runs[2].id });
+  await until(() => nextRunner.calls.length === 1); assert.equal(nextRunner.calls[0].roleId, 'host');
+  nextRunner.calls[0].complete({ structuredOutput: { continue: true, guidance: 'No rounds remain.' } });
+  await until(() => nextRunner.calls.length === 2); assert.equal(nextRunner.calls[1].stepId, 'summary');
+  nextRunner.calls[1].complete(); const result = await restored.done;
+  assert.equal(result.status, 'completed'); assert.equal(result.runs.filter(row => row.roleId.startsWith('participant')).length, 2);
 });

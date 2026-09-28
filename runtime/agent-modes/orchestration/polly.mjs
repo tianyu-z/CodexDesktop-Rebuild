@@ -28,7 +28,7 @@ function validateVerdict(value, checks = false) {
 }
 
 const nativePublic = result => Object.fromEntries(['id', 'engine', 'roleId', 'stepId', 'attempt', 'round', 'status', 'requestedModel', 'actualModel', 'text', 'structuredOutput', 'nativeSessionId', 'usage'].filter(key => result?.[key] !== undefined).map(key => [key, result[key]]));
-const evidence = (result, roleId, options, details = result.structuredOutput?.checks) => ({ kind: 'model-reported', engine: options.template.roles[roleId].engine, roleId, requestedModel: options.models[options.template.roles[roleId].engine], text: result.text ?? '', ...(details === undefined ? {} : { checks: clone(details) }) });
+const evidence = (result, roleId, options, details = result.structuredOutput?.checks) => ({ kind: 'model-reported', engine: options.template.roles[roleId].engine, roleId, requestedModel: Object.hasOwn(options.template.roles[roleId], 'model') ? options.template.roles[roleId].model : options.models[options.template.roles[roleId].engine], text: result.text ?? '', ...(details === undefined ? {} : { checks: clone(details) }) });
 const taskSignature = dependencies => dependencies.map(entry => [entry.task.id, entry.artifact.head, entry.artifact.hash]);
 
 /** Isolated artifact operations; all native work goes through the scheduler's global budget. */

@@ -295,3 +295,73 @@ test('continuing after immediate stop starts the frozen workflow when no schedul
   assert.equal(loaded, true);
   assert.ok(calls.filter(call => call.engine === 'claude').every(call => call.model === selected.engineModels.claude));
 });
+
+test('role overrides are validated, persisted and frozen before native work; native model cannot replace explicit roles', async t => {
+  const f = fixture(t), roleOverrides = { codex: { engine: 'claude', model: 'participant-special' }, claude: { engine: 'claude', model: 'other-special' }, moderator: { engine: 'codex', model: 'host-special', prompt: 'Custom host.' } };
+  await assert.rejects(f.router.request('thread/start', { ...selected, roleOverrides: { missing: { model: 'x' } }, cwd: f.dir }), /roleOverrides/);
+  assert.equal(f.calls.length, 0);
+  const start = await f.router.request('thread/start', { ...selected, roleOverrides, cwd: f.dir });
+  assert.deepEqual(start.engineState.roleOverrides, roleOverrides);
+  assert.equal(f.calls.find(call => call.method === 'thread/start').params.roleOverrides, undefined);
+  roleOverrides.moderator.prompt = 'Caller mutation';
+  const { turn } = await f.router.request('turn/start', { threadId: 'chat', model: 'native-current', input: [{ type: 'text', text: 'Compare' }] });
+  await tick(); const w = f.workflows[0];
+  assert.equal(w.options.template.roles.moderator.prompt, 'Custom host.');
+  assert.equal(w.options.template.roles.moderator.model, 'host-special');
+  assert.equal(w.options.template.roles.codex.model, 'participant-special');
+  assert.equal(w.options.models.codex, 'native-current');
+  w.finish('interrupted'); await tick();
+  await f.router.request('engine/mode/set', { threadId: 'chat', engineMode: 'both', roleOverrides: {} });
+  await f.router.request('engine/runs/retry', { threadId: 'chat', turnId: turn.id }); await tick();
+  assert.equal(f.workflows[1].options.roleOverrides.moderator.model, 'host-special');
+});
+
+test('a remote gateway exposes templates and runs workflows on its selected host', async t => {
+  const f = fixture(t); f.router.remote = true;
+  const hostId = 'remote-ssh:fixture';
+  const capabilities = await f.router.request('engine/capabilities', { hostId });
+  assert.equal(capabilities.bothAvailable, true); assert.equal(capabilities.localOnly, false);
+  assert.equal(capabilities.templateSchemaVersion, 2);
+  const template = (await f.router.request('engine/templates/read', { hostId, id: 'debby' })).template;
+  assert.equal(template.revision, 2);
+  await f.router.request('thread/start', { ...selected, hostId, cwd: f.dir });
+  const { turn } = await f.router.request('turn/start', { threadId: 'chat', hostId, input: [{ type: 'text', text: 'Compare on this host.' }] });
+  await tick();
+  assert.equal((await f.router.request('engine/runs/read', { threadId: 'chat', hostId, turnId: turn.id })).workflows.length, 1);
+  await f.router.request('engine/runs/interrupt', { threadId: 'chat', hostId, turnId: turn.id });
+  assert.equal(f.store.get('chat').activeTurn, null);
+});
+
+test('two Claude participants with different models and a custom Claude host persist one completed hosted turn', async t => {
+  const { WorkflowScheduler } = await import('../../runtime/agent-modes/orchestration/scheduler.mjs');
+  const f = fixture(t), calls = [];
+  f.router.workflow.factory = callbacks => new WorkflowScheduler({ ...callbacks, runner: { start(options) {
+    calls.push(options);
+    const done = Promise.resolve().then(() => {
+      options.onEvent({ type: 'session', sessionId: options.nativeSessionId ?? `session-${options.roleId}` });
+      options.onEvent({ type: 'message-completed', id: `${options.runId}:message`, text: `${options.roleId} result` });
+      return { status: 'completed', text: `${options.roleId} result`, ...(options.outputSchema ? { structuredOutput: { continue: false, guidance: 'Sufficient evidence.' } } : {}) };
+    });
+    return { done, interrupt: () => done };
+  } } });
+  const roleOverrides = { participant_a: { engine: 'claude', model: 'model-a' }, participant_b: { engine: 'claude', model: 'model-b' }, host: { model: 'model-host', prompt: 'Compare the assumptions and evidence.' } };
+  await f.router.request('thread/start', { engineMode: 'both', template: { id: 'debby', revision: 2, parameters: { rounds: 4 } }, roleOverrides, cwd: f.dir });
+  await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'text', text: 'Compare' }] });
+  for (let i = 0; i < 100 && f.store.get('chat').activeTurn; i++) await tick();
+  const row = f.store.get('chat').turns[0];
+  assert.equal(row.turn.status, 'completed', row.turn.error?.message);
+  assert.deepEqual(calls.map(call => [call.roleId, call.engine, call.model]), [['participant_a', 'claude', 'model-a'], ['participant_b', 'claude', 'model-b'], ['host', 'claude', 'model-host'], ['host', 'claude', 'model-host']]);
+  assert.equal(new Set(row.runs.slice(0, 2).map(run => run.nativeSessionId)).size, 2);
+  assert.equal(row.workflow.state.outputs.sources['debate.sources'].length, 2);
+  assert.equal(row.turn.items.filter(item => item.type === 'userMessage').length, 1);
+  assert.match(calls.at(-1).instructions, /Compare the assumptions and evidence/);
+});
+
+test('changing template resets omitted overrides while selecting the same template retains them', async t => {
+  const f = fixture(t), roleOverrides = { codex: { model: 'custom' } };
+  await f.router.request('thread/start', { ...selected, roleOverrides, cwd: f.dir });
+  const same = await f.router.request('engine/mode/set', { engineMode: 'both', threadId: 'chat', template: selected.template });
+  assert.deepEqual(same.roleOverrides, roleOverrides);
+  const changed = await f.router.request('engine/mode/set', { engineMode: 'both', threadId: 'chat', template: { id: 'polly', revision: 1, parameters: {} } });
+  assert.deepEqual(changed.roleOverrides, {});
+});
