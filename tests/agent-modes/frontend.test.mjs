@@ -20,7 +20,7 @@ test('draft engine and Claude model stay scoped; Codex carries no Claude model o
   assert.deepEqual(plain(api.capture(a, 'local')), { engineMode: 'codex' });
   api.setDraftSelection(a, { engineMode: 'claude' });
   assert.equal(api.capture(a, 'local').engineModel, 'opus');
-  assert.deepEqual(plain(api.capture(a, 'remote-ssh:test')), {});
+  assert.deepEqual(plain(api.capture(a, 'remote-ssh:test')), { engineMode: 'codex' });
 });
 
 test('unknown modes and invalid model selections fail explicitly', () => {
@@ -47,11 +47,11 @@ test('mode switch persists on its thread and failed changes preserve selected en
   assert.equal(api.getSnapshot(scope, 'thread-a', 'local').pending, false);
 });
 
-test('remote mode selection and reads never invoke local gateway RPCs', async () => {
+test('remote mode selection uses its manager and failed reads deny native metadata', async () => {
   const api = load(), scope = draft();
-  const manager = { getHostId: () => 'remote-ssh:test', sendRequest: () => { throw Error('Unexpected RPC'); } };
-  await assert.rejects(api.changeSelection({ scope, threadId: 'a', hostId: 'remote-ssh:test', manager }, { engineMode: 'claude' }), /local/);
-  assert.equal(await api.permitsNativeMetadata(manager, 'a'), true);
+  const manager = { getHostId: () => 'remote-ssh:test', sendRequest: () => { throw Error('Remote gateway offline'); } };
+  await assert.rejects(api.changeSelection({ scope, threadId: 'a', hostId: 'remote-ssh:test', manager }, { engineMode: 'claude' }), /Remote gateway offline/);
+  assert.equal(await api.permitsNativeMetadata(manager, 'a'), false);
 });
 
 test('native metadata never generates for Claude, including before first request completes', async () => {
@@ -116,8 +116,8 @@ test('Claude selector uses a separate model picker and explains permission owner
   assert.match(model.props.title, /Codex permission selector applies only to Codex/);
 });
 
-test('selector disables engine changes for active runtime and remote chats', () => {
-  for (const options of [{ busy: true }, { hostId: 'remote-ssh:test' }]) {
+test('selector disables engine changes for active runtime on local and remote hosts', () => {
+  for (const options of [{ busy: true }, { hostId: 'remote-ssh:test', busy: true }]) {
     const api = load(), { tree } = componentHarness(api, options);
     assert.equal(tree.props.children[0].props.disabled, true);
   }
@@ -395,6 +395,6 @@ test('selector discovers models through the callable RPC client without synchron
   assert.ok(model.props.children.some(option => option.props.value === 'claude-opus-5-5'));
   const remote = componentHarness(api, { hostId: 'remote-ssh:rno', threadId: null, manager, scope, seed: false }).tree;
   await remote.props.children[0].props.onPointerDown();
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
   assert.equal(hostLookups, 0);
 });

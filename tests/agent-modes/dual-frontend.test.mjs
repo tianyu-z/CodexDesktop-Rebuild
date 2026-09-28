@@ -16,13 +16,13 @@ test('both selection captures independent models and immutable template values',
   api.setDraftSelection(scope, selected);
   selected.engineModels.claude = 'mutated'; selected.template.parameters.rounds = 4;
   const captured = api.capture(scope, 'local');
-  assert.deepEqual(plain(captured), { ...selection(), skipAutoTitleGeneration: true });
+  assert.deepEqual(plain(captured), { ...selection(), roleOverrides: {}, skipAutoTitleGeneration: true });
   captured.template.parameters.rounds = 5;
   assert.equal(api.capture(scope, 'local').template.parameters.rounds, 1);
   api.setDraftSelection(scope, { engineMode: 'codex' });
   api.setDraftSelection(scope, { engineMode: 'both' });
   assert.deepEqual(plain(api.capture(scope, 'local').engineModels), selection().engineModels);
-  assert.deepEqual(plain(api.capture(scope, 'remote')), {});
+  assert.deepEqual(plain(api.capture(scope, 'remote')), { engineMode: 'codex' });
 });
 
 test('both prewarm intent survives stale native reads and uses the resolved native model at send', async () => {
@@ -102,7 +102,7 @@ function selectorProps(scope, manager, extras = {}) {
   return { scope, hostId: 'local', getHost: () => 'local', getManager: () => manager, useAtom: () => false, nativeModelPicker: { native: true }, ...extras };
 }
 
-test('both selector uses only authoritative local capability and preserves native model controls', async () => {
+test('both selector uses only authoritative host capability and preserves native model controls', async () => {
   const { api, scope } = setup();
   const manager = { getHostId: () => 'local', sendRequest: async () => ({ engines: ['codex', 'claude'], bothAvailable: true, claudeModels: [{ value: 'claude-exact' }] }) };
   await api.refreshCapabilities(manager);
@@ -154,21 +154,21 @@ async function templateSetup() {
   return { api, scope, manager, calls, templates };
 }
 
-test('template selector defaults to Polly and Debby discussion changes 0 to 1 with bounded rounds', async () => {
+test('template selector defaults to Polly and new Debby discussion starts at two bounded rounds', async () => {
   const { api, scope, manager } = await templateSetup(), changes = [];
   let selected = api.getSnapshot(scope).template;
   const props = { manager, hostId: 'local', selection: selected, disabled: false, onChange: value => { selected = value; changes.push(value); props.selection = value; } };
   const view = ui(api, 'TemplateControls', props);
   assert.equal(find(view.render(), 'Workflow template').props.value, 'polly@1');
-  find(view.render(), 'Workflow template').props.onChange({ target: { value: 'debby@1' } });
+  find(view.render(), 'Workflow template').props.onChange({ target: { value: 'debby@2' } });
   const debby = ui(api, 'TemplateControls', { ...props, selection: selected });
-  assert.equal(find(debby.render(), 'Enable discussion').props.checked, false);
+  assert.equal(find(debby.render(), 'Enable discussion').props.checked, true);
   find(debby.render(), 'Enable discussion').props.onChange({ target: { checked: true } });
   assert.equal(changes.at(-1).parameters.rounds, 1);
   const enabled = ui(api, 'TemplateControls', { ...props, selection: changes.at(-1) }).render();
   assert.equal(find(enabled, 'Discussion rounds').props.min, 1);
   assert.equal(find(enabled, 'Discussion rounds').props.max, 5);
-  assert.match(words(enabled), /selected Claude model/);
+  assert.match(words(enabled), /own engine, model and prompt/);
 });
 
 test('template manager copies builtins, edits roles and definitions, and saves a separate revision', async () => {
@@ -231,8 +231,8 @@ test('both source panel attributes roles, keeps unreported models absent and sto
   let tree = view.render();
   assert.equal(tree.props['data-cdx-engine-source'], 'both');
   assert.ok(nodes(tree).some(node => node.type === 'details'));
-  assert.match(words(tree), /Codex \+ Claude Code/);
-  assert.match(words(tree), /planner/); assert.match(words(tree), /task-1/);
+  assert.match(words(tree), /Multi-agent \(Codex \/ Claude\)/);
+  assert.match(words(tree), /Planner/); assert.match(words(tree), /task-1/);
   assert.match(words(tree), /partial plan/); assert.match(words(tree), /Requested model: claude-selected/);
   assert.equal((words(tree).match(/Actual model:/g) ?? []).length, 1);
   assert.match(words(tree), /Dependent work is blocked/);
@@ -269,7 +269,7 @@ test('advanced YAML edits cannot be silently discarded by switching to the basic
   assert.match(words(view.render()), /Save.*YAML.*before.*basic form/);
 });
 
-test('synchronous template and run transport failures can be retried and remain local', async () => {
+test('synchronous template and run failures can be retried on each registered host', async () => {
   const { api } = setup(); let count = 0;
   const manager = { getHostId: () => 'local', sendRequest: () => { count++; throw Error('Offline'); } };
   await api.refreshTemplates(manager); await api.refreshTemplates(manager);
@@ -277,17 +277,18 @@ test('synchronous template and run transport failures can be retried and remain 
   api.registerManager(manager);
   await api.refreshRuns('chat', 'local', 'turn'); await api.refreshRuns('chat', 'local', 'turn');
   assert.equal(count, 4);
+  api.registerManager(manager, 'remote');
   await api.refreshTemplates(manager, 'remote'); await api.refreshRuns('chat', 'remote', 'turn');
-  assert.equal(count, 4);
+  assert.equal(count, 6);
 });
 
 test('custom template parameters use schema types and describe a selected Codex coordinator', async () => {
   const { api, manager, templates } = await templateSetup();
-  const custom = plain(templates[1]); custom.id = 'custom'; custom.roles.moderator.engine = 'codex';
+  const custom = plain(templates[1]); custom.id = 'custom'; custom.roles.host.engine = 'codex'; custom.revision = 1;
   custom.parameters = { flag: { type: 'boolean', default: false }, note: { type: 'string', default: 'test' }, count: { type: 'integer', min: 1, max: 4, default: 2 } };
   templates.push(custom); await api.refreshTemplates(manager, 'local', true);
   const changes = [], view = ui(api, 'TemplateControls', { manager, selection: { id: 'custom', revision: 1, parameters: {} }, onChange: value => changes.push(value) });
-  assert.match(words(view.render()), /selected Codex model/);
+  assert.match(words(view.render()), /own engine, model and prompt/);
   find(view.render(), 'Template parameter flag').props.onChange({ target: { checked: true } });
   assert.equal(changes.at(-1).parameters.flag, true);
   find(view.render(), 'Template parameter count').props.onChange({ target: { value: '5' } });
@@ -398,10 +399,10 @@ test('both keeps the actual native model picker when the upstream width gate hid
 
 test('retry controls track latest eligible scheduler attempts and keep earlier output readable', async t => {
   const { WorkflowScheduler } = await import('../../runtime/agent-modes/orchestration/scheduler.mjs');
-  const { BUILTIN_TEMPLATES } = await import('../../runtime/agent-modes/templates/builtins.mjs');
+  const { BUILTIN_TEMPLATE_REVISIONS } = await import('../../runtime/agent-modes/templates/builtins.mjs');
   const calls = [], { api } = setup();
   const runner = { start(options) { let finish; const done = new Promise(resolve => { finish = resolve; }); calls.push({ ...options, finish }); return { done, interrupt: async () => { finish({ status: 'interrupted', text: 'partial' }); return done; } }; } };
-  const handle = new WorkflowScheduler({ runner }).start({ runId: 'workflow', template: BUILTIN_TEMPLATES.find(template => template.id === 'debby'), parameters: { rounds: 0 }, models: { codex: 'gpt-selected', claude: 'claude-selected' }, cwd: '/tmp', input: 'Compare' });
+  const handle = new WorkflowScheduler({ runner }).start({ runId: 'workflow', template: BUILTIN_TEMPLATE_REVISIONS.find(template => template.id === 'debby' && template.revision === 1), parameters: { rounds: 0 }, models: { codex: 'gpt-selected', claude: 'claude-selected' }, cwd: '/tmp', input: 'Compare' });
   t.after(() => handle.interrupt());
   const until = async predicate => { for (let count = 0; count < 80; count++) { if (predicate()) return; await tick(); } assert.fail('Scheduler did not settle'); };
   await until(() => calls.length === 2);
@@ -530,4 +531,78 @@ test('newer-started authoritative workflow reads win when their responses arrive
   responses.get('old')({ workflows: [{ turnId: 'old', isLatestTurn: true, status: 'interrupted', runs: [] }] }); await old;
   assert.equal(api.getSnapshot(null, 'chat').workflows.old.isLatestTurn, false);
   assert.equal(api.getSnapshot(null, 'chat').workflows.new.isLatestTurn, true);
+});
+
+test('role controls independently configure both participants and host including same-engine same-model choices', async () => {
+  const { api, manager } = await templateSetup();
+  manager.sendRequest = async method => method === 'model/list' ? { data: [{ model: 'gpt-a', displayName: 'GPT A' }, { model: 'gpt-b', displayName: 'GPT B' }], nextCursor: null } : { engines: ['codex', 'claude'], bothAvailable: true, claudeModels: [{ value: 'claude-a' }, { value: 'claude-b' }] };
+  await api.refreshCapabilities(manager); await api.refreshCodexModels(manager);
+  const changes = [], props = { manager, hostId: 'local', selection: { id: 'debby', revision: 2, parameters: {} }, roleOverrides: {}, models: { codex: 'gpt-a', claude: 'claude-a' }, onChange: value => { changes.push(plain(value)); props.roleOverrides = value; } };
+  const view = ui(api, 'RoleControls', props);
+  assert.ok(find(view.render(), 'Participant A engine')); assert.ok(find(view.render(), 'Participant B engine')); assert.ok(find(view.render(), 'Host engine'));
+  find(view.render(), 'Participant B engine').props.onChange({ target: { value: 'codex' } });
+  find(view.render(), 'Participant A model').props.onChange({ target: { value: 'gpt-b' } });
+  find(view.render(), 'Participant B model').props.onChange({ target: { value: 'gpt-b' } });
+  find(view.render(), 'Host engine').props.onChange({ target: { value: 'codex' } });
+  find(view.render(), 'Host model').props.onChange({ target: { value: 'gpt-a' } });
+  find(view.render(), 'Host prompt').props.onBlur({ target: { value: 'Host a careful debate.' } });
+  assert.equal(changes.at(-1).participant_a.model, 'gpt-b');
+  assert.deepEqual(changes.at(-1).participant_b, { engine: 'codex', model: 'gpt-b' });
+  assert.deepEqual(changes.at(-1).host, { engine: 'codex', model: 'gpt-a', prompt: 'Host a careful debate.' });
+  assert.ok(find(view.render(), 'Participant B model').props.children.some(option => option.props.value === 'gpt-b'));
+  props.disabled = true;
+  for (const label of ['Participant A engine', 'Participant B model', 'Host prompt']) assert.equal(find(view.render(), label).props.disabled, true);
+});
+
+test('Polly worker and reviewer engines remain fixed while every role model and prompt is editable', async () => {
+  const { api, manager } = await templateSetup(), changes = [];
+  const view = ui(api, 'RoleControls', { manager, selection: { id: 'polly', revision: 1, parameters: {} }, roleOverrides: {}, models: {}, onChange: value => changes.push(value) });
+  assert.equal(find(view.render(), 'Planner engine').props.disabled, false);
+  assert.equal(find(view.render(), 'Summary engine').props.disabled, false);
+  for (const role of ['Codex worker', 'Claude worker', 'Codex reviewer', 'Claude reviewer']) {
+    assert.equal(find(view.render(), `${role} engine`).props.disabled, true);
+    assert.equal(find(view.render(), `${role} model`).props.disabled, false);
+    assert.equal(find(view.render(), `${role} prompt`).props.disabled, false);
+    find(view.render(), `${role} engine`).props.onChange({ target: { value: 'claude' } });
+  }
+  assert.equal(changes.length, 0);
+});
+
+test('new Debby exposes bounded discussion and a host mode enum while legacy saved revisions remain usable', async () => {
+  const { api, manager } = await templateSetup(), changes = [];
+  const props = { manager, selection: { id: 'debby', revision: 2, parameters: {} }, onChange: value => changes.push(value) };
+  const tree = ui(api, 'TemplateControls', props).render();
+  assert.equal(find(tree, 'Discussion rounds').props.value, 2);
+  const mode = find(tree, 'Host mode');
+  assert.equal(mode.type, 'select'); assert.equal(mode.props.value, 'per-round');
+  assert.deepEqual(plain(mode.props.children.map(node => node.props.value)), ['per-round', 'final-only']);
+  mode.props.onChange({ target: { value: 'final-only' } });
+  assert.equal(changes.at(-1).parameters.host_mode, 'final-only');
+  const legacy = ui(api, 'TemplateControls', { ...props, selection: { id: 'debby', revision: 1, parameters: { rounds: 0 } } }).render();
+  assert.equal(find(legacy, 'Workflow template').props.value, 'debby@1');
+});
+
+test('new template uses schema 2 hosted participants and editor persists per-role models', async () => {
+  const { validateTemplate } = await import('../../runtime/agent-modes/templates/schema.mjs');
+  const { api, manager, calls } = await templateSetup(), view = ui(api, 'TemplateManager', { manager });
+  button(view.render(), 'New dual template').props.onClick();
+  find(view.render(), 'Role participant_a model').props.onChange({ target: { value: 'gpt-a' } });
+  find(view.render(), 'Role participant_b engine').props.onChange({ target: { value: 'codex' } });
+  find(view.render(), 'Role participant_b model').props.onChange({ target: { value: 'gpt-a' } });
+  find(view.render(), 'Role host model').props.onChange({ target: { value: 'claude-b' } });
+  await button(view.render(), 'Save template').props.onClick();
+  const saved = calls.findLast(call => call.method === 'engine/templates/save').params.template;
+  assert.equal(saved.schemaVersion, 2);
+  assert.equal(saved.steps[0].type, 'hostedDebate');
+  assert.equal(saved.roles.participant_a.model, 'gpt-a');
+  assert.equal(saved.roles.participant_b.model, 'gpt-a');
+  assert.equal(saved.roles.host.model, 'claude-b');
+  assert.doesNotThrow(() => validateTemplate(saved));
+});
+
+test('role override wire validation rejects malformed models, engines and prompts', () => {
+  const { api } = setup();
+  for (const roleOverrides of [null, [], { host: { model: 'bad model' } }, { host: { engine: 'other' } }, { host: { prompt: ' ' } }, { host: { prompt: 'a'.repeat(100001) } }, { host: { unexpected: true } }]) {
+    assert.throws(() => api.requestFields({ ...selection(), roleOverrides }), /role|Role/);
+  }
 });

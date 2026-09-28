@@ -30,7 +30,7 @@ const APP_PATCHES = [
     'H=!P&&(0,H2.jsx)(`span`,{ref:S,children:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:F,permissionsCwdOverride:i,permissionsHostId:a})})'],
   ['manager response observation',
     'async sendRequest(e,t,n){return this.requestClient.sendRequest(e,t,n)}',
-    'async sendRequest(e,t,n){globalThis.__cdxEngineModes.registerManager(this);let __cdxEngineResponse=await this.requestClient.sendRequest(e,t,n);globalThis.__cdxEngineModes.observe(this,e,t,__cdxEngineResponse);return __cdxEngineResponse}'],
+    'async sendRequest(e,t,n){let __cdxEngineHost=this.getHostId();globalThis.__cdxEngineModes.registerManager(this,__cdxEngineHost);let __cdxEngineResponse=await this.requestClient.sendRequest(e,t,n);globalThis.__cdxEngineModes.observe(this,e,t,__cdxEngineResponse,__cdxEngineHost);return __cdxEngineResponse}'],
   ['scoped composer controls',
     'HV.FooterInlineControls,{ref:x,children:[V,H,r,U]}',
     'HV.FooterInlineControls,{ref:x,children:[V,(0,H2.jsx)(globalThis.__cdxEngineModes.Selector,{React:V2,jsx:H2,scope:u,threadId:f,hostId:a,cwd:i,getHost:(e,t)=>e.get(Rk,t),getManager:zg,useAtom:ss,busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H,bothNativeModelPicker:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:!1,permissionsCwdOverride:i,permissionsHostId:a})}),r,U]}'],
@@ -102,6 +102,7 @@ const APP_PATCHES = [
 // Earlier development previews used these exact replacements. Upgrade only
 // recognized output so patchAssets can safely reuse a previously patched copy.
 const PREVIEW_UPGRADES = [
+  ['manager response observation', 'async sendRequest(e,t,n){globalThis.__cdxEngineModes.registerManager(this);let __cdxEngineResponse=await this.requestClient.sendRequest(e,t,n);globalThis.__cdxEngineModes.observe(this,e,t,__cdxEngineResponse);return __cdxEngineResponse}'],
   ['scoped composer controls', 'HV.FooterInlineControls,{ref:x,children:[V,(0,H2.jsx)(globalThis.__cdxEngineModes.Selector,{React:V2,jsx:H2,scope:u,threadId:f,hostId:a,cwd:i,getHost:(e,t)=>e.get(Rk,t),getManager:zg,useAtom:ss,busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H}),r,U]}'],
   ['thread creation propagation', 'this.threadCreation.createConversation({clientUserMessageId:u,engineMode:e.engineMode,engineModel:e.engineModel,'],
   ['first turn override including prewarm', 'await this.executeTurnStart(B,{request:{threadId:B,clientUserMessageId:u,engineMode:e.engineMode,engineModel:e.engineModel,'],
