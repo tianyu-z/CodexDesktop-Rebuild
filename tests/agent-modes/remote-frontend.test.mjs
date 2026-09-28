@@ -109,7 +109,7 @@ test('complete paginated native Codex catalogs remain independent for each host'
   host = 'ssh:b'; await api.refreshCodexModels(manager, { hostId: host });
   assert.deepEqual(plain(api.getCodexModels(manager, { hostId: 'ssh:a' }).models.map(model => model.value)), ['a-first', 'a-second']);
   assert.deepEqual(plain(api.getCodexModels(manager, { hostId: 'ssh:b' }).models.map(model => model.value)), ['b-first', 'b-second']);
-  assert.ok(calls.every(call => call.method === 'model/list' && call.params.limit === 100));
+  assert.ok(calls.every(call => call.method === 'model/list' && call.params.limit === 100 && call.params.includeHidden === true));
 });
 
 test('delayed template catalogs and workflow reads retain host ownership', async () => {
@@ -166,4 +166,54 @@ test('remote composer busy atoms reject cached role edits until its runtime beco
   render(api, scope, manager, hostId, { useAtom: () => false });
   await api.changeSelection(context, { engineMode: 'both', roleOverrides: {} });
   assert.deepEqual(plain(api.capture(scope, hostId).roleOverrides), {});
+});
+
+test('submitting while a role save is pending cannot send old overrides and overwrite the save', async () => {
+  const { api, scope } = setup(), hostId = 'ssh:a'; let finish;
+  const manager = { getHostId: () => hostId, sendRequest: (_method, params) => new Promise(resolve => { finish = () => resolve({ ...params, models: params.engineModels }); }) };
+  api.observe(manager, 'engine/mode/set', { threadId: 'chat' }, { ...selected(), models: selected().engineModels });
+  const changed = { ...selected().roleOverrides, host: { prompt: 'NEW HOST', model: 'claude-new' } };
+  const saving = api.changeSelection({ scope, threadId: 'chat', hostId, manager }, { engineMode: 'both', roleOverrides: changed });
+  assert.equal(api.getSnapshot(scope, 'chat', hostId).pending, true);
+  assert.throws(() => api.turnRequestFields(manager, 'chat', {}, 'immediate', 'gpt-current'), /saving.*send again/i);
+  finish(); await saving;
+  assert.deepEqual(plain(api.turnRequestFields(manager, 'chat', {}, 'retry', 'gpt-current').roleOverrides), changed);
+});
+
+test('failed role saves never leak unacknowledged overrides into a later turn', async () => {
+  const { api, scope } = setup(), hostId = 'ssh:a'; let reject;
+  const manager = { getHostId: () => hostId, sendRequest: () => new Promise((_resolve, fail) => { reject = fail; }) };
+  api.observe(manager, 'engine/mode/set', { threadId: 'chat' }, { ...selected(), models: selected().engineModels });
+  const saving = api.changeSelection({ scope, threadId: 'chat', hostId, manager }, { engineMode: 'both', roleOverrides: { host: { prompt: 'Unsaved host prompt' } } });
+  const rejected = assert.rejects(saving, /Cannot save/);
+  assert.throws(() => api.turnRequestFields(manager, 'chat', selected(), 'immediate', 'gpt-current'), /saving.*send again/i);
+  reject(Error('Cannot save roles')); await rejected;
+  assert.deepEqual(plain(api.turnRequestFields(manager, 'chat', {}, 'later', 'gpt-current').roleOverrides), selected().roleOverrides);
+  assert.equal(api.getSnapshot(scope, 'chat', hostId).pending, false);
+  assert.match(api.getSnapshot(scope, 'chat', hostId).error, /Cannot save/);
+});
+
+test('native picker patch supplies the actual host auth, provider and availability policy to role selectors', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url), { patchNativePicker } = require('../../scripts/patch-agent-modes.js');
+  const fixture = readFileSync(new URL('./fixtures/native-model-picker.js', import.meta.url), 'utf8');
+  const patched = patchNativePicker(fixture), calls = []; let hooks;
+  const availabilityAtom = {}, configAtom = {}, config = { model_provider: 'custom' }, policy = { availableModels: new Set(['hidden-allowed']), useHiddenModels: true };
+  const context = {
+    __cdxEngineModes: { configureCodexAvailability: value => { hooks = value; } },
+    Vqa: availabilityAtom, RS: configAtom,
+    ss: (atom, hostId, options) => { calls.push({ atom, hostId, options }); return atom === availabilityAtom ? policy : { data: { config } }; },
+    LA: hostId => { assert.equal(hostId, 'ssh:target'); return { authMethod: 'chatgpt', isLoading: false }; },
+    cb: value => value, Afn: value => value.model_provider === 'custom', Wqa: value => value.model.model === 'allowed',
+  };
+  vm.runInNewContext(patched, context);
+  assert.ok(hooks, 'The native module must register its policy before role controls render');
+  const actual = hooks.usePolicy('ssh:target');
+  assert.equal(actual.availableModels, policy.availableModels);
+  assert.equal(actual.useHiddenModels, true); assert.equal(actual.authMethod, 'chatgpt'); assert.equal(actual.isCustomModelProvider, true);
+  assert.equal(calls.find(call => call.atom === configAtom).hostId, 'ssh:target');
+  assert.deepEqual(plain(calls.find(call => call.atom === configAtom).options), { enabled: false });
+  assert.equal(hooks.isAvailable({ model: { model: 'allowed' } }), true);
+  const previous = patched.slice(patched.indexOf('function fNc'));
+  assert.equal(patchNativePicker(previous), patched.slice(patched.indexOf('globalThis.__cdxEngineModes.configureCodexAvailability')));
 });

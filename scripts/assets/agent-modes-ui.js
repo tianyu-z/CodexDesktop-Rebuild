@@ -5,6 +5,7 @@
   const MODEL_CACHE_TTL = 60_000;
   const modelCatalogs = new WeakMap();
   const codexCatalogs = new WeakMap();
+  let codexAvailability = null;
   const disconnectedCodex = newCodexCatalog();
   const disconnectedCatalog = newCatalog();
   const drafts = new WeakMap();
@@ -57,13 +58,13 @@
     if (!contexts.has(contextKey)) contexts.set(contextKey, newCatalog());
     return contexts.get(contextKey);
   }
-  function normalizeModels(models) {
+  function normalizeModels(models, includeVisibility = false) {
     const result = [], seen = new Set();
     for (const raw of Array.isArray(models) ? models : []) {
       const model = typeof raw === 'string' ? { value: raw } : raw;
       if (!validModelId(model?.value) || seen.has(model.value)) continue;
       seen.add(model.value);
-      result.push({ value: model.value, displayName: displayText(model.displayName, 128) || model.value, description: displayText(model.description), ...(validModelId(model.resolvedModel) ? { resolvedModel: model.resolvedModel } : {}) });
+      result.push({ value: model.value, displayName: displayText(model.displayName, 128) || model.value, description: displayText(model.description), ...(includeVisibility ? { hidden: model.hidden === true } : {}), ...(validModelId(model.resolvedModel) ? { resolvedModel: model.resolvedModel } : {}) });
     }
     return result;
   }
@@ -112,7 +113,7 @@
       try {
         const models = [], seen = new Set(); let cursor;
         do {
-          const response = await manager.sendRequest('model/list', { limit: 100, ...(cursor ? { cursor } : {}) });
+          const response = await manager.sendRequest('model/list', { includeHidden: true, limit: 100, ...(cursor ? { cursor } : {}) });
           if (row.revision !== revision) return row.snapshot;
           if (!Array.isArray(response?.data)) throw Error('Invalid Codex model catalog');
           models.push(...response.data.map(model => ({ ...model, value: model.model ?? model.id })));
@@ -120,7 +121,7 @@
           if (cursor && (typeof cursor !== 'string' || seen.has(cursor))) throw Error('Codex model pagination repeated its cursor');
           if (cursor) seen.add(cursor);
         } while (cursor);
-        update(row, { models: normalizeModels(models), error: null, loadedAt: Date.now() });
+        update(row, { models: normalizeModels(models, true), error: null, loadedAt: Date.now() });
       } catch (error) { if (row.revision === revision) update(row, { error: displayText(error?.message ?? String(error)), loadedAt: Date.now() }); }
       finally { if (row.revision === revision) { row.promise = null; update(row, { loading: false }); } }
       return row.snapshot;
@@ -205,6 +206,7 @@
   function turnRequestFields(manager, threadId, options, clientUserMessageId, nativeModel) {
     const hostId = managerHost(manager);
     const row = threads.get(key(threadId, hostId));
+    if (row?.snapshot.pending) throw Error('Chat engine or roles are still saving. Wait for the save to finish, then send again.');
     const selected = options?.engineMode != null ? options : row?.creationIntent ?? (row?.snapshot.engineMode === 'both' ? { engineMode: 'both', engineModels: row.snapshot.models, template: row.snapshot.template, roleOverrides: row.snapshot.roleOverrides } : options);
     const fields = requestFields(selected);
     if (fields.engineMode === 'both' && nativeModel !== undefined) {
@@ -461,6 +463,8 @@
     const catalog = useRecord(React, templateRecord(manager, hostId));
     const claude = useRecord(React, catalogRecord(manager, { hostId, threadId, cwd }));
     const codex = useRecord(React, codexCatalogRecord(manager, { hostId, threadId, cwd }));
+    // These hooks are registered once by the native module before React mounts.
+    const codexPolicy = codexAvailability?.usePolicy(hostId);
     const [error, setError] = React.useState(null);
     React.useEffect(() => {
       refreshTemplates(manager, hostId).then(() => readTemplate(manager, hostId, selection));
@@ -483,13 +487,13 @@
       const override = roleOverrides[id] ?? {}, engine = override.engine ?? role.engine, name = roleLabel(id);
       const effectiveModel = Object.hasOwn(override, 'model') ? override.model : Object.hasOwn(role, 'model') ? role.model : models[engine];
       const effectivePrompt = override.prompt ?? role.prompt;
-      const available = engine === 'claude' ? modelOptions(claude, effectiveModel).filter(model => model.value !== 'default') : [...codex.models];
+      const available = engine === 'claude' ? modelOptions(claude, effectiveModel).filter(model => model.value !== 'default') : codex.models.filter(model => codexAvailability && codexPolicy ? codexAvailability.isAvailable({ ...codexPolicy, additionalAvailableModels: new Set([effectiveModel]), model: { ...model, model: model.value } }) : !model.hidden && model.value !== 'codex-auto-review');
       if (validModelId(effectiveModel) && !available.some(model => model.value === effectiveModel)) available.push({ value: effectiveModel, displayName: 'Saved model' });
       return jsx.jsxs('fieldset', { style: { border: '1px solid #8884', borderRadius: 6, padding: 6, minWidth: 0 }, children: [
         jsx.jsx('legend', { children: name }),
         jsx.jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 }, children: [
           jsx.jsx('select', { 'aria-label': `${name} engine`, value: engine, disabled: disabled || fixed.has(id), title: fixed.has(id) ? 'This workflow requires this engine for its worker/reviewer topology.' : 'Engine for this role', style: selectStyle, onChange: event => change(id, 'engine', event.target.value), children: ['codex', 'claude'].map(value => jsx.jsx('option', { value, children: value === 'codex' ? 'Codex' : 'Claude Code' }, value)) }),
-          jsx.jsx('select', { 'aria-label': `${name} model`, value: Object.hasOwn(override, 'model') ? override.model ?? '' : '__inherit__', disabled, style: { ...selectStyle, maxWidth: 240 }, onFocus: () => engine === 'codex' ? refreshCodexModels(manager, { hostId, threadId, cwd }) : refreshCapabilities(manager, { hostId, threadId, cwd }), onChange: event => change(id, 'model', event.target.value === '__inherit__' ? undefined : event.target.value || null), children: [
+          jsx.jsx('select', { 'aria-label': `${name} model`, value: Object.hasOwn(override, 'model') ? override.model ?? '' : '__inherit__', disabled: disabled || (engine === 'codex' && codexPolicy?.loading === true), style: { ...selectStyle, maxWidth: 240 }, onFocus: () => engine === 'codex' ? refreshCodexModels(manager, { hostId, threadId, cwd }) : refreshCapabilities(manager, { hostId, threadId, cwd }), onChange: event => change(id, 'model', event.target.value === '__inherit__' ? undefined : event.target.value || null), children: [
             jsx.jsx('option', { value: '__inherit__', children: `Use template/default · ${Object.hasOwn(role, 'model') ? role.model ?? 'engine default' : models[engine] ?? 'engine default'}` }),
             jsx.jsx('option', { value: '', children: `${engine === 'codex' ? 'Codex' : 'Claude'} default` }),
             ...available.map(model => jsx.jsx('option', { value: model.value, title: modelTitle(model), children: modelLabel(model) }, model.value)),
@@ -690,6 +694,7 @@
     Selector, SourceBadge, TemplateControls, TemplateManager, RoleControls, refreshTemplates, refreshRuns, capture, requestFields, turnRequestFields, registerManager, noteStarted, observe,
     permitsNativeMetadata, permitsNativeModelSelection, sourceFor, setDraftSelection, changeSelection, refreshThread, refreshCapabilities,
     getCapabilities: (manager, context) => catalogRecord(manager, context).snapshot,
+    configureCodexAvailability: hooks => { codexAvailability = hooks; },
     refreshCodexModels, getCodexModels: (manager, context) => codexCatalogRecord(manager, context).snapshot,
     getSnapshot: (scope, threadId, hostId) => record(scope, threadId, hostId).snapshot,
   };

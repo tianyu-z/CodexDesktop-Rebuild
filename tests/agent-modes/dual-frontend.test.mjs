@@ -606,3 +606,30 @@ test('role override wire validation rejects malformed models, engines and prompt
     assert.throws(() => api.requestFields({ ...selection(), roleOverrides }), /role|Role/);
   }
 });
+
+test('role Codex options follow native hidden-model, provider and saved-selection availability', async () => {
+  const { api, manager } = await templateSetup();
+  const rawModels = [
+    { model: 'public', hidden: false }, { model: 'hidden-allowed', hidden: true },
+    { model: 'hidden-denied', hidden: true }, { model: 'hidden-saved', hidden: true },
+    { model: 'codex-auto-review', hidden: false },
+  ];
+  const requests = [];
+  manager.sendRequest = async (_method, params) => { requests.push(params); return { data: rawModels.filter(model => params.includeHidden || !model.hidden), nextCursor: null }; };
+  await api.refreshCodexModels(manager);
+  let policy = { authMethod: 'chatgpt', availableModels: new Set(['public', 'hidden-allowed']), useHiddenModels: true, isCustomModelProvider: false };
+  // Pinned native Wqa predicate: the renderer calls this rule with native policy.
+  const isAvailable = ({ additionalAvailableModels, authMethod, availableModels, isCustomModelProvider, model, useHiddenModels }) => additionalAvailableModels?.has(model.model) === true || model.model !== 'codex-auto-review' && (useHiddenModels && !isCustomModelProvider && authMethod !== 'amazonBedrock' ? availableModels.has(model.model) : !model.hidden);
+  api.configureCodexAvailability({ usePolicy: hostId => { assert.equal(hostId, 'local'); return policy; }, isAvailable });
+  const view = ui(api, 'RoleControls', { manager, hostId: 'local', selection: { id: 'debby', revision: 2, parameters: {} }, roleOverrides: { participant_a: { model: 'hidden-saved' }, participant_b: { engine: 'codex' } }, models: { codex: 'public' }, onChange: () => {} });
+  const options = label => plain(find(view.render(), label).props.children.map(option => option.props.value).filter(value => value && value !== '__inherit__'));
+  assert.deepEqual(options('Participant A model'), ['public', 'hidden-allowed', 'hidden-saved']);
+  assert.deepEqual(options('Participant B model'), ['public', 'hidden-allowed']);
+  policy = { ...policy, isCustomModelProvider: true };
+  assert.deepEqual(options('Participant B model'), ['public']);
+  policy = { ...policy, isCustomModelProvider: false, authMethod: 'amazonBedrock' };
+  assert.deepEqual(options('Participant B model'), ['public']);
+  policy = { ...policy, authMethod: 'chatgpt', useHiddenModels: false };
+  assert.deepEqual(options('Participant B model'), ['public']);
+  assert.equal(requests[0].includeHidden, true);
+});

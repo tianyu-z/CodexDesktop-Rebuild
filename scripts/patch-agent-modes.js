@@ -116,7 +116,7 @@ const PREVIEW_UPGRADES = [
 const NATIVE_PICKER_PATCHES = [
   ['native picker guard context',
     'function fNc(e){let t=(0,_Nc.c)(167),',
-    'function fNc(e){let __cdxPickerProps=e;let t=(0,_Nc.c)(167),'],
+    'globalThis.__cdxEngineModes.configureCodexAvailability({usePolicy:__cdxHost=>{let __cdxAvailability=ss(Vqa),__cdxAuth=LA(__cdxHost),{data:__cdxConfig}=ss(RS,__cdxHost,{enabled:!1});return{...__cdxAvailability,authMethod:__cdxAuth?.authMethod,isCustomModelProvider:Afn(__cdxConfig==null?null:cb(__cdxConfig.config)),loading:__cdxAuth?.isLoading===!0}},isAvailable:__cdxOptions=>Wqa(__cdxOptions)});function fNc(e){let __cdxPickerProps=e;let t=(0,_Nc.c)(167),'],
   ['native model selection guard',
     'Ie=function(e,t){return(w?.selectModelAndReasoningEffort??x)',
     'Ie=function(e,t){if(!globalThis.__cdxEngineModes.permitsNativeModelSelection(__cdxPickerProps))return;return(w?.selectModelAndReasoningEffort??x)'],
@@ -140,6 +140,10 @@ const NATIVE_PICKER_PATCHES = [
     '_$(`composer.cycleReasoningEffort`,Ye,{...Xe,enabled:Xe.enabled&&globalThis.__cdxEngineModes.permitsNativeModelSelection(__cdxPickerProps)})'],
 ];
 function patchNativePicker(source) {
+  const previous = 'function fNc(e){let __cdxPickerProps=e;let t=(0,_Nc.c)(167),', current = NATIVE_PICKER_PATCHES[0][2];
+  const previousCount = occurrences(source, previous), currentCount = occurrences(source, current);
+  if (previousCount > 1 || currentCount > 1) throw new Error('agent-modes: expected one native picker availability registration');
+  if (previousCount === 1 && currentCount === 0) source = source.replace(previous, () => current);
   for (const [name, before, after] of NATIVE_PICKER_PATCHES) source = replaceExactOnce(source, before, after, name);
   return source;
 }
