@@ -3,9 +3,9 @@ import { CodexRole } from './codex-role.mjs';
 
 /** Each role owns a native harness run; credentials and model slots stay local. */
 export class RoleRunner {
-  constructor({ claudeAdapter = new ClaudeAdapter(), codexCommand, nativeClientFactory } = {}) {
+  constructor({ claudeAdapter = new ClaudeAdapter(), codexCommand, codexArgs, nativeClientFactory } = {}) {
     this.claudeAdapter = claudeAdapter;
-    this.codexRole = new CodexRole({ codexCommand, nativeClientFactory });
+    this.codexRole = new CodexRole({ codexCommand, codexArgs, nativeClientFactory });
   }
 
   start(options) {

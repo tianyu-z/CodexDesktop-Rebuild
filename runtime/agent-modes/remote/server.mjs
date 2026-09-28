@@ -4,14 +4,22 @@ import { dirname } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 
 /** One durable engine owner, independent of the transient desktop connection. */
-export async function startRemoteServer({ socketPath, runtimeFactory, version = 'development', maxPayload = 16 * 1024 * 1024, maxInFlight = 64 }) {
+export async function startRemoteServer({ socketPath, runtimeFactory, version = 'development', maxPayload = 16 * 1024 * 1024, maxInFlight = 64, closeLock }) {
+  const busy = () => (runtime.isBusy?.() ?? false) || inFlight > 0 || controls > 0 || pending.size > 0 || !!initialization && !initialization.ready;
   const http = createServer((request, response) => {
-    if (request.url === '/health') { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify({ ok: true, version })); return; }
+    response.setHeader('Content-Type', 'application/json');
+    if (request.url === '/health') { response.end(JSON.stringify({ ok: true, version, protocolVersion: 1, busy: busy(), stopping: shutdownRequested })); return; }
+    if (request.method === 'POST' && ['/shutdown', '/shutdown?force=1'].includes(request.url)) {
+      if (request.url !== '/shutdown?force=1' && busy()) { response.writeHead(409); response.end(JSON.stringify({ error: 'Remote gateway has active work. Finish or interrupt it before upgrading.' })); return; }
+      shutdownRequested = true;
+      response.end(JSON.stringify({ stopping: true }));
+      setImmediate(() => { void close(); }); return;
+    }
     response.writeHead(404); response.end();
   });
   const sockets = new WebSocketServer({ noServer: true, maxPayload, perMessageDeflate: false });
   const pending = new Map(), tasks = new Set();
-  let controller, initialization, initialized = false, closing, inFlight = 0, controls = 0;
+  let controller, initialization, initialized = false, closing, inFlight = 0, controls = 0, shutdownRequested = false;
   const send = (ws, message) => {
     if (ws?.readyState !== WebSocket.OPEN) return;
     // History is persisted by the router; slow clients reconnect and read it.
@@ -45,8 +53,15 @@ export async function startRemoteServer({ socketPath, runtimeFactory, version = 
     Promise.resolve().then(() => runtime.request('initialize', params)).then(
       result => finishInitialization(state, result), error => finishInitialization(state, null, error));
   }
+  function activatePeer(peer) {
+    if (!peer.initialized) throw Error('Initialization did not finish.');
+    if (peer.ready) return;
+    if (!initialized) { runtime.notify({ method: 'initialized' }); initialized = true; }
+    peer.ready = true;
+    for (const approval of pending.values()) send(peer.ws, approval);
+  }
   http.on('upgrade', (request, socket, head) => {
-    if (closing || request.url !== '/rpc') { socket.destroy(); return; }
+    if (closing || shutdownRequested || request.url !== '/rpc') { socket.destroy(); return; }
     sockets.handleUpgrade(request, socket, head, ws => sockets.emit('connection', ws));
   });
   sockets.on('connection', ws => {
@@ -62,6 +77,7 @@ export async function startRemoteServer({ socketPath, runtimeFactory, version = 
         if (!message || typeof message !== 'object' || Array.isArray(message)) return;
         const respond = result => send(ws, { id: message.id, result });
         try {
+          if (shutdownRequested) throw Error('Remote gateway is stopping.');
           if (message.method === 'initialize') {
             if (peer.claimed) throw Error('This controller has already requested initialization.');
             if (controller && controller !== peer && controller.ws.readyState === WebSocket.OPEN) throw Error('Another desktop controller is connected to this gateway.');
@@ -75,17 +91,17 @@ export async function startRemoteServer({ socketPath, runtimeFactory, version = 
           }
           if (controller !== peer || !peer.claimed) throw Error('Initialize this controller before making engine requests.');
           if (message.method === 'initialized') {
-            if (!peer.initialized) throw Error('Initialization did not finish.');
-            if (!initialized) { initialized = true; runtime.notify({ method: 'initialized' }); }
-            peer.ready = true;
-            for (const approval of pending.values()) send(ws, approval);
+            activatePeer(peer);
             return;
           }
           if (message.method == null) {
             if (pending.has(message.id) && runtime.respond(message)) pending.delete(message.id);
             return;
           }
-          if (!peer.ready) throw Error('Send initialized before making engine requests.');
+          // The pinned desktop sends getAuthStatus immediately after initialize
+          // and omits initialized. Its first subsequent RPC confirms readiness;
+          // explicit initialized clients keep the same approval replay behavior.
+          if (!peer.ready) activatePeer(peer);
           if (message.id == null) { runtime.notify(message); return; }
           const control = ['turn/interrupt', 'engine/runs/interrupt'].includes(message.method);
           if (control ? controls >= 16 : inFlight >= maxInFlight) throw Error('Too many in-flight engine requests. Retry after a request finishes.');
@@ -111,7 +127,10 @@ export async function startRemoteServer({ socketPath, runtimeFactory, version = 
   heartbeat.unref();
   async function close() {
     if (closing) return closing;
+    shutdownRequested = true;
     closing = (async () => {
+      const release = await closeLock?.();
+      try {
       clearInterval(heartbeat);
       for (const ws of sockets.clients) ws.terminate();
       await runtime.close();
@@ -119,6 +138,7 @@ export async function startRemoteServer({ socketPath, runtimeFactory, version = 
       await new Promise(resolve => sockets.close(resolve));
       await new Promise(resolve => http.close(resolve));
       try { await unlink(socketPath); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      } finally { await release?.(); }
     })();
     return closing;
   }

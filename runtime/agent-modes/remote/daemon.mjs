@@ -11,6 +11,7 @@ import { createEngineRuntime } from '../runtime.mjs';
 import { startRemoteServer } from './server.mjs';
 import { remoteClaudeEnvironment } from './environment.mjs';
 import { acquireStartupLock } from './startup-lock.mjs';
+import { resolveRemoteSandboxArgs } from './sandbox.mjs';
 
 const scope = process.env.CDX_REMOTE_SCOPE ?? 'chatgpt-dev';
 if (!/^[a-z0-9-]{1,100}$/.test(scope)) throw Error('Invalid remote engine scope.');
@@ -24,21 +25,38 @@ function prepareDirectory() {
   const info = lstatSync(socketDirectory);
   if (!info.isDirectory() || info.isSymbolicLink() || info.mode & 0o077 || (process.getuid && info.uid !== process.getuid())) throw Error('Remote engine socket directory is not private.');
 }
-function health() {
+function controlRequest(path = '/health', method = 'GET') {
   return new Promise((resolve, reject) => {
-    const req = request({ socketPath, path: '/health', timeout: 1500 }, res => {
+    const req = request({ socketPath, path, method, timeout: 1500 }, res => {
       let body = ''; res.setEncoding('utf8'); res.on('data', part => { body += part; if (body.length > 4096) req.destroy(); });
-      res.on('end', () => { try { resolve(JSON.parse(body)); } catch { reject(Error('Invalid gateway health response.')); } });
+      res.on('end', () => { try { const result = JSON.parse(body); if (res.statusCode >= 400) reject(Error(result.error ?? 'Gateway control request failed.')); else resolve(result); } catch { reject(Error('Invalid gateway control response.')); } });
     });
     req.on('timeout', () => req.destroy(Error('Remote gateway health check timed out.'))); req.on('error', reject); req.end();
   });
+}
+const health = () => controlRequest();
+async function waitForStop() {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try { await health(); } catch (error) { if (['ENOENT', 'ECONNREFUSED'].includes(error.code)) return; throw error; }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw Error('Remote gateway is still stopping. Retry after its active operations finish.');
+}
+async function stop(force = false) {
+  try { await controlRequest(force ? '/shutdown?force=1' : '/shutdown', 'POST'); }
+  catch (error) { if (['ENOENT', 'ECONNREFUSED'].includes(error.code)) return; throw error; }
+  await waitForStop();
 }
 async function ensure() {
   prepareDirectory();
   try {
     const status = await health();
-    if (status.version !== version) throw Error('A different remote gateway version is running. Finish its tasks and restart that gateway before upgrading.');
-    return status;
+    if (status.stopping) await waitForStop();
+    else if (status.version !== version) {
+      if (status.protocolVersion !== 1) throw Error('The old remote gateway requires a scoped restart before upgrading.');
+      if (status.busy) throw Error('Remote gateway has active work. Finish or interrupt it before upgrading.');
+      await stop();
+    } else return status;
   } catch (error) {
     if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error;
   }
@@ -61,6 +79,7 @@ async function ensure() {
 async function main() {
   const action = process.argv[2];
   if (action === 'ensure') { console.log(JSON.stringify(await ensure())); return; }
+  if (action === 'stop') { prepareDirectory(); await stop(true); return; }
   if (action === 'proxy') {
     const socket = createConnection(socketPath);
     socket.on('error', () => { console.error('Remote engine gateway connection failed.'); process.exitCode = 1; process.stdin.destroy(); });
@@ -83,8 +102,9 @@ async function main() {
     }
   const command = process.env.CDX_REAL_CODEX;
   if (!command || !process.env.CDX_CLAUDE_PATH) throw Error('Remote Codex and Claude executables must be configured.');
-  server = await startRemoteServer({ socketPath, version,
-    runtimeFactory: ({ emit, onExit }) => createEngineRuntime({ command, args: ['-c', 'features.code_mode_host=true', 'app-server'],
+  const sandboxArgs = await resolveRemoteSandboxArgs({ command });
+  server = await startRemoteServer({ socketPath, version, closeLock: () => acquireStartupLock(join(socketDirectory, 'startup.lock')),
+    runtimeFactory: ({ emit, onExit }) => createEngineRuntime({ command, args: [...sandboxArgs, '-c', 'features.code_mode_host=true', 'app-server'], codexRoleArgs: [...sandboxArgs, 'app-server'],
       directory, emit, onExit, remote: true, claudePath: process.env.CDX_CLAUDE_PATH, environment: remoteClaudeEnvironment }) });
   } finally { await release(); }
   let closing;

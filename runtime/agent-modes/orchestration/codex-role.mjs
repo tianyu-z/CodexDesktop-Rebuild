@@ -7,8 +7,9 @@ const interruptedError = () => new Error('Native Codex role was interrupted.');
 
 /** One original App Server process per role, with native persisted thread resume. */
 export class CodexRole {
-  constructor({ codexCommand = '/Applications/chatgpt-dev.app/Contents/Resources/codex', nativeClientFactory = options => new NativeClient(options) } = {}) {
+  constructor({ codexCommand = '/Applications/chatgpt-dev.app/Contents/Resources/codex', codexArgs = ['app-server'], nativeClientFactory = options => new NativeClient(options) } = {}) {
     this.command = codexCommand;
+    this.args = [...codexArgs];
     this.clientFactory = nativeClientFactory;
   }
 
@@ -77,7 +78,7 @@ export class CodexRole {
         alive();
         if (typeof options.prompt !== 'string' || typeof options.cwd !== 'string' || !isAbsolute(options.cwd)) throw new TypeError('Native Codex requires a prompt and absolute working directory.');
         if (options.model != null && (typeof options.model !== 'string' || !options.model || /[\0\r\n]/.test(options.model))) throw new TypeError('Invalid native Codex model identifier.');
-        client = this.clientFactory({ command: this.command, args: ['app-server'], env: process.env, onNotification, onRequest: message => { void onRequest(message); }, onExit: (code, signal) => exit.resolve(new Error(`Native Codex exited (${signal ?? code}).`)) });
+        client = this.clientFactory({ command: this.command, args: [...this.args], env: process.env, onNotification, onRequest: message => { void onRequest(message); }, onExit: (code, signal) => exit.resolve(new Error(`Native Codex exited (${signal ?? code}).`)) });
         await request('initialize', { clientInfo: { name: 'codex_role_runner', version: '1.0.0' }, capabilities: { experimentalApi: true } });
         alive(); client.notify({ method: 'initialized', params: {} });
         const config = options.access === 'read' ? (await request('config/read', { cwd: options.cwd, includeLayers: true })).config : undefined;
