@@ -150,7 +150,11 @@ CDX_LIVE_DUAL=1 node tests/agent-modes/live-dual.mjs polly
 
 真实网关子进程还验证了五组异常流程：单侧无效模型、单角色停止/重试、整个回合停止/重启/重试、尚无角色时的继续，以及两种引擎的权限允许/拒绝/待审批取消。已归档 23 个拥有的测试 Codex 会话，无清理错误。证据见 `.artifacts/live-dual-debby-evidence.json`、`.artifacts/live-dual-custom-evidence.json`、`.artifacts/live-polly-verified.json` 与 `.artifacts/live-dual-resilience-summary.json`。
 
-最终源码自动化测试 **379/379 通过**，各模块规格及代码质量复查通过。独立预览包已经完成打包和严格签名校验。Mac 锁屏阻止了原生界面验收，已请求用户解锁；双引擎版本尚未替换已安装的 App。
+最终 GUI 验收已验证独立模型选择、30 个 Claude 选项、Debby 讨论轮数、内置模板只读、新建/复制模板、字段错误、YAML 导入导出和高级 JSON 修订保存。真实界面完成 Debby、由 Codex 汇总的自定义模板，以及 Polly 的两文件协作开发、交叉审查、集成检查、最终审查和写回；精确文件内容和保留文件另由脚本核对。整轮停止、单角色停止、保留成功结果、原回合重试、权限审批和重启后恢复模型/模板/角色结果也已验证。GUI Polly 曾拒绝一个违规规划并保留失败尝试，明确限定两项实现任务的新回合完成全部 8 个角色。证据见 `.artifacts/dual-gui-acceptance.json` 与 `.artifacts/dual-gui-runs.json`。
+
+GUI 发现并修复了两个集成缺口：原生回合归一化后，首个子角色的标签掩盖双引擎来源；共享侧栏缓存绕过网关过滤，显示内部子会话。前者在重启预览后复验通过；后者通过真实 SQLite 缓存读取、精确上游补丁校验及独立复查，但最终新版侧栏的原生界面复验因 Mac 再次锁屏仍待完成。过滤仅依据拥有的内部 ID，不删除共享目录记录或归档可复用会话，搜索结果也保留正确分页。
+
+最终全量检查运行了 **387 项**：386 项通过，一项真实 Git 工作区测试超过旧的约 7 秒等待限制。该用例单独重现超时后，将测试等待改为有上限的单调时钟 60 秒，原功能断言未改，复测在 10.04 秒通过。源码修改和测试修正均经独立复查。记录见 `.artifacts/dual-release-final-tests.log`、`.artifacts/dual-polly-rerun.log` 和 `.artifacts/dual-sidebar-fix-tests.log`。
 
 ## 安装与回退
 
@@ -166,7 +170,11 @@ CDX_LIVE_DUAL=1 node tests/agent-modes/live-dual.mjs polly
 
 回退时先退出 `chatgpt-dev`，将当前应用移到另一个保留位置，再把记录中的原应用备份复制回 `/Applications/chatgpt-dev.app`。保留 `engine-conversations` 数据目录；回退后原版界面不会显示 Claude 的附加历史，再次安装补丁后可恢复。回退不要求删除或改写原生 Codex 历史。
 
-源代码在 `codex/claude-code-modes` 分支，原有模型选择定制单独保存在基线提交中。上述安装记录对应此前的单引擎切换版本；双引擎版本的真实 Polly、界面及安装验收仍在进行，不能仅据源码能力推断当前已安装包的功能。
+双引擎版本已于 **2026-09-28 02:23 UTC** 安装到 `/Applications/chatgpt-dev.app`，代码修订 `e1e2bbb`。ASAR SHA-256 为 `0936257bf5884cb87cc8fb17884dbbc10f3b742dc23873a9f7be11695f474279`；28 个运行时文件、两处渲染器入口、界面及侧栏辅助脚本、ASAR 头校验与严格签名均与验证候选包一致。记录见 `.artifacts/dual-install-manifest.json` 和 `.artifacts/dual-installed-verification.json`。
+
+替换前的程序和配套 `engine-conversations` 数据保存在 `/Users/tianyu.zhang/.codex/backups/agent-modes/dual-2026-09-28T02-08-06Z/`，安装时另存一份数据快照。当前开发对话由正式 App 的旧进程承载，因此替换的是磁盘上的程序包，没有终止正在使用的 App 或网关；**重启 App 后新版本才生效**。锁屏期间无法完成正式 App 重启和最终侧栏界面复验。回退时应同时使用这次备份中的旧程序与对应附加数据；原生 Codex 历史不变。
+
+源代码在 `codex/claude-code-modes` 分支。先前单引擎版本已按要求推送；双引擎改动目前保留在本地，未另行推送。
 
 ## 远程验证进展
 
