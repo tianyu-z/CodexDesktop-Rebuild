@@ -1,0 +1,27 @@
+# Cluster workflows and independently configured roles
+
+Date: 2026-09-28. Authorized by the user's request to support every cluster, a custom host, and same-engine debate. Extends the previously approved remote transport and dual template designs.
+
+## Result
+The selected project host owns all execution and files. Only Codex, Only Claude and collaborative workflows work locally and on SSH hosts with both engines. Debate has two independent participants and an independent host, each configurable with engine, model and prompt. Equal engine/model choices still have distinct native sessions. Default host behavior is per-round guidance with early convergence; final-only synthesis remains selectable. No single chat spans multiple hosts.
+
+## Architecture
+Reuse the engine router, official Claude SDK and Codex app-server harness. The desktop SSH transport installs a content-addressed runtime in a private user directory on the remote host. A detached remote gateway serves a private Unix socket using WebSocket JSON RPC; SSH only transports control/output. Preserve original binaries, provider configuration and native server. The new gateway owns its own native stdio app-server and store. It must never run broad pkill or silently fall back to local execution. Platform-neutral JS dependencies are packaged; remote Node and installed Claude/Codex are discovered from login PATH or existing VS Code Server Node installations.
+
+Connections initialize independently while the remote engine router persists. Disconnect does not cancel active work. Pending native, workflow and Claude approvals retain their IDs; reinitialize/subscribe replays unresolved requests and persisted history restores output. Limit notification buffering and avoid retaining deltas indefinitely. A second controller must not claim an outstanding approval from another active connection. Gateway restart marks unfinished workflow roles interrupted through existing store recovery, never repeats tools automatically.
+
+Provider resolution uses remote explicit Claude configuration first. Only the known Foundry same-origin /openai/v1 to /anthropic mapping may derive the connection from remote Codex configuration; read static/env headers and auth only inside that host, refresh on each run. Preserve credential secrecy in logs and artifacts. No Mac API proxy.
+
+## Role contract
+Keep engineModels as engine-wide defaults for backward compatibility. Add roleOverrides: a map of template role ID to { engine?, model?, prompt? }. Only existing role IDs and these keys are accepted; model is null or a valid model identifier; prompts are bounded nonempty strings. Store selection and round snapshots durably. Resolve overrides into a validated effective template before execution, with model precedence override > template role.model > engine default. Access/session/graph cannot be changed through composer overrides. Unknown roles rejected. Changing a role engine/model/prompt changes its binding identity; retries use their frozen original config.
+
+Templates allow optional role.model and same-engine graphs; no mandatory reachable distinct-engine count. Existing schema version 1 templates remain readable. Extensions use schema version 2 when saved, with old built-in revisions retained for historical reads. Debby exposes participant_a, participant_b, host in the new revision (or equivalent stable IDs with explicit user labels). Existing histories retain their labels. Polly planner and summary also support role configuration; worker/reviewer engine topology stays validated.
+
+Hosted debate runs independent initial answers, host assessment, bounded critique rounds with host guidance, then host final synthesis. Host decisions use validated structured output { continue: boolean, guidance: string }; invalid/missing decisions block visibly and permit retry, never imply agreement. Final synthesis uses all completed source artifacts. Final-only mode preserves fixed rounds and summary behavior. Default rounds can remain conservative; maximum cannot exceed configured limits.
+
+## UI
+Keep Only Codex and Only Claude behavior. Collaborative mode gains a readable collaboration label (not claiming both engines are mandatory), per-role engine/model selectors and prompt editing. Model catalogs come from the selected remote gateway, with full Claude catalog and native Codex model/list pagination. No hardcoded family-only catalog. Selection, drafts, templates, capabilities, sources, workflow actions and metadata guards are host-scoped. Remote controls enable only after successful gateway capability handshake; show actionable connection failure.
+
+## Validation and delivery
+Tests first for role resolution, same-engine session isolation, host convergence/retry, frozen model selection, backward compatibility, remote initialization/approval reconnection and host-scoped UI. Native cluster acceptance: rno, bar, ala, blc, blc-2, sko, plus other reachable configured aliases; no claim for unreachable hosts. Run real multi-role workflows and file reads on every reachable primary cluster; full rno App checks include selection, Codex-to-Claude context, allow/deny/cancel, reconnect and restart. Test same-engine different-model and same-model debate. Local regression suite, patch exact seams/idempotence, preview GUI and bundle signature before installation. Never terminate the currently hosting App/gateway. Publish only if subsequently requested; the previous push scope is already fulfilled.
+
