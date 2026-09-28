@@ -84,6 +84,8 @@ class WorkflowExecution {
       const saved = this.state.bindings[key];
       this.state.bindings[key] = { ...saved, ...clone(value), consumedSeq: Math.max(saved?.consumedSeq ?? 0, value.consumedSeq ?? 0) };
     }
+    if (previous && data.template.schemaVersion === 1 && !Object.hasOwn(data, 'roleOverrides') &&
+      Object.values(data.template.roles).every(role => !Object.hasOwn(role, 'model'))) this.migrateLegacyBindings();
     this.seq = this.state.events.reduce((max, event) => Math.max(max, event.seq ?? 0), 0);
     for (const run of this.state.runs) {
       if (!settled.has(run.status)) run.status = 'interrupted';
@@ -103,6 +105,22 @@ class WorkflowExecution {
     else if (supplied.resume === true) this.activation.resolve();
     // The returned handle is available to stop before native scheduling starts.
     void Promise.resolve().then(() => this.execute());
+  }
+
+  migrateLegacyBindings() {
+    // Only an original v1 recovery config proves what the old unconfigured
+    // key meant. A new turn cannot infer that identity from a binding alone.
+    // Copy before the first snapshot upgrades config, since saved invocation
+    // prompts may already exclude history held only by this native session.
+    for (const descriptor of Object.values(this.state.invocations)) {
+      const role = this.options.template.roles[descriptor.roleId];
+      if (role?.session !== 'reuse' || role.engine !== descriptor.engine || role.model !== (descriptor.requestedModel ?? null)) continue;
+      const scope = createHash('sha256').update(JSON.stringify([descriptor.cwd, descriptor.purpose ?? 'default'])).digest('hex');
+      const legacyKey = `${this.options.template.id}@${this.options.template.revision ?? 1}/${descriptor.roleId}/${scope}`;
+      const legacy = this.state.bindings[legacyKey];
+      const key = roleBindingKey({ template: this.options.template, ...descriptor });
+      if (legacy?.engine === role.engine && !Object.hasOwn(this.state.bindings, key)) this.state.bindings[key] = clone(legacy);
+    }
   }
 
   latestRuns() { const runs = new Map(); for (const run of this.state.runs) if ((runs.get(roleKey(run))?.attempt ?? 0) < run.attempt) runs.set(roleKey(run), run); return [...runs.values()]; }

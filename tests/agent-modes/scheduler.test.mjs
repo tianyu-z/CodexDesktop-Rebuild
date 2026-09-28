@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { WorkflowScheduler, roleBindingKey as bindingKey } from '../../runtime/agent-modes/orchestration/scheduler.mjs';
 import { renderInputs } from '../../runtime/agent-modes/orchestration/inputs.mjs';
@@ -574,4 +575,57 @@ test('stopping a guided host round retains answers and explicit recovery retries
   await until(() => nextRunner.calls.length === 2); assert.equal(nextRunner.calls[1].stepId, 'summary');
   nextRunner.calls[1].complete(); const result = await restored.done;
   assert.equal(result.status, 'completed'); assert.equal(result.runs.filter(row => row.roleId.startsWith('participant')).length, 2);
+});
+
+
+// Persisted v1 recovery shape from before configured role binding identities.
+// Deliberately derives the historical key independently of roleBindingKey.
+function legacyRecoverySnapshot() {
+  const t = template(); t.roles.c.session = 'reuse'; t.steps[0].inputs.push('history');
+  const original = options({ template: t, throughSeq: 2, history: [{ seq: 1, text: 'ALREADY IN LEGACY SESSION' }, { seq: 2, text: 'PENDING PUBLIC HISTORY' }] });
+  const oldKey = `${t.id}@${t.revision}/c/${createHash('sha256').update(JSON.stringify([original.cwd, 'default'])).digest('hex')}`;
+  const inputs = { request: original.input, history: [original.history[1]] };
+  const descriptor = { roleId: 'c', stepId: 'left', round: 0, engine: 'codex', prompt: renderInputs(Object.keys(inputs), ref => inputs[ref]),
+    cwd: original.cwd, access: 'read', instructions: t.roles.c.prompt, requestedModel: original.models.codex, nativeOptions: {}, purpose: 'default', inputValues: inputs, acknowledgedHistorySeq: 2 };
+  const failed = { id: 'legacy-failed', engine: 'codex', roleId: 'c', stepId: 'left', attempt: 1, round: 0, status: 'failed', requestedModel: original.models.codex, cwd: original.cwd, text: 'Partial', error: 'Try again' };
+  const completed = { id: 'legacy-completed', engine: 'claude', roleId: 'a', stepId: 'right', attempt: 1, round: 0, status: 'completed', requestedModel: original.models.claude, cwd: original.cwd, text: 'Keep sibling answer' };
+  const snapshot = { version: 1, id: original.runId, status: 'blocked', config: { ...original, parameters: {}, nativeOptions: {} }, runs: [failed, completed], events: [],
+    bindings: { [oldKey]: { engine: 'codex', sessionId: 'legacy-native-session', consumedSeq: 1 } },
+    invocations: { [JSON.stringify(['left', 'c', 0])]: descriptor }, checkpoints: {},
+    cache: { steps: { right: completed }, roles: { [JSON.stringify(['right', 'a', 0])]: completed } } };
+  return { original, oldKey, descriptor, snapshot };
+}
+
+test('legacy failed role recovery resumes its old-key native session with the frozen filtered prompt', async () => {
+  const { original, oldKey, descriptor, snapshot } = legacyRecoverySnapshot();
+  const runner = harness(), run = new WorkflowScheduler({ runner }).start({ ...original, previousSnapshot: snapshot, retryRunId: 'legacy-failed',
+    roleOverrides: { c: { engine: 'claude', model: 'new-selection', prompt: 'Changed selection' } },
+    bindings: { [oldKey]: { engine: 'codex', sessionId: 'legacy-current-session', consumedSeq: 2 } },
+  });
+  await until(() => runner.calls.length === 1);
+  const retried = runner.calls[0];
+  assert.equal(retried.nativeSessionId, 'legacy-current-session');
+  assert.equal(retried.prompt, descriptor.prompt); assert.doesNotMatch(retried.prompt, /ALREADY IN LEGACY SESSION/);
+  assert.match(retried.prompt, /PENDING PUBLIC HISTORY/); assert.equal(retried.model, 'codex-exact');
+  assert.equal(retried.instructions, original.template.roles.c.prompt);
+  const configuredKey = bindingKey({ template: run.snapshot().config.template, roleId: 'c', cwd: original.cwd });
+  assert.notEqual(configuredKey, oldKey);
+  assert.equal(run.snapshot().bindings[configuredKey].consumedSeq, 2);
+  retried.complete({ status: 'failed', error: 'One more retry' }); await until(() => run.snapshot().status === 'blocked');
+  const converted = run.snapshot(), retry = converted.runs.at(-1); await run.interrupt();
+  const nextRunner = harness(), next = new WorkflowScheduler({ runner: nextRunner }).start({ ...original, previousSnapshot: converted, retryRunId: retry.id });
+  await until(() => nextRunner.calls.length === 1); assert.equal(nextRunner.calls[0].nativeSessionId, 'legacy-current-session');
+  assert.equal(nextRunner.calls[0].prompt, descriptor.prompt);
+  assert.equal((await finishRemaining(next, nextRunner)).status, 'completed');
+});
+
+test('legacy bindings are never adopted by new turns with changed role configuration', async () => {
+  const { original, snapshot } = legacyRecoverySnapshot();
+  for (const override of [{ engine: 'claude' }, { model: 'new-model' }, { prompt: 'New role instructions' }]) {
+    const runner = harness(), run = new WorkflowScheduler({ runner }).start({ ...original, runId: 'new-workflow', bindings: snapshot.bindings, roleOverrides: { c: override } });
+    await until(() => runner.calls.length === 2);
+    const call = runner.calls.find(call => call.roleId === 'c');
+    assert.equal(call.nativeSessionId, undefined); assert.match(call.prompt, /ALREADY IN LEGACY SESSION/);
+    assert.equal((await finishRemaining(run, runner)).status, 'completed');
+  }
 });
