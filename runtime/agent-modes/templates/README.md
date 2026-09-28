@@ -1,10 +1,11 @@
-# Engine templates, schema version 1
+# Engine templates, schema versions 1 and 2
 
 This directory contains declarative templates and local revision storage. It does
 not start models, execute code, grant permissions, or implement the scheduler.
 The scheduler must enforce the contracts below before reporting an operation as
-successful. All role engines bind to exactly the two model slots selected for the
-turn: `models.codex` and `models.claude`. A role cannot declare a model, provider,
+successful. Each role resolves its model from the conversation's role override,
+then the template role's optional `model`, then `models.codex` or `models.claude`.
+An explicit null model selects the engine's native default. A role cannot declare a provider,
 environment, credential, harness path, command, tool process, or approval policy.
 Prompt text is supplementary instruction data, never an executable expression.
 
@@ -51,12 +52,12 @@ scopes is intentional. Roles and parameters have independent namespaces.
 
 | Field | Schema |
 | --- | --- |
-| `schemaVersion` | Required, exactly `1`. |
+| `schemaVersion` | Required, `1` or `2`. New role models, same-engine graphs, parameter enums and hosted debates normalize to `2`. |
 | `id` | Required stable ID; never a file path. `polly` and `debby` are reserved built-in IDs. |
 | `revision` | Positive safe integer; omitted input defaults to `1`. Assigned locally on save. |
 | `name` | Nonempty string, at most 200 characters. |
 | `description` | Required string, may be empty, at most 5,000 characters. |
-| `roles` | Object with 1–64 named roles, each exactly `{engine, prompt, access, session}`. |
+| `roles` | Object with 1–64 named roles, each `{engine, prompt, access, session, model?}`. |
 | `parameters` | Named typed definitions; defaults to `{}`, maximum 32 definitions. |
 | `limits` | Defaults to `{concurrency:2,tasks:8,rounds:2}`; partial objects fill defaults. |
 | `steps` | Nonempty root scope; DAG rules below. |
@@ -69,9 +70,14 @@ Role `engine` is `codex` or `claude`, `access` is `read` or `write`, `session` i
 Access is a ceiling intersected with host/user policy. The scheduler/harness must
 actually enforce read-only roles. `reuse` allows a role's separate native session
 to resume under the same template revision and workspace; `fresh` requires a new
-role session. Sessions are not shared between roles or concurrent tasks.
+role session. Sessions are not shared between roles or concurrent tasks. Engine,
+model and prompt are part of binding identity. Top-level `roleOverrides` on
+conversation/turn selection accepts existing role IDs mapped to `{engine?,model?,prompt?}`;
+it cannot change access or session policy. Omitted overrides preserve selection,
+`{}` clears them, and changing template resets omitted overrides. The effective
+configuration is frozen for retry and resume.
 
-Parameter definitions are `{type,default,min?,max?,description?}`. Types are
+Parameter definitions are `{type,default,min?,max?,description?,enum?}`. Types are
 `integer`, `number`, `boolean` or `string`. Numeric definitions require finite
 `min` and `max`; integer bounds/defaults must be safe integers. String/boolean
 definitions reject numeric bounds. String defaults/values allow up to 10,000
@@ -81,9 +87,9 @@ Limits are integer ceilings: `concurrency` 1–4 active native runs across the
 whole template, `tasks` 1–32 dynamic tasks per plan, and `rounds` 0–10 per repeat
 or repair loop. Nested containers do not each receive an independent concurrency
 budget. The template graph allows at most 256 steps, 128 per scope, and 8 nested
-container levels. At least one executable Codex role and one executable Claude
-role must be reachable. Unused role declarations and constant-zero repeat bodies
-do not satisfy reachability; parameterized positive-maximum bodies can be reachable.
+container levels. Graphs may use only Codex, only Claude or both engines;
+different roles may select identical or different models. Polly's dynamic
+execution and opposite-engine review contracts still require their declared topology.
 
 ## References, dependencies and results
 
@@ -120,7 +126,8 @@ against them. No expressions or conditions are interpreted.
 | Type | Fields | Meaning and exports |
 | --- | --- | --- |
 | `run` | `role:string`, `inputs:string[]`, optional `prompt:string` | One native role invocation. Step prompt appends to the role instructions. Exports the complete role result at its ID. A write role requires isolated workspace handling; the template cannot select an arbitrary writable directory. |
-| `synthesize` | Same as `run` | Read-only role combines only the declared sources. It is an invocation of an existing engine slot, not a third model. Same export shape as `run`. |
+| `synthesize` | Same as `run` | Read-only role combines the declared sources using its independently resolved model. Same export shape as `run`. |
+| `hostedDebate` | `participants:{alias:roleId,alias:roleId}`, `host:roleId`, `inputs:string[]`, `count:Bound(0,limits.rounds)`, `mode:'per-round'|'final-only'|{parameter:string}` | Three distinct read roles. Independent answers, bounded critique rounds and final synthesis; per-round mode validates host decisions and may stop early. Exports participant aliases, `sources` and `assessments`. |
 | `parallel` | `steps:Step[]` | Nested DAG with ready children eligible concurrently. Completes after all children. Exports an object keyed by child IDs and each child's supported descendant references. |
 | `repeat` | `count:Bound(0,limits.rounds)`, `initial:{alias:reference}`, `steps:Step[]`, `yields:{alias:localReference}` | Run a nested DAG exactly `count` times; no model-controlled early convergence. Exports an object keyed by aliases and `<id>.<alias>`. See snapshot rules below. |
 | `planTasks` | `role:string`, `inputs:string[]`, optional `prompt:string`, optional `maxTasks:Bound(1,limits.tasks)` (default `limits.tasks`) | Read-only planner returns the task-plan JSON schema below. The scheduler validates it before any tasks launch. Exports validated `{tasks:[...]}` at its ID and its task list at `<id>.tasks`. |
@@ -160,10 +167,14 @@ are no body invocations and the aliases yield `initial` unchanged. A repeat's
 aliases are opaque values; they cannot masquerade as a `planTasks` or review
 target to bypass producer-type checks.
 
-Debby uses parallel initial answers, a repeat with aliases `codex` and `claude`,
-and Claude synthesis. Each critique run receives `request` plus the other
-engine's `previousRound` result. Its parameter `rounds` defaults to 0 and allows
-0–5. Polly uses Claude planning, isolated dynamic execution, opposite-engine
+Debby r2 uses `hostedDebate` with `participant_a`, `participant_b` and `host`.
+Defaults are Codex, Claude and Claude; each can be overridden independently.
+`rounds` defaults to 2 and allows 0–5; `host_mode` defaults to `per-round`.
+Host assessments must be `{continue:boolean,guidance:string}`; invalid output
+blocks the step and can be retried. Participant rounds consume immutable prior
+outputs and host guidance. `final-only` executes the configured number of rounds
+before synthesis. Debby r1 remains readable for historical workflows.
+Polly uses Claude planning, isolated dynamic execution, opposite-engine
 review/integration with at most 2 repairs, and Claude synthesis. Custom templates
 can rearrange/compose these primitives; no workflow is selected by template name.
 
@@ -212,7 +223,7 @@ copied/imported source metadata; changing a built-in copy's ID is sufficient.
 Removing a user template creates a tombstone and keeps every historical file.
 Re-creating its ID increments the latest revision. Missing IDs return `null` from
 `read` and `false` from `remove`; attempts to save/delete built-in IDs throw.
-Current shipped built-in revision 1 is immutable; executions must also retain
+Shipped built-in revisions are immutable; executions must also retain
 their full template snapshot to survive future built-in package upgrades.
 
 Writes use fsynced temporary JSON files and atomic renames. The application must

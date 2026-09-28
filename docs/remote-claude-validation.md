@@ -1,12 +1,45 @@
-# 远程 Claude 验证记录
+# 远程协作验证记录
 
-日期：2026-09-27。测试对象为客户端已有的 14 个 SSH 连接别名。
+## 2026-09-28：原生远程网关与可配置角色
+
+远程项目已接入与本地一致的模式、模板、角色设置和运行记录。桌面通过原有 SSH 登录包装和代理字节流连接持久网关；Codex App Server、Claude Code、模型请求及文件工具均在所选集群运行，不转发 Mac 的模型进程或密钥。
+
+Debby r2 的 participant_a、participant_b 和 host 分别选择引擎、模型及提示词，使用独立原生会话。支持 Codex + Claude、两个 Codex、两个 Claude，模型相同或不同；host 可逐轮指导并提前结束，或仅在固定讨论轮数后汇总。Polly 和自定义 schema v1/v2 模板使用同一远程调度器。
+
+验收使用 `tests/agent-modes/live-remote.mjs` 创建独立临时目录，生成提示词中不提供的随机标记；要求两个参与者调用原生文件工具并返回精确标记，核对实际模型、独立会话、主持人输出、SSH 重连和持久历史。原始记录保存在 `.artifacts/remote-live-*.json`，失败尝试也保留。
+
+| 集群 | 完整混合角色与原生 Read 验收 | 证据 |
+| --- | --- | --- |
+| rno | 通过 | `remote-live-rno-mixed.json` |
+| ala | 通过 | `remote-live-ala-mixed.json` |
+| blc | 通过 | `remote-live-blc-mixed-v4.json` |
+| blc-2 | 通过 | `remote-live-blc-2-mixed-v4.json` |
+| bar | 通过 | `remote-live-bar-mixed-v5.json` |
+| sko | 通过 | `remote-live-sko-mixed-v5.json` |
+
+rno 还通过了同模型双 Codex、异模型双 Codex（Luna/Terra）、同模型双 Claude（Haiku/Haiku）、异模型双 Claude（Haiku/Sonnet 4.6）、Codex 主持人和 final-only 固定轮数测试。每项均核对真实请求模型与实际模型，不能用模型自述代替执行记录。
+
+`live-remote-lifecycle.mjs` 在 rno 和 blc 通过挂起审批后断线重连、相同审批 ID 重放、拒绝后文件未创建、挂起审批时中断、网关重启后原生会话恢复，以及 Codex→Claude、Claude→Codex 公开上下文接续。rno 和 blc 均另核对重启前后 Claude session UUID 一致；测试拒绝缺失或非 UUID 的绑定。驱动遵循此 App 实际握手：initialize 后直接 getAuthStatus，不假设 App 会发送 initialized。
+
+隔离预览的 rno GUI 已通过：两个 Codex 分别选择 Luna/Terra，Claude Haiku 主持并使用自定义提示词；同一聊天将 host 改为 Codex Luna 并修改提示词后立即发送，结果含新提示词要求的标记；远程模板复制、独立 host 模型保存也通过。证据为 `remote-gui-roles-and-template.txt` 及对应截图。最终运行时的 rno 模型菜单复验已通过，显示 22 个 API 具体型号和 5 个补充选项，包含 Opus 4.6、4.8、5、5.5；证据为 `remote-final-model-menu.txt`。集群同时启用 Foundry/Vertex 标志时，目录现在遵循原生 Claude 的 Foundry 优先级，不改写环境。最终状态保存修复包还在 GUI 完成双 Claude Haiku + 自定义 host 的完整一轮，四次角色运行均完成，实际模型均为 `claude-haiku-4-5-20251001`，最终输出包含 `GUI_FINAL_HOST_OK`。记录为 `remote-final-gui-v6.txt` 和截图。
+
+部分 Linux 集群禁止 bubblewrap 所需的 namespace。网关仅对只读角色选择实测可用的原生 Landlock 后端，不更改用户配置。检查在私有临时目录进行；单次最多 20 秒，共享 45 秒启动预算。主会话和可写角色保留用户选择的权限与原生命令参数，不自动降低沙箱保护。Polly 的 Full access 验收仅作用于测试新建的独立 Git 目录。
+
+rno 的 Polly 完整验收已通过，证据为 `remote-live-rno-polly-full-access-v6.json`：Claude 规划、Codex 修改、Claude 审查、Codex 集成验证、Claude 最终审查和汇总共 6 次原生角色运行；最终写回新建 Git 夹具，独立执行 `node verify.mjs` 成功，marker 和原验证文件哈希不变。该次明确选择 Full access；不把此结果当作集群原生 workspace-write sandbox 已可用。
+
+早期 Polly 的状态读取曾超时。实测同一文本片段触发十多次同步全量状态写入，阻塞共享盘上的网关。修复把完整角色快照和公开事件各合并为一次同步原子保存，落盘成功后才发送界面通知。95 项相关回归通过；rno 原始 32 事件耗时 7.433 秒，修复原型 1.300 秒，最终源码 128 事件 7.598 秒。度量细节为 `remote-persistence-rno-v6.json`；完整 Polly 随后通过，失败尝试仍保留。
+
+以下记录保留早期单引擎探索过程，不能替代以上多角色和 App 验收。
+
+## 2026-09-27：单引擎探索记录
+
+测试对象为客户端已有的 14 个 SSH 连接别名。
 
 ## 结论
 
 rno、bar、ala、blc、blc-2、sko 均已验证：本机通过 SSH 启动集群上的真实 Claude Code，**使用该集群既有 Codex 提供方的同源 Anthropic API 路径，直接调用 API，不经过 Mac 的模型请求转发器**。真实 Read 工具已读取各集群临时目录里的随机内容并返回精确结果。rno 还在早期转发测试中通过了退出进程后恢复 Claude 会话并回忆上一轮内容的测试。
 
-这些结果证明远程执行链路可用。当前安装版的远程项目仍未接入 Claude 模式，不能把本记录当作客户端界面或远程混合引擎已经完成的验收。
+这些结果仅证明当时的单引擎远程执行链路可用。多角色和客户端界面验收见上方 2026-09-28 记录。
 
 ## 与 Codex 相同网络路径的直接调用
 
@@ -57,24 +90,25 @@ rno、bar、ala、blc-2、sko 使用集群内部 Foundry 服务；blc 使用其�
 
 以上是使用 Mac 地址和连接参数进行测试时的观察，不代表各集群使用自身配置也需要经过 Mac。最新直接调用结果见前节。
 
-## 尚未通过 SSH 的别名
+## 尚未通过 SSH 的别名（2026-09-28 再次检查）
 
 | 别名 | 观察到的阻碍 |
 | --- | --- |
 | col、staging0、rno0 | SSH 目标域名解析失败 |
-| ala0 | SSH 连接探测超时 |
-| bar0、bar1、sko0 | SSH 密钥代理拒绝签名，随后公钥认证失败 |
+| ala0、bar0 | 公钥认证失败 |
+| bar1 | SSH 命令超时 |
+| sko0 | 目标拒绝 SSH 连接 |
 | bar2 | 当前 known_hosts 中没有目标 ED25519 主机密钥，严格验证拒绝连接 |
 
-这些是上述别名的连接问题；例如 `rno0` 失败不影响已通过的 `rno`。本次没有绕过主机密钥验证或反复触发密钥代理确认。
+最新只读复查使用 BatchMode 和严格主机密钥验证，记录为 `.artifacts/remote-other-aliases-final.json`。这些是上述别名的连接问题；例如 `rno0` 失败不影响已通过的 `rno`。本次没有绕过主机密钥验证或反复触发密钥代理确认。
 
-## 接入前需要兼容的差异
+## 接入前观察到的差异（历史）
 
 - rno、bar、ala、sko 可找到 Node 22.17.1。blc 和 blc-2 没有常规 PATH 中的 Node，但已找到可执行的 VS Code Server 自带 Node 22/24。
 - 已生成并检查 rno 的 Codex 0.142.5，以及 ala、blc、sko 的 0.144.5 协议。这些版本有 `thread/inject_items`，没有新的 `thread/turns/list` 和 `thread/items/list`；需兼容完整历史接口。
 - blc-2 的 Codex 0.154.0 同时具有这些分页接口。
 - bar 的初始版本探测为 0.154.0，后续协议生成探测超时，不能声称协议验收完成。
-- 已安装版本的前端仍限制 Claude 为本地模式；网关目前只支持本地 JSONL，并不支持原生远程 WebSocket 入口。远程支持需要明确的传输适配、按主机隔离的能力缓存和恢复逻辑。
+- 当时的前端限制 Claude 为本地模式，网关仅支持本地 JSONL。这些限制已由持久远程 WebSocket 网关、按主机隔离的界面状态和恢复逻辑解除。
 
 ## 原始证据
 
@@ -91,4 +125,9 @@ rno、bar、ala、blc-2、sko 使用集群内部 Foundry 服务；blc 使用其�
 - `remote-direct-files.json`：六个集群不经 Mac API 转发的真实模型调用和文件读取结果。
 - `probe-remote-direct.py`：读取远程既有提供方配置并运行一次性 Read 验证的脚本，不是应用运行时组件。
 
-远程界面的模式切换、混合引擎上下文、工具审批、断线恢复和重启恢复仍需在实现后单独验收。
+远程界面与生命周期的后续验收已单独记录在本文开头。原生 SSH 不可达的别名仍需先恢复其连接；本实现保持主机密钥与认证验证。
+
+
+## 验收数据整理
+
+`cleanup-remote-acceptance.mjs` 根据已完成的精确测试 ID 和工作目录清单，经原生服务再次检查空闲状态后归档了 16 个测试会话。身份、更新时间、写入者或状态不满足检查的记录保留，未强制抢占、删除文件或清空历史。原始测试工作目录和证据仍可复核；清单、每次结果和跳过原因位于 `.artifacts/remote-acceptance-archive-*`。界面验收会话保留供复核。
