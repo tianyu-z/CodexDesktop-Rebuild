@@ -21,6 +21,7 @@ const PATCHES = [
   "patch-archive-delete.js",
   "patch-branch-edit.js",
   "patch-model-add.js",
+  "patch-sidebar-navigation.js",
 ];
 
 function main() {

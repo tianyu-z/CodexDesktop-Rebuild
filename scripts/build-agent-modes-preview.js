@@ -15,11 +15,12 @@ function patchBootstrap(code) {
   code = replaceOne(code, 'NAME="chatgpt-dev"', 'NAME=process.env.CDX_ENGINE_APP_NAME||"chatgpt-dev"');
   return `${marker}\nrequire("./agent-modes-bootstrap.cjs");\n${code}`;
 }
-async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = path.join(ROOT, '.artifacts', 'ChatGPT Engines Preview.app'), appName = 'chatgpt-dev-engines-preview' } = {}) {
+async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = path.join(ROOT, '.artifacts', 'ChatGPT Engines Preview.app'), appName = 'chatgpt-dev-engines-preview', preserveRuntime = false } = {}) {
   const asar = await import('@electron/asar');
   const { patchAssets } = require('./patch-agent-modes.js');
   const { patchCatalogBuild } = require('./patch-agent-catalog.js');
   const { patchRemoteBuild } = require('./patch-agent-remote.js');
+  const { patchSidebarAssets } = require('./patch-sidebar-navigation.js');
   const { packageRemoteRuntime } = require('./remote-runtime-package.js');
   const source = path.join(ROOT, 'src', 'mac-arm64', '_asar');
   const version = JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8')).version;
@@ -30,6 +31,7 @@ async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = pat
   patchAssets(path.join(stagedAsar, 'webview', 'assets'));
   patchCatalogBuild(path.join(stagedAsar, '.vite', 'build'));
   patchRemoteBuild(path.join(stagedAsar, '.vite', 'build'));
+  patchSidebarAssets(path.join(stagedAsar, 'webview', 'assets'));
   const bootstrap = path.join(stagedAsar, '.vite', 'build', 'early-bootstrap.js');
   fs.writeFileSync(bootstrap, patchBootstrap(fs.readFileSync(bootstrap, 'utf8')));
   fs.copyFileSync(path.join(ROOT, 'scripts', 'assets', 'agent-modes-bootstrap.cjs'), path.join(stagedAsar, '.vite', 'build', 'agent-modes-bootstrap.cjs'));
@@ -53,8 +55,23 @@ async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = pat
   // with the application and never replaces the original Codex executable.
   fs.writeFileSync(path.join(runtime, 'codex-gateway'), '#!/bin/sh\nCDX_GATEWAY_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\nexec "$CDX_GATEWAY_DIR/node" "$CDX_GATEWAY_DIR/gateway.mjs" "$@"\n', { mode: 0o755 });
   fs.writeFileSync(path.join(runtime, 'build.json'), JSON.stringify(buildInfo, null, 2));
-  const remotePackage = packageRemoteRuntime(path.join(ROOT, 'runtime', 'agent-modes'), path.join(runtime, 'remote-runtime.tar.gz'));
-  fs.writeFileSync(path.join(runtime, 'remote-build.json'), JSON.stringify(remotePackage));
+  if (preserveRuntime) {
+    const original = path.join(sourceApp, 'Contents', 'Resources', 'agent-modes');
+    const digest = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    const verify = (relative = '') => {
+      for (const name of fs.readdirSync(path.join(ROOT, 'runtime', 'agent-modes', relative))) {
+        if (name === 'node_modules') continue;
+        const item = path.join(relative, name), local = path.join(ROOT, 'runtime', 'agent-modes', item);
+        if (fs.statSync(local).isDirectory()) verify(item);
+        else if (digest(local) !== digest(path.join(original, item))) throw Error('Appearance build must preserve installed runtime: ' + item);
+      }
+    };
+    verify();
+    for (const name of ['remote-runtime.tar.gz', 'remote-build.json']) fs.copyFileSync(path.join(original, name), path.join(runtime, name));
+  } else {
+    const remotePackage = packageRemoteRuntime(path.join(ROOT, 'runtime', 'agent-modes'), path.join(runtime, 'remote-runtime.tar.gz'));
+    fs.writeFileSync(path.join(runtime, 'remote-build.json'), JSON.stringify(remotePackage));
+  }
   const archive = path.join(staging, 'app.asar');
   await asar.createPackage(stagedAsar, archive);
   fs.copyFileSync(archive, path.join(resources, 'app.asar'));
