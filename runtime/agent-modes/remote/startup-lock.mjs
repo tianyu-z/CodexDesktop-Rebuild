@@ -12,13 +12,13 @@ fcntl.flock(fd,fcntl.LOCK_EX)
 print("LOCKED",flush=True)
 sys.stdin.buffer.read()
 `;
-export async function acquireStartupLock(path) {
+export async function acquireStartupLock(path, { timeoutMs = 45000 } = {}) {
   const child = spawn('python3', ['-u', '-c', program, path], { stdio: ['pipe', 'pipe', 'pipe'] });
   let release, locked = false, settled = false;
   const exited = new Promise(resolve => child.once('close', resolve));
   try {
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { child.kill(); reject(Error('Remote gateway startup lock timed out.')); }, 10000);
+      const timer = setTimeout(() => { child.kill(); finish(Error('Remote gateway startup lock timed out.')); }, timeoutMs);
       const finish = error => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(); };
       let output = '';
       child.stdout.on('data', bytes => { output += bytes; if (output.includes('LOCKED\n')) { locked = true; finish(); } });

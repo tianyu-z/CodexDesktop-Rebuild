@@ -22,10 +22,10 @@ test('invalid engine, access or run ID cannot launch a native harness', () => {
   for (const extra of [{ engine: 'other' }, { access: 'admin' }, { runId: '' }]) assert.throws(() => runner.start({ ...base, ...extra }), /Invalid/);
 });
 
-test('remote Codex compatibility args reach each role without relaxing read policy', async () => {
+test('remote Codex compatibility args apply only to read roles without relaxing native policies', async () => {
   const launches = [], requests = [], responses = [];
-  const codexArgs = ['--enable', 'use_legacy_landlock', 'app-server'];
-  const runner = new RoleRunner({ codexCommand: '/remote/codex', codexArgs, nativeClientFactory: options => {
+  const codexReadArgs = ['--enable', 'use_legacy_landlock', 'app-server'];
+  const runner = new RoleRunner({ codexCommand: '/remote/codex', codexReadArgs, nativeClientFactory: options => {
     launches.push(options);
     return { request: async (method, params) => {
       requests.push({ method, params });
@@ -38,7 +38,7 @@ test('remote Codex compatibility args reach each role without relaxing read poli
       return {};
     }, notify: () => {}, respond: message => responses.push(message), close: async () => {} };
   } });
-  codexArgs[0] = '--invalid-mutation';
+  codexReadArgs[0] = '--invalid-mutation';
   const result = await runner.start({ engine: 'codex', runId: 'remote-role', cwd: '/remote/workspace', prompt: 'Read only', access: 'read',
     nativeOptions: { args: ['--dangerously-bypass-approvals-and-sandbox'], sandbox: 'danger-full-access' },
     onPermission: () => assert.fail('Read-role escalation reached user permission handler') }).done;
@@ -48,6 +48,14 @@ test('remote Codex compatibility args reach each role without relaxing read poli
   assert.equal(requests.find(row => row.method === 'thread/start').params.sandbox, 'read-only');
   assert.deepEqual(requests.find(row => row.method === 'turn/start').params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
   assert.deepEqual(responses, [{ id: 'escalation', result: { decision: 'decline' } }]);
+  for (const [sandbox, sandboxPolicy] of [['workspace-write', { type: 'workspaceWrite', writableRoots: [], networkAccess: false }], ['danger-full-access', { type: 'dangerFullAccess' }]]) {
+    requests.length = 0;
+    const result = await runner.start({ engine: 'codex', runId: 'write-role', cwd: '/remote/workspace', prompt: 'Write', access: 'write', nativeOptions: { sandbox, sandboxPolicy } }).done;
+    assert.equal(result.status, 'completed');
+    assert.deepEqual(launches.at(-1).args, ['app-server'], 'Write roles retain the native backend');
+    assert.equal(requests.find(row => row.method === 'thread/start').params.sandbox, sandbox);
+    assert.deepEqual(requests.find(row => row.method === 'turn/start').params.sandboxPolicy, sandboxPolicy);
+  }
 });
 
 test('Claude default and absent selections resolve only in Claude without mutating the model slot', async () => {

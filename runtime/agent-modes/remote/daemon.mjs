@@ -20,6 +20,9 @@ const token = createHash('sha256').update(directory).digest('hex').slice(0, 20);
 const socketDirectory = join(tmpdir(), 'cdx-engines-' + (process.getuid?.() ?? 'user') + '-' + token);
 const socketPath = join(socketDirectory, 'rpc.sock');
 const version = process.env.CDX_REMOTE_VERSION ?? 'development';
+// Two bounded 20-second read-only probes plus startup overhead. The desktop
+// setup helper allows 90 seconds, including login and a scoped idle upgrade.
+const startupTimeoutMs = 45000;
 function prepareDirectory() {
   mkdirSync(socketDirectory, { recursive: true, mode: 0o700 });
   const info = lstatSync(socketDirectory);
@@ -65,7 +68,8 @@ async function ensure() {
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'serve'], { detached: true, stdio: ['ignore', log, log], env: process.env });
   closeSync(log); child.unref();
   let exited = false; child.once('exit', () => { exited = true; });
-  for (let attempt = 0; attempt < 100; attempt++) {
+  const deadline = performance.now() + startupTimeoutMs;
+  while (performance.now() < deadline) {
     try {
       const status = await health();
       if (status.version !== version) throw Error('Remote gateway version changed while connecting.');
@@ -74,7 +78,7 @@ async function ensure() {
     if (exited) throw Error('Remote engine gateway exited during startup. Inspect its private gateway.log.');
     await new Promise(resolve => setTimeout(resolve, 100));
   }
-  throw Error('Remote engine gateway did not become ready within 10 seconds.');
+  throw Error('Remote engine gateway did not become ready within 45 seconds.');
 }
 async function main() {
   const action = process.argv[2];
@@ -89,7 +93,8 @@ async function main() {
   }
   if (action !== 'serve') throw Error('Expected ensure, serve or proxy.');
   prepareDirectory();
-  const release = await acquireStartupLock(join(socketDirectory, 'startup.lock'));
+  const deadline = performance.now() + startupTimeoutMs;
+  const release = await acquireStartupLock(join(socketDirectory, 'startup.lock'), { timeoutMs: startupTimeoutMs });
   let server;
   try {
     try {
@@ -102,9 +107,11 @@ async function main() {
     }
   const command = process.env.CDX_REAL_CODEX;
   if (!command || !process.env.CDX_CLAUDE_PATH) throw Error('Remote Codex and Claude executables must be configured.');
-  const sandboxArgs = await resolveRemoteSandboxArgs({ command });
+  // Only read roles opt into the backend this read-only probe verified. Main
+  // sessions and write roles preserve the user's configured native policies.
+  const sandboxArgs = await resolveRemoteSandboxArgs({ command, deadline });
   server = await startRemoteServer({ socketPath, version, closeLock: () => acquireStartupLock(join(socketDirectory, 'startup.lock')),
-    runtimeFactory: ({ emit, onExit }) => createEngineRuntime({ command, args: [...sandboxArgs, '-c', 'features.code_mode_host=true', 'app-server'], codexRoleArgs: [...sandboxArgs, 'app-server'],
+    runtimeFactory: ({ emit, onExit }) => createEngineRuntime({ command, args: ['-c', 'features.code_mode_host=true', 'app-server'], codexReadRoleArgs: [...sandboxArgs, 'app-server'],
       directory, emit, onExit, remote: true, claudePath: process.env.CDX_CLAUDE_PATH, environment: remoteClaudeEnvironment }) });
   } finally { await release(); }
   let closing;
