@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import fsPromises from 'node:fs/promises';
 import { ConversationStore } from '../../runtime/agent-modes/store.mjs';
 import { EngineRouter } from '../../runtime/agent-modes/router.mjs';
 const tick = () => new Promise(resolve => setImmediate(resolve));
+const composerImage = () => ({ type: 'image', url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC' });
 function fixture(t) {
   const dir=mkdtempSync(join(tmpdir(),'engine-router-'));
   const thread={id:'thread-1',cwd:dir,turns:[],status:{type:'idle'},createdAt:1,updatedAt:1,preview:''};
@@ -16,6 +18,69 @@ function fixture(t) {
   t.after(async()=>{await router.close();rmSync(dir,{recursive:true,force:true});});return {dir,thread,calls,events,runs,store,router};
 }
 async function start(f,engineMode='codex'){return f.router.request('thread/start',{cwd:f.dir,engineMode,model:'codex-model',agentMode:'guardian-approvals'});}
+
+for (const text of ['', '/clear with this image']) test(`Claude keeps image content through normal start and steering (${text || 'image only'})`, async t => {
+  const f = fixture(t); await start(f, 'claude');
+  const input = [...(text ? [{ type: 'text', text }] : []), composerImage()];
+  const original = structuredClone(input);
+  const { turn } = await f.router.request('turn/start', { threadId: 'thread-1', input });
+  await tick();
+  assert.equal(f.runs.length, 1);
+  assert.ok(f.runs[0].options.content.some(block => block.type === 'image'));
+  assert.deepEqual(turn.items[0].content, original);
+  const sent = [];
+  f.runs[0].steer = async value => { sent.push(value); return {}; };
+  await f.router.request('turn/steer', { threadId: 'thread-1', expectedTurnId: turn.id, input });
+  assert.ok(sent[0].some(block => block.type === 'image'));
+  assert.deepEqual(f.store.get('thread-1').turns[0].turn.items.at(-1).content, original);
+});
+
+test('Stop owns a visible Claude turn during image preparation and releases before the file opens', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  const path = join(f.dir, 'pending.png'); await fsPromises.writeFile(path, Buffer.from(composerImage().url.split(',')[1], 'base64'));
+  const open = fsPromises.open.bind(fsPromises);
+  let release, entered, closed; const blocked = new Promise(resolve => { release = resolve; }), opening = new Promise(resolve => { entered = resolve; });
+  const drained = new Promise(resolve => { closed = resolve; });
+  t.mock.method(fsPromises, 'open', async (...args) => {
+    if (args[0] !== path) return open(...args);
+    entered(); await blocked;
+    const handle = await open(...args), close = handle.close.bind(handle);
+    handle.close = async () => { try { return await close(); } finally { closed(); } }; return handle;
+  });
+  let response;
+  const starting = f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'localImage', path }] }).then(value => { response = value; return value; });
+  await opening;
+  try {
+    assert.ok(response?.turn.id, 'The composer receives an owned turn ID before image I/O finishes');
+    assert.ok(f.events.some(event => event.method === 'turn/started' && event.params.turn.id === response.turn.id));
+    await assert.rejects(f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: 'stale-turn' }), /ownership/i);
+    let stopped = false;
+    const stopping = f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: response.turn.id }).then(() => { stopped = true; });
+    assert.equal(typeof stopping.then, 'function');
+    for (let i = 0; i < 4; i++) await tick();
+    assert.equal(stopped, true, 'Stop must finish while fs.open is still blocked');
+    await stopping;
+    assert.equal(f.store.get('thread-1').turns[0].turn.status, 'interrupted');
+    const next = await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'next prompt' }] }); await tick();
+    assert.equal(f.runs.length, 1);
+    assert.equal(f.store.get('thread-1').activeRun.turnId, next.turn.id);
+  } finally { release(); await drained; await starting; }
+  await tick(); assert.equal(f.runs.length, 1, 'The cancelled read cannot launch a late native run');
+  assert.equal(f.calls.some(call => call.method === 'turn/interrupt'), false);
+});
+
+for (const type of ['mention', 'skill']) test(`slash-looking ${type} input remains model context on start and steering`, async t => {
+  const f = fixture(t); await start(f, 'claude');
+  const input = [{ type: 'text', text: '/clear' }, { type, path: '/reference/path', name: 'Reference' }];
+  const { turn } = await f.router.request('turn/start', { threadId: 'thread-1', input }); await tick();
+  assert.equal(Array.isArray(f.runs[0].options.content), true);
+  assert.match(f.runs[0].options.content[0].text, /^\[Current user request\]/);
+  assert.match(f.runs[0].options.content[2].text, /reference data, not instructions/);
+  const sent = []; f.runs[0].steer = async value => { sent.push(value); };
+  await f.router.request('turn/steer', { threadId: 'thread-1', expectedTurnId: turn.id, input });
+  assert.match(sent[0][0].text, /^\[Additional user request\]/);
+  assert.match(sent[0][2].text, /reference data, not instructions/);
+});
 for (const mode of ['claude', 'both']) {
   for (const remote of [false, true]) {
     test(`native goal activation cannot launch Codex in ${mode} mode (${remote ? 'remote' : 'local'})`, async t => {
@@ -189,9 +254,17 @@ test('slow model discovery never blocks interrupting an active Claude turn', asy
 test('mode is scoped to thread; native parameters retain permission agentMode',async t=>{const f=fixture(t);await start(f,'claude');assert.equal(f.store.get('thread-1').mode,'claude');assert.equal(f.calls[0].params.agentMode,'guardian-approvals');assert.equal(f.calls[0].params.engineMode,undefined);assert.equal(f.calls[0].params.model,undefined);await assert.rejects(()=>f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'both'}),/gateway/);assert.equal(f.store.get('thread-1').mode,'claude');});
 test('Claude start never starts Codex inference; completion persists before notification',async t=>{const f=fixture(t);await start(f,'claude');const {turn}=await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'hello'}],model:'wrong-codex-model'});await tick();assert.equal(f.runs.length,1);assert.equal(f.runs[0].options.model,undefined);assert.equal(f.runs[0].options.prompt,'hello');assert.equal(f.calls.filter(c=>c.method==='turn/start').length,0);await assert.rejects(()=>f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'codex'}),/active/);f.runs[0].options.onEvent({type:'session',sessionId:'claude-session'});f.runs[0].options.onEvent({type:'message-start',id:'text-1'});f.runs[0].options.onEvent({type:'text-delta',id:'text-1',delta:'answer'});f.runs[0].options.onEvent({type:'message-completed',id:'text-1',text:'answer'});f.runs[0].finish({status:'completed',nativeSessionId:'claude-session'});await tick();const record=new ConversationStore(f.dir).get('thread-1');assert.equal(record.turns[0].turn.id,turn.id);assert.equal(record.turns[0].turn.status,'completed');assert.equal(record.turns[0].turn.items[1].text,'answer');assert.equal(record.activeRun,null);assert.ok(f.events.some(e=>e.method==='turn/completed'));});
 test('mixed history survives read, resume, pagination and switching context both ways',async t=>{const f=fixture(t);await start(f);f.thread.turns=[{id:'old-codex',status:'completed',items:[{id:'a',type:'agentMessage',text:'codeword violet'}]}];await f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'claude'});const {turn}=await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'remember amber'}]});await tick();assert.match(f.runs[0].options.prompt,/violet/);f.runs[0].options.onEvent({type:'message-completed',id:'b',text:'amber stored'});f.runs[0].finish({status:'completed',nativeSessionId:'cc'});await tick();for(const method of ['thread/read','thread/resume']){const result=await f.router.request(method,{threadId:'thread-1',includeTurns:true});assert.deepEqual(result.thread.turns.map(x=>x.id),['old-codex',turn.id]);}const p1=await f.router.request('thread/turns/list',{threadId:'thread-1',limit:1,sortDirection:'asc'});const p2=await f.router.request('thread/turns/list',{threadId:'thread-1',limit:1,sortDirection:'asc',cursor:p1.nextCursor});assert.equal(p2.data[0].id,turn.id);const reverse=await f.router.request('thread/turns/list',{threadId:'thread-1',sortDirection:'desc',cursor:p2.backwardsCursor});assert.equal(reverse.data[0].id,turn.id);const items=await f.router.request('thread/items/list',{threadId:'thread-1',turnId:turn.id});assert.equal(items.data[1].item.text,'amber stored');await f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'codex'});await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'continue'}]});assert.equal(f.runs.length,1);assert.match(f.calls.find(c=>c.method==='turn/start').params.input[0].text,/amber stored/);});
-test('Claude rejects unsupported attachment without creating active run',async t=>{const f=fixture(t);await start(f,'claude');await assert.rejects(()=>f.router.request('turn/start',{threadId:'thread-1',input:[{type:'image',url:'x'}]}),/Unsupported/);assert.equal(f.store.get('thread-1').activeRun,null);assert.equal(f.runs.length,0);});
-test('interrupt is bound to the exact turn; pending permissions fail closed',async t=>{const f=fixture(t);await start(f,'claude');const {turn}=await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'run'}]});await tick();const permission=f.runs[0].options.onPermission({name:'Bash',input:{command:'touch sample'},id:'tool-1',signal:new AbortController().signal});await tick();const ask=f.events.find(e=>e.id&&e.method?.includes('requestApproval'));assert.ok(ask);await assert.rejects(()=>f.router.request('turn/interrupt',{threadId:'thread-1',turnId:'wrong'}),/ownership/);await f.router.request('turn/interrupt',{threadId:'thread-1',turnId:turn.id});assert.equal((await permission).decision,'decline');assert.equal(f.router.respond({id:ask.id,result:{decision:'accept'}}),false);assert.equal(f.store.get('thread-1').activeRun,null);});
-test('approval answer authorizes only its pending request',async t=>{const f=fixture(t);await start(f,'claude');await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'run'}]});await tick();const options={name:'Bash',input:{command:'echo ok'},id:'tool-1',signal:new AbortController().signal};const pending=f.runs[0].options.onPermission(options);await tick();const ask=f.events.find(e=>e.id&&e.method?.includes('requestApproval'));assert.equal(f.router.respond({id:'unrelated',result:{decision:'accept'}}),false);assert.equal(f.router.respond({id:ask.id,result:{decision:'accept'}}),true);assert.deepEqual(await pending,{decision:'accept',updatedInput:options.input});});
+test('Claude invalid image completes its visible turn as failed before native startup', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  const { turn } = await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'image', url: 'x' }] });
+  await tick();
+  const stored = f.store.get('thread-1').turns.find(row => row.turn.id === turn.id).turn;
+  assert.equal(stored.status, 'failed'); assert.match(stored.error.message, /Unsupported/);
+  assert.equal(f.store.get('thread-1').activeRun, null); assert.equal(f.runs.length, 0);
+  assert.equal(f.calls.some(call => call.method === 'thread/inject_items'), false);
+});
+test('interrupt is bound to the exact turn; pending permissions fail closed',async t=>{const f=fixture(t);await start(f,'claude');const {turn}=await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'run'}]});await tick();const permission=f.runs[0].options.onPermission({name:'Bash',input:{command:'touch sample'},id:'tool-1',signal:new AbortController().signal});await tick();const ask=f.events.find(e=>e.id&&e.method==='item/tool/requestUserInput');assert.ok(ask);await assert.rejects(()=>f.router.request('turn/interrupt',{threadId:'thread-1',turnId:'wrong'}),/ownership/);await f.router.request('turn/interrupt',{threadId:'thread-1',turnId:turn.id});assert.equal((await permission).decision,'decline');assert.equal(f.router.respond({id:ask.id,result:{decision:'accept'}}),false);assert.equal(f.store.get('thread-1').activeRun,null);});
+test('approval answer authorizes only its pending request',async t=>{const f=fixture(t);await start(f,'claude');await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'run'}]});await tick();const options={name:'Bash',input:{command:'echo ok'},id:'tool-1',signal:new AbortController().signal};const pending=f.runs[0].options.onPermission(options);await tick();const ask=f.events.find(e=>e.id&&e.method==='item/tool/requestUserInput');assert.equal(f.router.respond({id:'unrelated',result:{decision:'accept'}}),false);assert.equal(f.router.respond({id:ask.id,result:{answers:{permission:{answers:['Allow once']}}}}),true);assert.deepEqual(await pending,{decision:'accept',updatedInput:options.input});});
 test('prewarmed empty native shells can switch and Claude materializes without inference',async t=>{const f=fixture(t);await start(f);const original=f.router.native.request.bind(f.router.native);f.router.native.request=async(method,params)=>{if(method==='thread/read'&&params.includeTurns)throw Error('list_turns is not supported yet');if(method==='thread/read'){const r=await original(method,params);r.thread.historyMode='paginated';return r;}if(method==='thread/turns/list')throw Error('thread is not materialized yet; unavailable before first user message');return original(method,params);};await f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'claude'});await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'hello'}]});await tick();assert.equal(f.calls.filter(c=>c.method==='thread/inject_items').length,1);assert.equal(f.calls.filter(c=>c.method==='turn/start').length,0);});
 test('late native start response cannot resurrect a completed turn or leak injected context',async t=>{const f=fixture(t);await start(f);const original=f.router.native.request.bind(f.router.native);f.router.native.request=async(method,params)=>{if(method!=='turn/start')return original(method,params);const turn={id:'race',status:'inProgress',items:[{id:'user',type:'userMessage',content:params.input}]};f.router.nativeNotification({method:'turn/started',params:{threadId:'thread-1',turn}});f.router.nativeNotification({method:'turn/completed',params:{threadId:'thread-1',turn:{...turn,status:'completed'}}});return {turn};};await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'original prompt'}]});assert.equal(f.store.get('thread-1').turns[0].turn.status,'completed');assert.equal(f.store.get('thread-1').activeRun,null);});
 test('native rollback removes discarded turns from the unified store and delete removes sidecar data',async t=>{const f=fixture(t);await start(f);f.thread.turns=[{id:'keep',items:[],status:'completed'},{id:'discard',items:[],status:'completed'}];await f.router.request('thread/read',{threadId:'thread-1',includeTurns:true});const original=f.router.native.request.bind(f.router.native);f.router.native.request=async(method,params)=>{if(method==='thread/rollback'){f.thread.turns=f.thread.turns.slice(0,1);return {thread:structuredClone(f.thread)};}return original(method,params);};await f.router.request('thread/rollback',{threadId:'thread-1',numTurns:1});const read=await f.router.request('thread/read',{threadId:'thread-1',includeTurns:true});assert.deepEqual(read.thread.turns.map(t=>t.id),['keep']);await f.router.request('thread/delete',{threadId:'thread-1'});assert.equal(f.store.get('thread-1'),null);assert.equal(new ConversationStore(f.dir).get('thread-1'),null);});
@@ -302,11 +375,58 @@ test('cancelling a pending Claude permission resolves the exact frontend request
   const { turn } = await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'request a tool' }] });
   await tick();
   const pending = f.runs[0].options.onPermission({ name: 'Bash', input: { command: 'echo fixture' }, id: 'tool-permission', signal: new AbortController().signal });
-  const request = f.events.find(event => event.method === 'item/commandExecution/requestApproval');
+  const request = f.events.find(event => event.method === 'item/tool/requestUserInput');
   await f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: turn.id });
   assert.equal((await pending).decision, 'decline');
   assert.deepEqual(f.events.filter(event => event.method === 'serverRequest/resolved').map(event => event.params), [{ threadId: 'thread-1', requestId: request.id }]);
   assert.equal(f.router.respond({ id: request.id, result: { decision: 'accept' } }), false);
+});
+
+test('Claude questions render their native choices and return answers keyed by the original question', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'ask me' }] }); await tick();
+  const question = { question: 'Which packages?', header: 'Packages', multiSelect: true, options: [{ label: 'API', description: 'Server' }, { label: 'UI', description: 'Client' }] };
+  const input = { questions: [question] };
+  const pending = f.runs[0].options.onPermission({ name: 'AskUserQuestion', input, id: 'native-question', signal: new AbortController().signal });
+  const card = f.events.at(-1);
+  assert.equal(card.method, 'item/tool/requestUserInput');
+  assert.equal(card.params.questions[0].question, question.question);
+  assert.equal(card.params.questions[0].isMultiSelect, true);
+  assert.deepEqual(card.params.questions[0].options, question.options);
+  f.router.respond({ id: card.id, result: { answers: { question_0: { answers: ['API', 'UI'] } } } });
+  assert.deepEqual(await pending, { decision: 'accept', updatedInput: { ...input, answers: { 'Which packages?': 'API, UI' } } });
+});
+
+test('Claude plan feedback, explicit modes, and current-run rules use only their owned request', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'plan' }] }); await tick();
+  const cases = [
+    { request: { name: 'ExitPlanMode', input: { plan: '# Native plan' } }, answer: 'Add rollback steps.', key: 'plan', expected: { decision: 'decline', message: 'Add rollback steps.' } },
+    { request: { name: 'ExitPlanMode', input: { plan: '# Native plan' } }, answer: 'Approve with automatic edits', key: 'plan', expected: { decision: 'accept', updatedInput: { plan: '# Native plan' }, permissionMode: 'acceptEdits' } },
+    { request: { name: 'Bash', input: { command: 'npm test' }, suggestions: [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'npm test:*' }], behavior: 'allow', destination: 'session' }] }, answer: 'Allow for current run', key: 'permission' },
+  ];
+  for (const [index, entry] of cases.entries()) {
+    const pending = f.runs[0].options.onPermission({ ...entry.request, id: `native-${index}`, signal: new AbortController().signal }), card = f.events.at(-1);
+    assert.equal(card.method, 'item/tool/requestUserInput');
+    f.router.respond({ id: card.id, result: { answers: { [entry.key]: { answers: [entry.answer] } }, updatedPermissions: [{ type: 'setMode', mode: 'bypassPermissions', destination: 'userSettings' }] } });
+    assert.deepEqual(await pending, entry.expected ?? { decision: 'accept', updatedInput: entry.request.input, updatedPermissions: entry.request.suggestions });
+    assert.equal(f.router.respond({ id: card.id, result: { answers: { [entry.key]: { answers: ['Allow once'] } } } }), false);
+  }
+});
+
+test('Stop resolves native questions and plans once and late answers cannot resume either', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  const { turn } = await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'plan and ask' }] }); await tick();
+  const question = { question: 'Which one?', options: [{ label: 'One' }, { label: 'Two' }] };
+  const pending = [{ name: 'AskUserQuestion', input: { questions: [question] } }, { name: 'ExitPlanMode', input: { plan: 'Do work' } }].map((request, index) => f.runs[0].options.onPermission({ ...request, id: `native-${index}`, signal: new AbortController().signal }));
+  const cards = f.events.filter(event => event.method === 'item/tool/requestUserInput');
+  await f.router.request('turn/interrupt', { threadId: 'thread-1', turnId: turn.id });
+  assert.deepEqual((await Promise.all(pending)).map(response => response.decision), ['decline', 'decline']);
+  for (const card of cards) {
+    assert.equal(f.events.filter(event => event.method === 'serverRequest/resolved' && event.params.requestId === card.id).length, 1);
+    assert.equal(f.router.respond({ id: card.id, result: { answers: { question_0: { answers: ['One'] }, plan: { answers: ['Approve with automatic edits'] } } } }), false);
+  }
+  assert.equal(f.store.get('thread-1').activeRun, null);
 });
 
 test('plain steering reaches the owned Claude run and persists a correlated user item', async t => {

@@ -4,13 +4,16 @@ import fs, { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import fsPromises from 'node:fs/promises';
 import { ConversationStore } from '../../runtime/agent-modes/store.mjs';
 import { TemplateStore } from '../../runtime/agent-modes/templates/store.mjs';
 import { EngineRouter } from '../../runtime/agent-modes/router.mjs';
 const tick = () => new Promise(resolve => setImmediate(resolve));
+const composerImage = () => ({ type: 'image', url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC' });
 const selected = { engineMode: 'both', engineModels: { codex: 'codex-x', claude: 'claude-y' }, template: { id: 'debby', revision: 1, parameters: { rounds: 1 } } };
 function fixture(t) {
   const dir = mkdtempSync(join(tmpdir(), 'dual-router-')), events = [], calls = [], workflows = [];
+  let workflowReady; const workflowStarted = new Promise(resolve => { workflowReady = resolve; });
   const store = new ConversationStore(join(dir, 'conversations')), templates = new TemplateStore(join(dir, 'templates'));
   const thread = { id: 'chat', cwd: dir, turns: [], status: { type: 'idle' } };
   const native = { async request(method, params) { calls.push({ method, params });
@@ -27,11 +30,11 @@ function fixture(t) {
     record.publish = () => options.onSnapshot(structuredClone(record.state));
     record.finish = status => { record.state.status = status; for (const run of record.state.runs) if (['running', 'awaitingApproval'].includes(run.status)) run.status = status === 'completed' ? 'completed' : 'interrupted'; record.publish(); resolve({ status }); };
     const handle = { done, snapshot: () => structuredClone(record.state), interrupt: async runId => { record.interrupted.push(runId ?? 'whole'); if (!runId) record.finish('interrupted'); }, retry: runId => { record.retried.push(runId); } };
-    record.handle = handle; workflows.push(record); record.publish(); return handle;
+    record.handle = handle; workflows.push(record); record.publish(); workflowReady(record); return handle;
   } });
   const router = new EngineRouter({ store, native, adapter, emit: message => events.push(message), templates, workflowFactory });
   t.after(async () => { await router.close(); rmSync(dir, { recursive: true, force: true }); });
-  return { dir, store, templates, thread, native, calls, events, workflows, router };
+  return { dir, store, templates, thread, native, calls, events, workflows, workflowStarted, router };
 }
 async function started(f) {
   await f.router.request('thread/start', { ...structuredClone(selected), cwd: f.dir, model: 'native-start', agentMode: 'guardian-approvals' });
@@ -39,6 +42,89 @@ async function started(f) {
   await tick(); return result;
 }
 const roles = () => ['codex', 'claude'].map(engine => ({ id: `${engine}-run`, roleId: engine, stepId: `answers.${engine}`, round: 0, attempt: 1, status: 'running', engine, requestedModel: engine === 'codex' ? 'codex-current' : 'claude-y', cwd: '/fixture' }));
+
+test('mixed image input stores one private capture and preserves its ID through retry and steering', async t => {
+  const f = fixture(t);
+  await f.router.request('thread/start', { ...selected, cwd: f.dir });
+  const input = [{ type: 'text', text: '/status and inspect this image' }, composerImage()];
+  const { turn } = await f.router.request('turn/start', { threadId: 'chat', input });
+  const workflow = await f.workflowStarted, capture = workflow.options.inputCapture;
+  assert.deepEqual(f.store.get('chat').turns[0].workflow.config.inputCapture, capture);
+  assert.match(capture.id, /^[a-f0-9]{64}$/);
+  assert.deepEqual(f.store.get('chat').turns[0].turn.items[0].content, input);
+  assert.doesNotMatch(JSON.stringify(f.router.workflow.read('chat')), /iVBORw0KGgo/);
+  const captured = await workflow.callbacks.loadInputCapture(capture, { signal: workflow.options.signal });
+  assert.equal(captured[1].type, 'image');
+  const sent = []; workflow.handle.steer = async value => { sent.push(value); return {}; };
+  await f.router.request('turn/steer', { threadId: 'chat', expectedTurnId: turn.id, input: [composerImage()] });
+  assert.match(sent[0].inputCapture.id, /^[a-f0-9]{64}$/);
+  workflow.finish('interrupted'); await tick();
+  await f.router.request('engine/runs/retry', { threadId: 'chat', turnId: turn.id }); await tick();
+  assert.deepEqual(f.workflows[1].options.inputCapture, capture);
+});
+
+test('Stop owns a visible workflow turn during image preparation and releases before the file opens', async t => {
+  const f = fixture(t); await f.router.request('thread/start', { ...selected, cwd: f.dir });
+  const path = join(f.dir, 'pending.png'); await fsPromises.writeFile(path, Buffer.from(composerImage().url.split(',')[1], 'base64'));
+  const open = fsPromises.open.bind(fsPromises);
+  let release, entered, closed; const blocked = new Promise(resolve => { release = resolve; }), opening = new Promise(resolve => { entered = resolve; });
+  const drained = new Promise(resolve => { closed = resolve; });
+  t.mock.method(fsPromises, 'open', async (...args) => {
+    if (args[0] !== path) return open(...args);
+    entered(); await blocked;
+    const handle = await open(...args), close = handle.close.bind(handle);
+    handle.close = async () => { try { return await close(); } finally { closed(); } }; return handle;
+  });
+  let response;
+  const starting = f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'localImage', path }] }).then(value => { response = value; return value; });
+  await opening;
+  try {
+    assert.ok(response?.turn.id, 'The composer receives an owned turn ID before image I/O finishes');
+    assert.ok(f.events.some(event => event.method === 'turn/started' && event.params.turn.id === response.turn.id));
+    await assert.rejects(f.router.request('turn/interrupt', { threadId: 'chat', turnId: 'stale-turn' }), /ownership/i);
+    let stopped = false;
+    const stopping = f.router.request('turn/interrupt', { threadId: 'chat', turnId: response.turn.id }).then(() => { stopped = true; });
+    assert.equal(typeof stopping.then, 'function');
+    for (let i = 0; i < 4; i++) await tick();
+    assert.equal(stopped, true, 'Stop must finish while fs.open is still blocked');
+    await stopping;
+    assert.equal(f.store.get('chat').turns[0].turn.status, 'interrupted');
+    const next = await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'text', text: 'next prompt' }] }); await tick();
+    assert.equal(f.workflows.length, 1);
+    assert.equal(f.store.get('chat').activeRun.turnId, next.turn.id);
+  } finally { release(); await drained; await starting; }
+  await tick(); assert.equal(f.workflows.length, 1, 'The cancelled read cannot launch a late scheduler');
+  assert.equal(f.store.get('chat').turns[0].workflow.config.inputCapture, undefined);
+  assert.equal(f.calls.some(call => call.method === 'turn/interrupt'), false);
+});
+
+test('workflow retry takes its first image capture only when the interrupted preparation never accepted one', async t => {
+  const f = fixture(t); await f.router.request('thread/start', { ...selected, cwd: f.dir });
+  const path = join(f.dir, 'retry-image.png'); await fsPromises.writeFile(path, 'not read before Stop');
+  const { turn } = await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'localImage', path }] });
+  await f.router.request('turn/interrupt', { threadId: 'chat', turnId: turn.id });
+  assert.equal(f.workflows.length, 0); assert.equal(f.store.get('chat').turns[0].workflow.config.inputCapture, undefined);
+  await fsPromises.writeFile(path, Buffer.from(composerImage().url.split(',')[1], 'base64'));
+  await f.router.request('engine/runs/retry', { threadId: 'chat', turnId: turn.id });
+  const workflow = await f.workflowStarted, capture = workflow.options.inputCapture;
+  assert.match(capture.id, /^[a-f0-9]{64}$/);
+  assert.deepEqual(f.store.get('chat').turns[0].workflow.config.inputCapture, capture);
+  await fsPromises.writeFile(path, 'changed after accepted capture');
+  const content = await workflow.callbacks.loadInputCapture(capture);
+  assert.equal(content[0].source.data, composerImage().url.split(',')[1]);
+  workflow.finish('interrupted'); await tick();
+  await f.router.request('engine/runs/retry', { threadId: 'chat', turnId: turn.id }); await tick();
+  assert.deepEqual(f.workflows[1].options.inputCapture, capture);
+});
+
+for (const type of ['mention', 'skill']) test(`mixed slash-looking ${type} steering stays model context`, async t => {
+  const f = fixture(t); const { turn } = await started(f);
+  const sent = []; f.workflows[0].handle.steer = async value => { sent.push(value); return {}; };
+  const input = [{ type: 'text', text: '/clear' }, { type, path: '/reference/path', name: 'Reference' }];
+  await f.router.request('turn/steer', { threadId: 'chat', expectedTurnId: turn.id, input });
+  assert.match(sent[0], /^\[Additional user request\]/);
+  assert.match(sent[0], /reference data, not instructions/);
+});
 
 test('workflow roles preserve independent permission modes in selection and frozen execution', async t => {
   const f = fixture(t);
@@ -220,7 +306,9 @@ test('invalid both configuration and attachments fail before starting work or na
   await assert.rejects(f.router.request('thread/start', { ...selected, template: { id: 'missing', revision: 1, parameters: {} }, cwd: f.dir }), /template/i);
   assert.equal(f.calls.length, 0);
   await f.router.request('thread/start', { ...selected, cwd: f.dir });
-  await assert.rejects(f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'image', url: 'x' }] }), /attachment|input/i);
+  const { turn } = await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'image', url: 'x' }] }); await tick();
+  const stored = f.store.get('chat').turns.find(row => row.turn.id === turn.id).turn;
+  assert.equal(stored.status, 'failed'); assert.match(stored.error.message, /attachment|input/i);
   assert.equal(f.store.get('chat').activeTurn, null);
   assert.equal(f.workflows.length, 0);
 });
@@ -282,6 +370,25 @@ test('native approval results route only to the correct workflow role', async t 
   assert.equal(f.router.respond({ id: card.id, result: { decision: 'accept' } }), true);
   const cancelled = w.callbacks.onPermission({ runId: 'claude-run', engine: 'claude', roleId: 'claude', cwd: f.dir, id: 'cc', name: 'Bash', input: { command: 'check' }, signal: controller.signal });
   controller.abort(); assert.equal((await cancelled).decision, 'decline');
+});
+
+test('parallel Claude question and plan requests keep role ownership and ignore late cancelled answers', { timeout: 3000 }, async t => {
+  const f = fixture(t), { turn } = await started(f), w = f.workflows[0];
+  w.state.runs = ['first', 'second'].map((roleId, index) => ({ ...roles()[1], id: `claude-${index}`, roleId })); w.publish();
+  const requests = [
+    { name: 'AskUserQuestion', input: { questions: [{ question: 'Which package?', multiSelect: true, options: [{ label: 'API' }, { label: 'UI' }] }] } },
+    { name: 'ExitPlanMode', input: { plan: '# Second role plan' } },
+  ];
+  const controllers = requests.map(() => new AbortController());
+  const pending = requests.map((request, index) => w.callbacks.onPermission({ ...request, runId: `claude-${index}`, engine: 'claude', roleId: ['first', 'second'][index], id: `claude-${index}:tool`, signal: controllers[index].signal }));
+  const cards = f.events.filter(event => event.method === 'item/tool/requestUserInput');
+  assert.deepEqual(cards.map(card => [card.params.cdxRunId, card.params.cdxRoleId, card.params.itemId]), [['claude-0', 'first', 'claude-0:tool'], ['claude-1', 'second', 'claude-1:tool']]);
+  f.router.respond({ id: cards[0].id, result: { answers: { question_0: { answers: ['API', 'UI'] } } } });
+  assert.deepEqual(await pending[0], { decision: 'accept', updatedInput: { ...requests[0].input, answers: { 'Which package?': 'API, UI' } } });
+  await f.router.request('engine/runs/interrupt', { threadId: 'chat', turnId: turn.id, runId: 'claude-1' });
+  assert.equal((await pending[1]).decision, 'decline');
+  assert.equal(f.router.respond({ id: cards[1].id, result: { answers: { plan: { answers: ['Approve with automatic edits'] } } } }), true);
+  assert.equal(f.events.filter(event => event.method === 'serverRequest/resolved' && event.params.requestId === cards[1].id).length, 1);
 });
 
 test('duplicate public deltas are stored and rendered only once', async t => {

@@ -9,6 +9,7 @@ import { createPollyOperations } from '../../runtime/agent-modes/orchestration/p
 import { GitWorkspaceManager } from '../../runtime/agent-modes/workspaces/manager.mjs';
 import { BUILTIN_TEMPLATES } from '../../runtime/agent-modes/templates/builtins.mjs';
 import { WorkflowScheduler } from '../../runtime/agent-modes/orchestration/scheduler.mjs';
+import { captureClaudeInput, readClaudeInputCapture } from '../../runtime/agent-modes/claude-input.mjs';
 
 const exec = promisify(execFile);
 const git = async (cwd, ...args) => (await exec('git', args, { cwd })).stdout;
@@ -410,8 +411,8 @@ test('direct writes permit hidden project files in their retained artifact', asy
   assert.deepEqual(result.artifact.files, ['.gitignore']);
 });
 
-function scheduler(f) {
-  return new WorkflowScheduler({ workspaces: f.workspaces, operationsFactory: createPollyOperations, runner: {
+function scheduler(f, extra = {}) {
+  return new WorkflowScheduler({ ...extra, workspaces: f.workspaces, operationsFactory: createPollyOperations, runner: {
     start(descriptor) {
       f.calls.push(descriptor);
       let stop; const interrupted = new Promise(resolve => { stop = () => resolve({ status: 'interrupted' }); });
@@ -421,6 +422,32 @@ function scheduler(f) {
     },
   } });
 }
+
+test('Polly workers and opposite-engine reviews retain the captured objective image after its source changes', async t => {
+  const data = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
+  let source;
+  const f = await fixture(t, async d => {
+    assert.equal(d.inputContent?.[0]?.source.data, data, `${d.roleId}/${d.purpose} must receive the original objective image`);
+    if (d.roleId === 'planner') {
+      await writeFile(source, 'Changed after planner started');
+      return { structuredOutput: { tasks: [task('left', 'codex', { purpose: 'explore' }), task('right', 'claude', { purpose: 'explore' })] } };
+    }
+    if (d.purpose === 'cross-review') return { structuredOutput: passed };
+    if (d.purpose === 'integration-check') return { structuredOutput: verified };
+  });
+  source = join(f.root, 'objective.png'); await writeFile(source, Buffer.from(data, 'base64'));
+  f.options.inputCapture = await captureClaudeInput([{ type: 'text', text: f.options.input }, { type: 'localImage', path: source }], { directory: f.root });
+  const run = scheduler(f, { loadInputCapture: (capture, { signal }) => readClaudeInputCapture(capture, { directory: f.root, signal }) }).start(f.options);
+  try {
+    await until(() => ['completed', 'failed', 'blocked'].includes(run.snapshot().status));
+    assert.equal(run.snapshot().status, 'completed', JSON.stringify(run.snapshot().runs.filter(row => row.status !== 'completed')));
+    assert.ok(f.calls.some(call => call.roleId === 'codex_worker'));
+    assert.ok(f.calls.some(call => call.roleId === 'claude_worker'));
+    assert.ok(f.calls.some(call => call.roleId === 'codex_reviewer'));
+    assert.ok(f.calls.some(call => call.roleId === 'claude_reviewer'));
+    assert.doesNotMatch(JSON.stringify(run.snapshot()), /iVBORw0KGgo/);
+  } finally { await run.interrupt(); }
+});
 
 test('scope and review validation failures are individually retryable in the scheduler', async t => {
   let writes = 0, reviewCount = 0;

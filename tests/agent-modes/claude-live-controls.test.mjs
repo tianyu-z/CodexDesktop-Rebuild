@@ -17,8 +17,8 @@ function fixture(methods = {}, extra = {}) {
     observed.input = request.prompt[Symbol.asyncIterator]().next();
     return {
       async initializationResult() { observed.initialized = true; return {}; },
-      async getStatus() { observed.controls.push('status'); return { state: 'working' }; },
-      async listPermissionRules() { observed.controls.push('permissions'); return { allow: ['Read(*)'] }; },
+      async getStatus() { observed.controls.push('status'); return { sections: [{ title: 'Session', rows: [{ label: 'Status', value: 'working' }] }] }; },
+      async listPermissionRules() { observed.controls.push('permissions'); return { state: { rules: [{ behavior: 'allow', rule: 'Read(*)' }] } }; },
       next() { return queued.length ? Promise.resolve({ done: false, value: queued.shift() }) : observed.closed ? Promise.resolve({ done: true }) : new Promise(resolve => waiters.push(resolve)); },
       close() { observed.closed = true; for (const resolve of waiters.splice(0)) resolve({ done: true }); },
       async return() { return { done: true }; }, async interrupt() {},
@@ -51,6 +51,19 @@ test('live controls enforce a narrow canonical command allowlist before invoking
   }
   assert.deepEqual(observed.controls, []);
   await run.interrupt();
+});
+
+test('live task stop reaches only an observed task in its selected adapter process', async () => {
+  const stopped = [], left = fixture({ stopTask: async id => stopped.push(id) }), right = fixture({ stopTask: async () => assert.fail('wrong native worker') });
+  left.push({ type: 'system', subtype: 'task_started', task_id: 'owned-task', description: 'Review' });
+  await tick();
+  await assert.rejects(right.run.control({ name: 'tasks', args: 'stop owned-task' }), /observed/);
+  assert.match((await left.run.control({ name: 'tasks', args: 'stop owned-task' })).text, /stop requested/);
+  assert.deepEqual(stopped, ['owned-task']);
+  left.push({ type: 'system', subtype: 'task_notification', task_id: 'owned-task', status: 'stopped' });
+  await tick();
+  await assert.rejects(left.run.control({ name: 'tasks', args: 'stop owned-task' }), /active/);
+  await Promise.all([left.run.interrupt(), right.run.interrupt()]);
 });
 
 test('cancelling a side question cancels only its control request and releases signal listeners', async () => {

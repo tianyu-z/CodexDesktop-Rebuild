@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { inputText } from './handoff.mjs';
-import { resolveClaudeCommand } from './claude-commands.mjs';
+import { claudeInputText, isClaudeCommandInput } from './claude-input.mjs';
+import { resolveClaudeCommand, isNativeClaudeGoal } from './claude-commands.mjs';
 import { presentItem, presentTurn } from './codex-events.mjs';
 
 /** Side controls share the running Query and never enter the workflow prompt. */
@@ -9,8 +9,9 @@ export async function liveClaudeControl(router, method, params) {
   if (!active) throw new Error('No Claude task is running. Send the command as a new message.');
   if ((params.expectedTurnId ?? params.turnId) && (params.expectedTurnId ?? params.turnId) !== active.turnId) throw new Error('Turn ownership mismatch.');
   const input = params.input ?? [{ type: 'text', text: params.command }];
-  const text = inputText(input).trim();
-  if (!/^\/(status|permissions|allowed-tools|tasks|bashes|btw)(?:\s|$)/.test(text)) throw new Error('Stop the active task before running this command. During a task use /status, /permissions, /tasks or /btw <question>.');
+  if (!isClaudeCommandInput(input)) throw new Error('Live Claude controls require a text-only slash command. Send attachments as a separate message.');
+  const text = claudeInputText(input).trim();
+  if (!/^\/(status|permissions|allowed-tools|tasks|bashes|btw|goal)(?:\s|$)/.test(text)) throw new Error('Stop the active task before running this command. During a task use /status, /permissions, /tasks, /goal or /btw <question>.');
   let owner, control, roleId, nativeRunId, stepId, cwd = chat.cwd;
   if (active.mode === 'both') {
     owner = router.workflow.active.get(active.id);
@@ -36,14 +37,20 @@ export async function liveClaudeControl(router, method, params) {
   if (!owner || (active.mode === 'both' ? typeof owner.handle?.control : typeof owner.adapterRun?.control) !== 'function') throw new Error('Claude is still starting. Retry the control after initialization.');
   const catalog = await router.adapter.listCommands({ cwd });
   const command = resolveClaudeCommand(catalog, text);
-  if (!command || !['status', 'permissions', 'tasks', 'btw'].includes(command.name) || command.origin !== 'app') throw new Error('Stop the active task before running this command.');
+  const nativeGoal = isNativeClaudeGoal(command);
+  if (!nativeGoal && (!command || !['status', 'permissions', 'tasks', 'btw'].includes(command.name) || command.origin !== 'app')) throw new Error('Stop the active task before running this command.');
   const response = await control(command);
-  if (router.store.require(chat.id).activeRun?.id !== active.id) throw new Error('The Claude task ended before this control completed. Retry as a new message.');
-  const source = { cdxClaudeLocalCommand: true, cdxEngineSource: 'claude', ...(roleId ? { cdxRoleId: roleId } : {}),
+  if (nativeGoal && response?.nativeInput !== true) throw new Error('This Claude adapter cannot send goal commands to its active input stream.');
+  const current = router.store.require(chat.id);
+  if (!nativeGoal && current.activeRun?.id !== active.id) throw new Error('The Claude task ended before this control completed. Retry as a new message.');
+  // A native input receipt can race Stop/completion; retain the accepted command
+  // on its original turn without restoring a stale running state.
+  if (nativeGoal) Object.assign(owner.turn, structuredClone(current.turns.find(row => row.turn.id === active.turnId).turn));
+  const source = { ...(!nativeGoal ? { cdxClaudeLocalCommand: true } : {}), cdxEngineSource: 'claude', ...(roleId ? { cdxRoleId: roleId } : {}),
     ...(nativeRunId ? { cdxRunId: nativeRunId, cdxStepId: stepId } : { cdxClaudeControlRunId: active.id }) };
   const items = [
     { id: `claude-control-user:${randomUUID()}`, type: 'userMessage', content: structuredClone(input), ...(params.clientUserMessageId ? { clientId: params.clientUserMessageId } : {}), ...source },
-    { id: `claude-control-output:${randomUUID()}`, type: 'agentMessage', text: response.text, phase: 'final_answer', ...source },
+    ...(!nativeGoal ? [{ id: `claude-control-output:${randomUUID()}`, type: 'agentMessage', text: response.text, phase: 'final_answer', ...source }] : []),
   ];
   owner.turn.items.push(...items);
   const engine = active.mode === 'both' ? 'both' : 'claude';

@@ -296,6 +296,21 @@ test('new native control capabilities are exposed as controls while discovered b
   await service.close();
 });
 
+test('native effort, output-style, fast and context commands retain precedence over app controls', async () => {
+  const service = catalog(metadataQuery(['effort', 'output-style', 'fast', 'context', 'usage'].map(name => ({ name, builtin: true }))));
+  const result = await service.list();
+  for (const name of ['effort', 'output-style', 'fast', 'context', 'usage']) {
+    const command = implementation.resolveClaudeCommand(result, `/${name}`);
+    assert.equal(command.origin, 'builtin');
+    assert.equal(command.execution, 'native');
+  }
+  assert.equal(implementation.resolveClaudeCommand(result, '/thinking off').control, 'thinking');
+  assert.equal(implementation.resolveClaudeCommand(result, '/tasks stop owned').args, 'stop owned');
+  assert.deepEqual(implementation.assertClaudeLiveCommand({ name: 'tasks', args: 'stop owned' }), { name: 'tasks', args: 'stop owned' });
+  assert.throws(() => implementation.assertClaudeLiveCommand({ name: 'tasks', args: 'stop foreign extra' }), /Usage/);
+  await service.close();
+});
+
 test('remote control enables the native worker without detaching its lifetime from the host', async () => {
   const enabled = [];
   const response = await implementation.executeClaudeControl({ async enableRemoteControl(...args) { enabled.push(args); return { url: 'https://claude.ai/code/session-fixture', bridge_session_id: 'session-fixture', work_secret: 'fixture-secret' }; } }, 'remote-control');

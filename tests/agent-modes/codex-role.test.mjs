@@ -6,6 +6,7 @@ import { NativeClient } from '../../runtime/agent-modes/upstream.mjs';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+const capturedImage = () => ({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC' } });
 function fixture({ replies = {}, options = {} } = {}) {
   const requests = [], notifications = [], responses = [], events = [];
   let callbacks, closes = 0;
@@ -51,6 +52,18 @@ test('native roles initialize a durable thread then pass the exact model and all
   assert.equal(result.actualModel, 'native-resolved');
   assert.equal(result.status, 'completed');
   assert.equal(f.closes, 1);
+});
+
+test('Codex roles and live steering receive captured image bytes without reopening local paths', async () => {
+  const inputContent = [capturedImage()], f = fixture({ options: { inputContent } });
+  inputContent[0].source.data = 'changed caller array';
+  await tick();
+  try {
+    const input = f.requests.find(request => request.method === 'turn/start').params.input;
+    assert.deepEqual(input, [{ type: 'text', text: 'Review it', text_elements: [] }, { type: 'image', url: `data:image/png;base64,${capturedImage().source.data}` }]);
+    await f.run.steer([capturedImage()]);
+    assert.deepEqual(f.requests.at(-1).params.input, [{ type: 'image', url: `data:image/png;base64,${capturedImage().source.data}` }]);
+  } finally { await f.run.interrupt(); }
 });
 
 test('read roles disable resolved MCP servers and delegation before using the native read-only sandbox', async () => {

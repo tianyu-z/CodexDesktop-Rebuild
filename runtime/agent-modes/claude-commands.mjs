@@ -4,11 +4,13 @@ import { realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { resolveClaudeEnvironment } from './claude-environment.mjs';
+import { callClaudeNativeControl, formatClaudeNativeControl, safeClaudeControlText, unsupportedClaudeControl, validateClaudeTaskArguments, executeClaudeSessionOptionControl } from './claude-native-controls.mjs';
+export { formatClaudeTasks } from './claude-native-controls.mjs';
 
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const validName = value => typeof value === 'string' && /^[^\s/\\\x00-\x1f\x7f]{1,200}$/u.test(value);
 const validFilename = value => typeof value === 'string' && /^[^/\\\x00-\x1f\x7f]{1,240}$/u.test(value) && !['.', '..'].includes(value);
-const unsupported = name => Object.assign(new Error(`/${name} requires a Claude capability or app action that is unavailable in this session.`), { code: 'CLAUDE_COMMAND_UNSUPPORTED' });
+const unsupported = unsupportedClaudeControl;
 
 // These are client-side commands in the official extension, not commands the
 // headless CLI advertises. Keep that distinction in the public catalog.
@@ -23,7 +25,12 @@ const appRows = [
   ['plan', 'Enable plan mode or view the current plan', 'control', [], '[open]'],
   ['copy', "Copy Claude's last response", 'local', [], '[N]'],
   ['export', 'Export the native conversation', 'control', [], '[filename]'],
-  ['tasks', 'View tasks in this session', 'local', ['bashes']],
+  ['tasks', 'View native tasks or stop a task in the selected live process', 'local', ['bashes'], '[stop <taskId>]'],
+  ['context', 'View native context usage', 'control'],
+  ['usage', 'View native session usage and available rate limits', 'control', ['cost', 'stats']],
+  ['effort', 'Set effort for this chat or selected role', 'control', [], '<low|medium|high|xhigh|max|auto>'],
+  ['thinking', 'Set thinking for this chat or selected role', 'control', [], '<on|off|adaptive|budgetTokens>'],
+  ['output-style', 'Set a native output style for this chat or selected role', 'control', [], '<name>'],
   ['btw', 'Ask a native side question', 'control', [], '[question]'],
   ['rewind', 'Preview or restore tracked files at a checkpoint', 'control', ['checkpoint', 'undo'], '[user-message-uuid] [--dry-run|--apply]'],
   ['resume', 'Resume an earlier Claude conversation', 'local', ['continue']],
@@ -103,7 +110,7 @@ export function assertClaudeCommandAccess(command, access) {
   const mutates = name === 'rewind' && /(?:^|\s)--apply(?:\s|$)/.test(args)
     || native && (
       ['reload-plugins', 'add-dir', 'terminal-setup', 'install-github-app'].includes(name)
-      || ['config', 'mcp', 'plugin', 'plugins', 'marketplace', 'hooks', 'memory', 'sandbox', 'chrome', 'permissions'].includes(name) && args !== '' && !inspection
+      || ['config', 'mcp', 'plugin', 'plugins', 'marketplace', 'hooks', 'memory', 'sandbox', 'chrome', 'permissions', 'output-style'].includes(name) && args !== '' && !inspection
       || name === 'rewind' && args !== '' && !/(?:^|\s)--dry-run(?:\s|$)/.test(args)
     );
   if (mutates) throw new Error(`/${name} requires write access; this Claude role has read-only access.`);
@@ -255,13 +262,7 @@ export class ClaudeCommandCatalog {
 }
 
 const secretKey = /^(?:env|headers|.*(?:api.?key|auth|password|secret|credential).*|(?:access|refresh|api|bearer)[_-]?token|token)$/i;
-function safeText(value) {
-  return String(value)
-    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
-    .replace(/\b(?:sk-ant-|sk-)[A-Za-z0-9_-]{12,}/g, '[redacted]')
-    .replace(/\b([\w-]*(?:token|secret|password|api[_-]?key|authorization)[\w-]*\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,)]+)/gi, '$1[redacted]')
-    .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1[redacted]@');
-}
+const safeText = safeClaudeControlText;
 function safeData(value, depth = 0) {
   if (depth > 12) return '[nested value]';
   if (typeof value === 'string') return safeText(value);
@@ -272,41 +273,38 @@ function safeData(value, depth = 0) {
 }
 const formatted = (title, data, hint = '') => ({ text: `${title}\n\n\`\`\`json\n${JSON.stringify(safeData(data), null, 2)}\n\`\`\`${hint ? `\n\n${hint}` : ''}` });
 
+export const isNativeClaudeGoal = command => command?.name === 'goal' && command.origin === 'builtin' && command.execution === 'native';
+
 export function assertClaudeLiveCommand(command) {
+  if (isNativeClaudeGoal(command) && (command.args === undefined || typeof command.args === 'string')) {
+    const args = (command.args ?? '').trim();
+    return { name: 'goal', origin: 'builtin', execution: 'native', args, input: `/goal${args ? ` ${args}` : ''}` };
+  }
   if (!record(command) || !['status', 'permissions', 'tasks', 'btw'].includes(command.name) || command.args !== undefined && typeof command.args !== 'string') throw new TypeError('This command is unavailable while Claude is active.');
   const args = (command.args ?? '').trim();
-  if (command.name === 'btw' ? !args : args !== '') throw new TypeError(command.name === 'btw' ? 'Use /btw <question> while Claude is active.' : `/${command.name} arguments are unavailable while Claude is active.`);
+  if (command.name === 'tasks') validateClaudeTaskArguments(args);
+  else if (command.name === 'btw' ? !args : args !== '') throw new TypeError(command.name === 'btw' ? 'Use /btw <question> while Claude is active.' : `/${command.name} arguments are unavailable while Claude is active.`);
   return { name: command.name, args };
 }
 
-export function formatClaudeTasks(tasks) {
-  const nativeTasks = structuredClone(tasks);
-  const text = nativeTasks.length ? `Native Claude tasks\n\n${nativeTasks.map(task => {
-    const state = task.processEnded ? `${task.status}${task.lastStatus ? ` (last seen ${task.lastStatus})` : ' (process-ended)'}` : task.status;
-    return `- ${task.id}: ${task.description ?? task.taskType ?? 'Task'} — ${state}${task.ambient ? ' (ambient)' : ''}${task.summary ? `; ${task.summary}` : ''}`;
-  }).join('\n')}` : 'No native tasks have been observed in this Claude process.';
-  return { text: safeText(text), nativeTasks };
-}
-
 /** Pinned SDK internals are guarded. Missing capabilities never become prompts. */
-export async function executeClaudeControl(query, command, args = '', { signal, access } = {}) {
+export async function executeClaudeControl(query, command, args = '', { signal, access, currentOptions, modelInfo } = {}) {
   const name = typeof command === 'string' ? command.replace(/^\//, '') : command?.control ?? command?.name;
   const argument = (typeof command === 'object' && command?.args !== undefined ? command.args : args).trim();
   assertClaudeCommandAccess({ ...(typeof command === 'object' ? command : {}), name, args: argument, execution: 'control' }, access);
-  if (argument && !['btw', 'feedback', 'rewind', 'export'].includes(name) && !(name === 'plan' && argument === 'open')) throw Object.assign(new Error(`/${name} arguments must be handled by the native command or app action.`), { code: 'CLAUDE_COMMAND_UNSUPPORTED' });
+  if (argument && !['btw', 'feedback', 'rewind', 'export', 'effort', 'thinking', 'output-style'].includes(name) && !(name === 'plan' && argument === 'open')) throw Object.assign(new Error(`/${name} arguments must be handled by the native command or app action.`), { code: 'CLAUDE_COMMAND_UNSUPPORTED' });
   const requireMethod = method => { if (typeof query?.[method] !== 'function') throw unsupported(name); };
-  const call = async (method, ...values) => {
-    requireMethod(method);
-    try { return await query[method](...values); }
-    catch { throw Object.assign(new Error(`Claude could not complete /${name}. Check the native session and retry.`), { code: 'CLAUDE_COMMAND_CONTROL_FAILED' }); }
-  };
+  const call = (method, ...values) => callClaudeNativeControl(query, name, method, values, { signal });
   switch (name) {
-    case 'status': return formatted('Claude status', await call('getStatus'));
-    case 'permissions': return formatted('Claude permissions', await call('listPermissionRules'), 'Choose a permission mode in the composer. Claude applies the native permission rules to each tool request.');
-    case 'skills': return formatted('Claude skills', await call('getSkillsDialog'));
-    case 'mcp': return formatted('Claude MCP servers', await call('mcpServerStatus'), 'Use /mcp reconnect|enable|disable <server> to manage a server.');
-    case 'memory': return formatted('Claude memory', await call('getMemoryDialog'));
-    case 'hooks': return formatted('Claude hooks', await call('getHooksListing'));
+    case 'status': return formatClaudeNativeControl(name, await call('getStatus'));
+    case 'permissions': return formatClaudeNativeControl(name, await call('listPermissionRules'));
+    case 'skills': return formatClaudeNativeControl(name, await call('getSkillsDialog'));
+    case 'mcp': return formatClaudeNativeControl(name, await call('mcpServerStatus'));
+    case 'memory': return formatClaudeNativeControl(name, await call('getMemoryDialog'));
+    case 'hooks': return formatClaudeNativeControl(name, await call('getHooksListing'));
+    case 'context': return formatClaudeNativeControl(name, await call('getContextUsage', { detail: 'summary' }));
+    case 'usage': return formatClaudeNativeControl(name, await call('usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET', { skipBehaviors: true }));
+    case 'effort': case 'thinking': case 'output-style': return executeClaudeSessionOptionControl(query, name, argument, { signal, currentOptions, modelInfo });
     case 'sandbox': return formatted('Claude sandbox', await call('getSandboxDialog'));
     case 'chrome': return formatted('Claude in Chrome', await call('getChromeDialog'));
     case 'remote-control': {
@@ -341,21 +339,17 @@ export async function executeClaudeControl(query, command, args = '', { signal, 
       return formatted(dryRun ? 'File rewind preview' : 'Rewound tracked files', response, dryRun && response?.canRewind === true ? `Use /rewind ${id} --apply to restore these files.` : '');
     }
     case 'config': {
-      const data = await call('getSettings');
-      const settings = record(data?.effective) ? data.effective : {};
-      const displayKeys = ['model', 'effortLevel', 'outputStyle', 'permissions', 'sandbox', 'disableAllHooks', 'fastMode', 'autoCompactWindow', 'language', 'enabledPlugins'];
-      return formatted('Claude configuration', { effective: Object.fromEntries(displayKeys.filter(key => key in settings).map(key => [key, settings[key]])), applied: data?.applied }, 'Use /config key=value to change native Claude settings. Run /config help for the keys accepted by this Claude version.');
+      return formatClaudeNativeControl(name, await call('getSettings'));
     }
     case 'plugins': {
-      const data = await call('getSettings');
-      return formatted('Configured Claude plugins', { enabledPlugins: data?.effective?.enabledPlugins ?? {} }, 'Use /reload-plugins to apply plugin changes to this session.');
+      return formatClaudeNativeControl(name, await call('getSettings'));
     }
     case 'help': {
       const commands = withAppCommands(normalizeClaudeCommands(await call('supportedCommands')));
       return { text: commands.map(row => `/${row.invocation ?? row.name}${row.argumentHint ? ` ${row.argumentHint}` : ''} — ${safeText(row.description)}`).join('\n') };
     }
     case 'plan': {
-      if (argument === 'open') return formatted('Claude plan', await call('getPlan'));
+      if (argument === 'open') return formatClaudeNativeControl(name, await call('getPlan'));
       await call('setPermissionMode', 'plan');
       return { text: 'Plan mode enabled.', settingsPatch: { permissionMode: 'plan' } };
     }

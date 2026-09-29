@@ -1,0 +1,2118 @@
+{
+  "versions": {
+    "cli": "2.1.283",
+    "extension": "2.1.283",
+    "appSdk": "0.3.282",
+    "extensionSdk": "0.3.283"
+  },
+  "extensionCommands": [
+    {
+      "command": "claude-vscode.editor.open",
+      "title": "Claude Code: Open in New Tab",
+      "icon": {
+        "light": "resources/claude-logo.svg",
+        "dark": "resources/claude-logo.svg"
+      }
+    },
+    {
+      "command": "claude-vscode.editor.openLast",
+      "title": "Claude Code: Open",
+      "icon": {
+        "light": "resources/claude-logo.svg",
+        "dark": "resources/claude-logo.svg"
+      }
+    },
+    {
+      "command": "claude-vscode.primaryEditor.open",
+      "title": "Claude Code: Open in Primary Editor",
+      "icon": {
+        "light": "resources/claude-logo.svg",
+        "dark": "resources/claude-logo.svg"
+      }
+    },
+    {
+      "command": "claude-vscode.window.open",
+      "title": "Claude Code: Open in New Window"
+    },
+    {
+      "command": "claude-vscode.createWorktree",
+      "title": "Claude Code: Create Worktree"
+    },
+    {
+      "command": "claude-vscode.sidebar.open",
+      "title": "Claude Code: Open in Side Bar",
+      "icon": {
+        "light": "resources/claude-logo.svg",
+        "dark": "resources/claude-logo.svg"
+      }
+    },
+    {
+      "command": "claude-vscode.newConversation",
+      "title": "Claude Code: New Conversation"
+    },
+    {
+      "command": "claude-vscode.reopenClosedSession",
+      "title": "Claude Code: Reopen Closed Session"
+    },
+    {
+      "command": "claude-vscode.update",
+      "title": "Claude Code: Update extension"
+    },
+    {
+      "command": "claude-vscode.focus",
+      "title": "Claude Code: Focus input"
+    },
+    {
+      "command": "claude-vscode.focusLastMessage",
+      "title": "Claude Code: Focus last message"
+    },
+    {
+      "command": "claude-vscode.blur",
+      "title": "Claude Code: Blur input"
+    },
+    {
+      "command": "claude-vscode.logout",
+      "title": "Claude Code: Logout"
+    },
+    {
+      "command": "claude-vscode.terminal.open",
+      "title": "Claude Code: Open in Terminal",
+      "icon": {
+        "light": "resources/claude-logo.svg",
+        "dark": "resources/claude-logo.svg"
+      }
+    },
+    {
+      "command": "claude-vscode.acceptProposedDiff",
+      "title": "Claude Code: Accept Proposed Changes",
+      "enablement": "claude-vscode.viewingProposedDiff",
+      "icon": "$(check)"
+    },
+    {
+      "command": "claude-vscode.rejectProposedDiff",
+      "title": "Claude Code: Reject Proposed Changes",
+      "enablement": "claude-vscode.viewingProposedDiff",
+      "icon": "$(discard)"
+    },
+    {
+      "command": "claude-vscode.acceptProposedHunk",
+      "title": "Claude Code: Accept Change at Cursor",
+      "enablement": "claude-vscode.viewingProposedDiff",
+      "icon": "$(check)"
+    },
+    {
+      "command": "claude-vscode.rejectProposedHunk",
+      "title": "Claude Code: Reject Change at Cursor",
+      "enablement": "claude-vscode.viewingProposedDiff",
+      "icon": "$(discard)"
+    },
+    {
+      "command": "claude-vscode.acceptProposedHunkFromBar",
+      "title": "Accept this change",
+      "icon": "$(check)"
+    },
+    {
+      "command": "claude-vscode.rejectProposedHunkFromBar",
+      "title": "Reject this change",
+      "icon": "$(discard)"
+    },
+    {
+      "command": "claude-vscode.insertAtMention",
+      "title": "Claude Code: Insert @-Mention Reference"
+    },
+    {
+      "command": "claude-vscode.installPlugin",
+      "title": "Claude Code: Install Plugin"
+    },
+    {
+      "command": "claude-code.acceptProposedDiff",
+      "title": "Claude Code: Accept Proposed Changes",
+      "enablement": "claude-code.viewingProposedDiff",
+      "icon": "$(check)"
+    },
+    {
+      "command": "claude-code.rejectProposedDiff",
+      "title": "Claude Code: Reject Proposed Changes",
+      "enablement": "claude-code.viewingProposedDiff",
+      "icon": "$(discard)"
+    },
+    {
+      "command": "claude-code.insertAtMentioned",
+      "title": "Claude Code: Insert At-Mentioned"
+    },
+    {
+      "command": "claude-vscode.showLogs",
+      "title": "Claude Code: Show Logs"
+    },
+    {
+      "command": "claude-vscode.toggleFocusView",
+      "title": "Claude Code: Toggle Focus view"
+    },
+    {
+      "command": "claude-vscode.openWalkthrough",
+      "title": "Claude Code: Open Walkthrough"
+    },
+    {
+      "command": "claude-vscode.markSessionUnread",
+      "title": "Claude Code: Mark Session as Unread"
+    },
+    {
+      "command": "claude-vscode.renameSessionTab",
+      "title": "Claude Code: Rename Session Tab"
+    },
+    {
+      "command": "claude-vscode.addSessionTabToGroup",
+      "title": "Claude Code: Add Session Tab to Group"
+    }
+  ],
+  "extensionKeybindings": [
+    {
+      "command": "claude-vscode.insertAtMention",
+      "key": "alt+k",
+      "mac": "alt+k",
+      "when": "editorTextFocus"
+    },
+    {
+      "command": "claude-vscode.focus",
+      "key": "cmd+escape",
+      "mac": "cmd+escape",
+      "win": "ctrl+escape",
+      "linux": "ctrl+escape",
+      "when": "!config.claudeCode.useTerminal && editorTextFocus"
+    },
+    {
+      "command": "claude-vscode.blur",
+      "key": "cmd+escape",
+      "mac": "cmd+escape",
+      "win": "ctrl+escape",
+      "linux": "ctrl+escape",
+      "when": "!config.claudeCode.useTerminal && !editorTextFocus"
+    },
+    {
+      "command": "claude-vscode.editor.open",
+      "key": "cmd+shift+escape",
+      "mac": "cmd+shift+escape",
+      "win": "ctrl+shift+escape",
+      "linux": "ctrl+shift+escape",
+      "when": "!config.claudeCode.useTerminal"
+    },
+    {
+      "command": "claude-vscode.terminal.open.keyboard",
+      "key": "cmd+escape",
+      "mac": "cmd+escape",
+      "win": "ctrl+escape",
+      "linux": "ctrl+escape",
+      "when": "config.claudeCode.useTerminal"
+    },
+    {
+      "command": "claude-code.insertAtMentioned",
+      "key": "cmd+alt+K",
+      "mac": "cmd+alt+K",
+      "win": "ctrl+alt+K",
+      "linux": "ctrl+alt+K",
+      "when": "editorTextFocus"
+    },
+    {
+      "command": "claude-vscode.newConversation",
+      "key": "cmd+n",
+      "mac": "cmd+n",
+      "win": "ctrl+n",
+      "linux": "ctrl+n",
+      "when": "config.claudeCode.enableNewConversationShortcut && (activeWebviewPanelId == 'claudeVSCodePanel' || (claude-vscode.sideBarActive && !editorFocus && !panelFocus))"
+    },
+    {
+      "command": "claude-vscode.toggleFocusView",
+      "key": "ctrl+alt+f",
+      "when": "activeWebviewPanelId == 'claudeVSCodePanel' || claude-vscode.sideBarActive"
+    },
+    {
+      "command": "claude-vscode.reopenClosedSession",
+      "key": "cmd+shift+t",
+      "mac": "cmd+shift+t",
+      "win": "ctrl+shift+t",
+      "linux": "ctrl+shift+t",
+      "when": "config.claudeCode.enableReopenClosedSessionShortcut && claude-vscode.lastClosedWasSession"
+    }
+  ],
+  "extensionSettings": [
+    "claudeCode.environmentVariables",
+    "claudeCode.useTerminal",
+    "claudeCode.allowDangerouslySkipPermissions",
+    "claudeCode.claudeProcessWrapper",
+    "claudeCode.respectGitIgnore",
+    "claudeCode.initialPermissionMode",
+    "claudeCode.disableLoginPrompt",
+    "claudeCode.autosave",
+    "claudeCode.focusView",
+    "claudeCode.useCtrlEnterToSend",
+    "claudeCode.preferredLocation",
+    "claudeCode.lockEditorGroups",
+    "claudeCode.enableNewConversationShortcut",
+    "claudeCode.enableReopenClosedSessionShortcut",
+    "claudeCode.hideOnboarding",
+    "claudeCode.attachOpenFile",
+    "claudeCode.continueAfterReload",
+    "claudeCode.scrollToBottomOnSend",
+    "claudeCode.archiveInactiveSessions",
+    "claudeCode.usePythonEnvironment"
+  ],
+  "nativeCommands": [
+    {
+      "name": "academic-pptx",
+      "origin": "skill",
+      "aliases": []
+    },
+    {
+      "name": "eli5",
+      "origin": "skill",
+      "aliases": []
+    },
+    {
+      "name": "deep-research",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "slack:channel-digest",
+      "origin": "skill",
+      "aliases": []
+    },
+    {
+      "name": "slack:draft-announcement",
+      "origin": "skill",
+      "aliases": []
+    },
+    {
+      "name": "slack:find-discussions",
+      "origin": "skill",
+      "aliases": []
+    },
+    {
+      "name": "slack:standup",
+      "origin": "skill",
+      "aliases": []
+    },
+    {
+      "name": "slack:summarize-channel",
+      "origin": "skill",
+      "aliases": []
+    },
+    {
+      "name": "slack:block-kit",
+      "origin": "skill",
+      "aliases": [
+        "block-kit"
+      ]
+    },
+    {
+      "name": "slack:create-slack-app",
+      "origin": "skill",
+      "aliases": [
+        "create-slack-app"
+      ]
+    },
+    {
+      "name": "slack:slack-api",
+      "origin": "skill",
+      "aliases": [
+        "slack-api"
+      ]
+    },
+    {
+      "name": "slack:slack-cli",
+      "origin": "skill",
+      "aliases": [
+        "slack-cli"
+      ]
+    },
+    {
+      "name": "slack:slack-docs",
+      "origin": "skill",
+      "aliases": [
+        "slack-docs"
+      ]
+    },
+    {
+      "name": "slack:slack-messaging",
+      "origin": "skill",
+      "aliases": [
+        "slack-messaging"
+      ]
+    },
+    {
+      "name": "slack:slack-search",
+      "origin": "skill",
+      "aliases": [
+        "slack-search"
+      ]
+    },
+    {
+      "name": "slack:test-slack-app",
+      "origin": "skill",
+      "aliases": [
+        "test-slack-app"
+      ]
+    },
+    {
+      "name": "skill-codex:codex",
+      "origin": "skill",
+      "aliases": [
+        "codex"
+      ]
+    },
+    {
+      "name": "superpowers:brainstorming",
+      "origin": "skill",
+      "aliases": [
+        "brainstorming"
+      ]
+    },
+    {
+      "name": "superpowers:diagnosing-superpowers",
+      "origin": "skill",
+      "aliases": [
+        "diagnosing-superpowers"
+      ]
+    },
+    {
+      "name": "superpowers:dispatching-parallel-agents",
+      "origin": "skill",
+      "aliases": [
+        "dispatching-parallel-agents"
+      ]
+    },
+    {
+      "name": "superpowers:executing-plans",
+      "origin": "skill",
+      "aliases": [
+        "executing-plans"
+      ]
+    },
+    {
+      "name": "superpowers:finishing-a-development-branch",
+      "origin": "skill",
+      "aliases": [
+        "finishing-a-development-branch"
+      ]
+    },
+    {
+      "name": "superpowers:receiving-code-review",
+      "origin": "skill",
+      "aliases": [
+        "receiving-code-review"
+      ]
+    },
+    {
+      "name": "superpowers:requesting-code-review",
+      "origin": "skill",
+      "aliases": [
+        "requesting-code-review"
+      ]
+    },
+    {
+      "name": "superpowers:subagent-driven-development",
+      "origin": "skill",
+      "aliases": [
+        "subagent-driven-development"
+      ]
+    },
+    {
+      "name": "superpowers:systematic-debugging",
+      "origin": "skill",
+      "aliases": [
+        "systematic-debugging"
+      ]
+    },
+    {
+      "name": "superpowers:test-driven-development",
+      "origin": "skill",
+      "aliases": [
+        "test-driven-development"
+      ]
+    },
+    {
+      "name": "superpowers:using-git-worktrees",
+      "origin": "skill",
+      "aliases": [
+        "using-git-worktrees"
+      ]
+    },
+    {
+      "name": "superpowers:using-superpowers",
+      "origin": "skill",
+      "aliases": [
+        "using-superpowers"
+      ]
+    },
+    {
+      "name": "superpowers:verification-before-completion",
+      "origin": "skill",
+      "aliases": [
+        "verification-before-completion"
+      ]
+    },
+    {
+      "name": "superpowers:writing-plans",
+      "origin": "skill",
+      "aliases": [
+        "writing-plans"
+      ]
+    },
+    {
+      "name": "superpowers:writing-skills",
+      "origin": "skill",
+      "aliases": [
+        "writing-skills"
+      ]
+    },
+    {
+      "name": "dataviz",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "update-config",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "verify",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "debug",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "code-review",
+      "origin": "builtin",
+      "aliases": [
+        "review"
+      ]
+    },
+    {
+      "name": "simplify",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "batch",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "fewer-permission-prompts",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "doctor",
+      "origin": "builtin",
+      "aliases": [
+        "checkup"
+      ]
+    },
+    {
+      "name": "loop",
+      "origin": "builtin",
+      "aliases": [
+        "proactive"
+      ]
+    },
+    {
+      "name": "claude-api",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "workflow-authoring",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "run",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "run-skill-generator",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "agents",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "auto-mode-setup",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "autocompact",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "clear",
+      "origin": "builtin",
+      "aliases": [
+        "reset",
+        "new"
+      ]
+    },
+    {
+      "name": "color",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "compact",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "config",
+      "origin": "builtin",
+      "aliases": [
+        "settings"
+      ]
+    },
+    {
+      "name": "output-style",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "context",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "effort",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "fast",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "focus",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "heapdump",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "init",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "mcp",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "model",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "__remote-workflow",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "workflow-launch-exec",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "reload-plugins",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "reload-skills",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "rename",
+      "origin": "builtin",
+      "aliases": [
+        "name"
+      ]
+    },
+    {
+      "name": "security-review",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "usage",
+      "origin": "builtin",
+      "aliases": [
+        "cost",
+        "stats"
+      ]
+    },
+    {
+      "name": "insights",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "recap",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "goal",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "list-agents",
+      "origin": "builtin",
+      "aliases": [
+        "peers"
+      ]
+    },
+    {
+      "name": "team-onboarding",
+      "origin": "builtin",
+      "aliases": []
+    },
+    {
+      "name": "status",
+      "origin": "app",
+      "aliases": []
+    },
+    {
+      "name": "permissions",
+      "origin": "app",
+      "aliases": [
+        "allowed-tools"
+      ]
+    },
+    {
+      "name": "skills",
+      "origin": "app",
+      "aliases": []
+    },
+    {
+      "name": "help",
+      "origin": "app",
+      "aliases": []
+    },
+    {
+      "name": "memory",
+      "origin": "app",
+      "aliases": []
+    },
+    {
+      "name": "hooks",
+      "origin": "app",
+      "aliases": []
+    },
+    {
+      "name": "plugins",
+      "origin": "app",
+      "aliases": [
+        "plugin",
+        "marketplace"
+      ]
+    },
+    {
+      "name": "plan",
+      "origin": "app",
+      "aliases": []
+    },
+    {
+      "name": "copy",
+      "origin": "app",
+      "aliases": []
+    },
+    {
+      "name": "export",
+      "origin": "app",
+      "aliases": []
+    },
+    {
+      "name": "tasks",
+      "origin": "app",
+      "aliases": [
+        "bashes"
+      ]
+    },
+    {
+      "name": "btw",
+      "origin": "app",
+      "aliases": []
+    },
+    {
+      "name": "rewind",
+      "origin": "app",
+      "aliases": [
+        "checkpoint",
+        "undo"
+      ]
+    },
+    {
+      "name": "resume",
+      "origin": "app",
+      "aliases": [
+        "continue"
+      ]
+    },
+    {
+      "name": "feedback",
+      "origin": "app",
+      "aliases": [
+        "bug"
+      ]
+    },
+    {
+      "name": "remote-control",
+      "origin": "app",
+      "aliases": [
+        "rc"
+      ]
+    },
+    {
+      "name": "chrome",
+      "origin": "app",
+      "aliases": []
+    },
+    {
+      "name": "sandbox",
+      "origin": "app",
+      "aliases": []
+    }
+  ],
+  "nativeApi": {
+    "cliVersion": "2.1.283 (Claude Code)",
+    "sdkVersion": "0.3.282",
+    "cliSha256": "d8cb1e5c79684cc12a8bfc813e3a2073406921b6245744b3009be3ab5651d21e",
+    "sdkOptions": [
+      "abortController",
+      "additionalDirectories",
+      "projectConfigRoot",
+      "agent",
+      "agents",
+      "allowedTools",
+      "canUseTool",
+      "continue",
+      "cwd",
+      "disallowedTools",
+      "toolAliases",
+      "tools",
+      "env",
+      "executable",
+      "executableArgs",
+      "extraArgs",
+      "fallbackModel",
+      "enableFileCheckpointing",
+      "toolConfig",
+      "forkSession",
+      "betas",
+      "hooks",
+      "onElicitation",
+      "onUserDialog",
+      "supportedDialogKinds",
+      "perTaskStopAffordance",
+      "persistSession",
+      "sessionStore",
+      "sessionStoreFlush",
+      "loadTimeoutMs",
+      "includeHookEvents",
+      "includePartialMessages",
+      "forwardSubagentText",
+      "verbatimPrompts",
+      "thinking",
+      "effort",
+      "maxThinkingTokens",
+      "maxTurns",
+      "maxBudgetUsd",
+      "taskBudget",
+      "mcpServers",
+      "model",
+      "outputFormat",
+      "pathToClaudeCodeExecutable",
+      "permissionMode",
+      "planModeInstructions",
+      "allowDangerouslySkipPermissions",
+      "permissionPromptToolName",
+      "permissionPrompts",
+      "plugins",
+      "pluginDelivery",
+      "promptSuggestions",
+      "agentProgressSummaries",
+      "resume",
+      "sessionId",
+      "resumeSessionAt",
+      "resumeDropsTurn",
+      "sandbox",
+      "settings",
+      "managedSettings",
+      "settingSources",
+      "skills",
+      "debug",
+      "debugFile",
+      "stderr",
+      "strictMcpConfig",
+      "systemPrompt",
+      "title",
+      "spawnClaudeCodeProcess"
+    ],
+    "settingsKeys": [
+      "apiKeyHelper",
+      "proxyAuthHelper",
+      "awsCredentialExport",
+      "awsAuthRefresh",
+      "gcpAuthRefresh",
+      "processWrapper",
+      "policyHelper",
+      "fileSuggestion",
+      "respectGitignore",
+      "cleanupPeriodDays",
+      "desktopSessionCleanupPeriodDays",
+      "syncClaudeAiSkills",
+      "syncClaudeAiPlugins",
+      "skillListingMaxDescChars",
+      "skillListingBudgetFraction",
+      "wslInheritsWindowsSettings",
+      "env",
+      "attribution",
+      "includeCoAuthoredBy",
+      "includeGitInstructions",
+      "permissions",
+      "model",
+      "fallbackModel",
+      "availableModels",
+      "enforceAvailableModels",
+      "modelOverrides",
+      "modelPicker",
+      "modelPricing",
+      "enableAllProjectMcpServers",
+      "enabledMcpjsonServers",
+      "disabledMcpjsonServers",
+      "disableClaudeAiConnectors",
+      "skillOverrides",
+      "disableBundledSkills",
+      "managedMcpServers",
+      "allowedMcpServers",
+      "deniedMcpServers",
+      "hooks",
+      "worktree",
+      "disableAllHooks",
+      "disableAgentView",
+      "disableRemoteControl",
+      "disableWorkflows",
+      "disableArtifact",
+      "enableArtifact",
+      "enableWorkflows",
+      "workflowSizeGuideline",
+      "workflowKeywordTriggerEnabled",
+      "disableSkillShellExecution",
+      "defaultShell",
+      "bashEditDiffEnabled",
+      "bashOutputMaxChars",
+      "taskOutputMaxChars",
+      "respondToBashCommands",
+      "allowManagedHooksOnly",
+      "allowedHttpHookUrls",
+      "httpHookAllowedEnvVars",
+      "allowManagedPermissionRulesOnly",
+      "allowManagedMcpServersOnly",
+      "allowAllClaudeAiMcps",
+      "allowClaudeInChromeWithManagedMcp",
+      "strictPluginOnlyCustomization",
+      "statusLine",
+      "prUrlTemplate",
+      "footerLinksRegexes",
+      "subagentStatusLine",
+      "enabledPlugins",
+      "prependPlugins",
+      "appendPlugins",
+      "extraKnownMarketplaces",
+      "additionalMarketplaces",
+      "strictKnownMarketplaces",
+      "allowedMarketplaces",
+      "blockedMarketplaces",
+      "disableCommandPluginSources",
+      "disableSideloadFlags",
+      "pluginSuggestionMarketplaces",
+      "forceLoginMethod",
+      "forceLoginGatewayUrl",
+      "gatewayInternalNetworks",
+      "parentSettingsBehavior",
+      "managedSourcesBehavior",
+      "forceLoginOrgUUID",
+      "forceRemoteSettingsRefresh",
+      "otelHeadersHelper",
+      "outputStyle",
+      "viewMode",
+      "language",
+      "skipWebFetchPreflight",
+      "sandbox",
+      "feedbackSurveyRate",
+      "feedbackDrafts",
+      "spinnerTipsEnabled",
+      "spinnerVerbs",
+      "spinnerTipsOverride",
+      "syntaxHighlightingDisabled",
+      "maxProseWidth",
+      "spellcheck",
+      "terminalTitleFromRename",
+      "promptCacheTtl",
+      "subagentPromptCacheTtl",
+      "alwaysThinkingEnabled",
+      "effortLevel",
+      "maxEffortLevel",
+      "modelSettings",
+      "ultracode",
+      "autoCompactWindow",
+      "advisorModel",
+      "fastMode",
+      "fastModePerSessionOptIn",
+      "promptSuggestionEnabled",
+      "emojiCompletionEnabled",
+      "showClearContextOnPlanAccept",
+      "askUserQuestionTimeout",
+      "dialogExpiry",
+      "agent",
+      "companyAnnouncements",
+      "pluginConfigs",
+      "remote",
+      "autoUpdatesChannel",
+      "minimumVersion",
+      "requiredMinimumVersion",
+      "requiredMaximumVersion",
+      "plansDirectory",
+      "tui",
+      "voice",
+      "channelsEnabled",
+      "allowedChannelPlugins",
+      "prefersReducedMotion",
+      "timeFormat",
+      "timeZone",
+      "autoMemoryEnabled",
+      "autoMemoryDirectory",
+      "autoDreamEnabled",
+      "showThinkingSummaries",
+      "skipDangerousModePermissionPrompt",
+      "disableAutoMode",
+      "sshConfigs",
+      "claudeMd",
+      "claudeMdExcludes",
+      "pluginTrustMessage",
+      "theme",
+      "editorMode",
+      "keybindingFlavor",
+      "vimInsertModeRemaps",
+      "verbose",
+      "preferredNotifChannel",
+      "autoCompactEnabled",
+      "precomputeCompactionEnabled",
+      "switchModelsOnFlag",
+      "autoContinueAtUsageLimit",
+      "autoScrollEnabled",
+      "wheelScrollAccelerationEnabled",
+      "fileCheckpointingEnabled",
+      "showTurnDuration",
+      "showMessageTimestamps",
+      "terminalProgressBarEnabled",
+      "todoFeatureEnabled",
+      "teammateMode",
+      "remoteControlAtStartup",
+      "isolatePeerMachines",
+      "daemonColdStart",
+      "crossSessionInbound",
+      "autoUploadSessions",
+      "inputNeededNotifEnabled",
+      "agentPushNotifEnabled",
+      "disableDeepLinkRegistration",
+      "voiceEnabled",
+      "defaultView"
+    ],
+    "cliHelpFlags": [
+      "--add-dir",
+      "--agent",
+      "--agents",
+      "--all",
+      "--allow-dangerously-skip-permissions",
+      "--allowed",
+      "--allowed-tools",
+      "--append-system-prompt",
+      "--autocompact",
+      "--ax-screen-reader",
+      "--background",
+      "--bare",
+      "--betas",
+      "--bg",
+      "--brief",
+      "--chrome",
+      "--client-data-url",
+      "--cloud",
+      "--continue",
+      "--dangerously-skip-permissions",
+      "--debug",
+      "--debug-file",
+      "--disable-slash-commands",
+      "--disallowed",
+      "--disallowed-tools",
+      "--effort",
+      "--environment",
+      "--exclude-dynamic-system-prompt-sections",
+      "--fallback-model",
+      "--file",
+      "--fork-session",
+      "--forward-subagent-text",
+      "--from-pr",
+      "--help",
+      "--ide",
+      "--include-hook-events",
+      "--include-partial-messages",
+      "--input-format",
+      "--json-schema",
+      "--max-budget-usd",
+      "--mcp-config",
+      "--model",
+      "--name",
+      "--no-chrome",
+      "--no-session-persistence",
+      "--output-format",
+      "--permission-mode",
+      "--permission-prompt-tool",
+      "--permission-prompts",
+      "--plugin-dir",
+      "--plugin-url",
+      "--print",
+      "--prompt-suggestions",
+      "--remote-control",
+      "--remote-control-session-name-prefix",
+      "--replay-user-messages",
+      "--restricted",
+      "--resume",
+      "--safe-mode",
+      "--session-id",
+      "--setting-sources",
+      "--settings",
+      "--strict-mcp-config",
+      "--system-prompt",
+      "--system-prompt-snapshot",
+      "--teleport",
+      "--tmux",
+      "--tools",
+      "--verbose",
+      "--version",
+      "--worktree"
+    ],
+    "hookEvents": [
+      "PreToolUse",
+      "PostToolUse",
+      "PostToolUseFailure",
+      "PostToolBatch",
+      "Notification",
+      "UserPromptSubmit",
+      "UserPromptExpansion",
+      "SessionStart",
+      "SessionEnd",
+      "Stop",
+      "StopFailure",
+      "SubagentStart",
+      "SubagentStop",
+      "PreCompact",
+      "PostCompact",
+      "PreModelSwitch",
+      "PostModelSwitch",
+      "PermissionRequest",
+      "PermissionDenied",
+      "Setup",
+      "TeammateIdle",
+      "TaskCreated",
+      "TaskCompleted",
+      "Elicitation",
+      "ElicitationResult",
+      "ConfigChange",
+      "WorktreeCreate",
+      "WorktreeRemove",
+      "InstructionsLoaded",
+      "CwdChanged",
+      "FileChanged",
+      "DirectoryAdded",
+      "MessageDisplay"
+    ],
+    "sdkPublicQueryMethods": [
+      "interrupt",
+      "setPermissionMode",
+      "setMcpPermissionModeOverride",
+      "setModel",
+      "setMaxThinkingTokens",
+      "applyFlagSettings",
+      "updateSettings",
+      "initializationResult",
+      "reinitialize",
+      "supportedCommands",
+      "supportedModels",
+      "supportedAgents",
+      "mcpServerStatus",
+      "getContextUsage",
+      "usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET",
+      "readFile",
+      "reloadPlugins",
+      "reloadSkills",
+      "reloadOutputStyles",
+      "accountInfo",
+      "rewindFiles",
+      "seedReadState",
+      "reconnectMcpServer",
+      "toggleMcpServer",
+      "readMcpResource",
+      "setMcpServers",
+      "streamInput",
+      "stopTask",
+      "backgroundTasks",
+      "close"
+    ],
+    "sdkExportedFunctions": [
+      "createSdkMcpServer",
+      "deleteSession",
+      "filterEscalatingDefaultMode",
+      "foldSessionSummary",
+      "forkSession",
+      "getSessionInfo",
+      "getSessionMessages",
+      "getSubagentMessages",
+      "importSessionToStore",
+      "listSessions",
+      "listSubagents",
+      "prewarm",
+      "query",
+      "renameSession",
+      "resolveSettings",
+      "startup",
+      "tagSession",
+      "tool"
+    ],
+    "sdkMessageVariants": [
+      "SDKAssistantMessage",
+      "SDKUserMessage",
+      "SDKUserMessageReplay",
+      "SDKResultMessage",
+      "SDKSystemMessage",
+      "SDKPartialAssistantMessage",
+      "SDKCompactBoundaryMessage",
+      "SDKStatusMessage",
+      "SDKAPIRetryMessage",
+      "SDKControlRequestProgressMessage",
+      "SDKModelRefusalFallbackMessage",
+      "SDKModelRefusalNoFallbackMessage",
+      "SDKLocalCommandOutputMessage",
+      "SDKHookStartedMessage",
+      "SDKHookProgressMessage",
+      "SDKHookResponseMessage",
+      "SDKPluginInstallMessage",
+      "SDKToolProgressMessage",
+      "SDKAuthStatusMessage",
+      "SDKTaskNotificationMessage",
+      "SDKTaskStartedMessage",
+      "SDKTaskUpdatedMessage",
+      "SDKTaskProgressMessage",
+      "SDKBackgroundTasksChangedMessage",
+      "SDKThinkingTokensMessage",
+      "SDKSessionStateChangedMessage",
+      "SDKWorkerShuttingDownMessage",
+      "SDKCommandsChangedMessage",
+      "SDKNotificationMessage",
+      "SDKFilesPersistedEvent",
+      "SDKToolUseSummaryMessage",
+      "SDKMemoryRecallMessage",
+      "SDKRateLimitEvent",
+      "SDKElicitationCompleteMessage",
+      "SDKPermissionDeniedMessage",
+      "SDKPromptSuggestionMessage",
+      "SDKMirrorErrorMessage",
+      "SDKInformationalMessage",
+      "SDKConversationResetMessage"
+    ],
+    "toolInputTypes": [
+      "AgentInput",
+      "BashInput",
+      "ExitPlanModeInput",
+      "FileEditInput",
+      "FileReadInput",
+      "FileWriteInput",
+      "GlobInput",
+      "GrepInput",
+      "TaskStopInput",
+      "ListMcpResourcesInput",
+      "RefreshMcpToolsInput",
+      "McpInput",
+      "NotebookEditInput",
+      "ReadMcpResourceDirInput",
+      "ReadMcpResourceInput",
+      "ReportFindingsInput",
+      "TodoWriteInput",
+      "WebFetchInput",
+      "WebSearchInput",
+      "AskUserQuestionInput",
+      "SendFeedbackInput",
+      "ClaudeDesignInput",
+      "ProjectsInput",
+      "EnterPlanModeInput",
+      "TaskCreateInput",
+      "TaskGetInput",
+      "TaskUpdateInput",
+      "TaskListInput",
+      "WorkflowInput",
+      "CronCreateInput",
+      "CronDeleteInput",
+      "CronListInput",
+      "ScheduleWakeupInput",
+      "RemoteTriggerInput",
+      "ShowOnboardingRolePickerInput",
+      "ReadNotificationsInput",
+      "MonitorInput",
+      "ProposeSkillsInput",
+      "ProposeGoalInput",
+      "ArtifactInput",
+      "PushNotificationInput",
+      "EnterWorktreeInput",
+      "ExitWorktreeInput",
+      "ToolOutputSchemas"
+    ]
+  },
+  "extensionControls": [
+    {
+      "method": "stopTask",
+      "subtype": "stop_task",
+      "fields": [
+        "subtype",
+        "task_id"
+      ]
+    },
+    {
+      "method": "backgroundTasks",
+      "subtype": "background_tasks",
+      "fields": [
+        "subtype",
+        "tool_use_id"
+      ]
+    },
+    {
+      "method": "interrupt",
+      "subtype": "interrupt",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "setPermissionMode",
+      "subtype": "set_permission_mode",
+      "fields": [
+        "subtype",
+        "mode"
+      ]
+    },
+    {
+      "method": "setMcpPermissionModeOverride",
+      "subtype": "set_mcp_permission_mode_override",
+      "fields": [
+        "subtype",
+        "serverName",
+        "mode"
+      ]
+    },
+    {
+      "method": "setChromeBrowserHints",
+      "subtype": "set_chrome_browser_hints",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "setPromptSuggestionsPaused",
+      "subtype": "set_prompt_suggestions_paused",
+      "fields": [
+        "subtype",
+        "paused"
+      ]
+    },
+    {
+      "method": "setModel",
+      "subtype": "set_model",
+      "fields": [
+        "subtype",
+        "model"
+      ]
+    },
+    {
+      "method": "setMaxThinkingTokens",
+      "subtype": "set_max_thinking_tokens",
+      "fields": [
+        "subtype",
+        "max_thinking_tokens",
+        "thinking_display"
+      ]
+    },
+    {
+      "method": "applyFlagSettings",
+      "subtype": "apply_flag_settings",
+      "fields": [
+        "subtype",
+        "settings"
+      ]
+    },
+    {
+      "method": "getSettings",
+      "subtype": "get_settings",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "getHooksListing",
+      "subtype": "get_hooks_listing",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "listPermissionRules",
+      "subtype": "list_permission_rules",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "updateSettings",
+      "subtype": "update_settings",
+      "fields": [
+        "subtype",
+        "source",
+        "settings"
+      ]
+    },
+    {
+      "method": "rewindFiles",
+      "subtype": "rewind_files",
+      "fields": [
+        "subtype",
+        "user_message_id",
+        "dry_run"
+      ]
+    },
+    {
+      "method": "cancelAsyncMessage",
+      "subtype": "cancel_async_message",
+      "fields": [
+        "subtype",
+        "message_uuid"
+      ]
+    },
+    {
+      "method": "seedReadState",
+      "subtype": "seed_read_state",
+      "fields": [
+        "subtype",
+        "path",
+        "mtime"
+      ]
+    },
+    {
+      "method": "setCwd",
+      "subtype": "set_cwd",
+      "fields": [
+        "subtype",
+        "path"
+      ]
+    },
+    {
+      "method": "claimSession",
+      "subtype": "claim_session",
+      "fields": [
+        "subtype",
+        "include_initialize"
+      ]
+    },
+    {
+      "method": "enableRemoteControl",
+      "subtype": "remote_control",
+      "fields": [
+        "subtype",
+        "enabled",
+        "reattach_session_id",
+        "keep_session_on_exit",
+        "work_secret"
+      ]
+    },
+    {
+      "method": "submitFeedback",
+      "subtype": "submit_feedback",
+      "fields": [
+        "subtype",
+        "description",
+        "surface",
+        "draft_id",
+        "type",
+        "title",
+        "area",
+        "attach_transcript"
+      ]
+    },
+    {
+      "method": "renameSession",
+      "subtype": "rename_session",
+      "fields": [
+        "subtype",
+        "title",
+        "source",
+        "session_id"
+      ]
+    },
+    {
+      "method": "generateSessionTitle",
+      "subtype": "generate_session_title",
+      "fields": [
+        "subtype",
+        "description",
+        "persist"
+      ]
+    },
+    {
+      "method": "askSideQuestion",
+      "subtype": "side_question",
+      "fields": [
+        "subtype",
+        "question"
+      ]
+    },
+    {
+      "method": "launchUltrareview",
+      "subtype": "ultrareview_launch",
+      "fields": [
+        "subtype",
+        "args",
+        "confirm"
+      ]
+    },
+    {
+      "method": "messageRated",
+      "subtype": "message_rated",
+      "fields": [
+        "subtype",
+        "messageUuid",
+        "sentiment",
+        "surface",
+        "cleared"
+      ]
+    },
+    {
+      "method": "reconnectMcpServer",
+      "subtype": "mcp_reconnect",
+      "fields": [
+        "subtype",
+        "serverName"
+      ]
+    },
+    {
+      "method": "toggleMcpServer",
+      "subtype": "mcp_toggle",
+      "fields": [
+        "subtype",
+        "serverName",
+        "enabled"
+      ]
+    },
+    {
+      "method": "readMcpResource",
+      "subtype": "mcp_read_resource",
+      "fields": [
+        "subtype",
+        "serverName",
+        "uri"
+      ]
+    },
+    {
+      "method": "enableChannel",
+      "subtype": "channel_enable",
+      "fields": [
+        "subtype",
+        "serverName"
+      ]
+    },
+    {
+      "method": "mcpAuthenticate",
+      "subtype": "mcp_authenticate",
+      "fields": [
+        "subtype",
+        "serverName",
+        "redirectUri"
+      ]
+    },
+    {
+      "method": "mcpClearAuth",
+      "subtype": "mcp_clear_auth",
+      "fields": [
+        "subtype",
+        "serverName"
+      ]
+    },
+    {
+      "method": "mcpSubmitOAuthCallbackUrl",
+      "subtype": "mcp_oauth_callback_url",
+      "fields": [
+        "subtype",
+        "serverName",
+        "callbackUrl"
+      ]
+    },
+    {
+      "method": "claudeAuthenticate",
+      "subtype": "claude_authenticate",
+      "fields": [
+        "subtype",
+        "loginWithClaudeAi"
+      ]
+    },
+    {
+      "method": "claudeOAuthCallback",
+      "subtype": "claude_oauth_callback",
+      "fields": [
+        "subtype",
+        "authorizationCode",
+        "state"
+      ]
+    },
+    {
+      "method": "claudeOAuthWaitForCompletion",
+      "subtype": "claude_oauth_wait_for_completion",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "mcpServerStatus",
+      "subtype": "mcp_status",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "getContextUsage",
+      "subtype": "get_context_usage",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET",
+      "subtype": "get_usage",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "getMemoryDialog",
+      "subtype": "get_memory_dialog",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "getSkillsDialog",
+      "subtype": "get_skills_dialog",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "getStatus",
+      "subtype": "get_status",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "exportConversation",
+      "subtype": "export_conversation",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "getChromeDialog",
+      "subtype": "get_chrome_dialog",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "getChromeBrowsers",
+      "subtype": "get_chrome_browsers",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "selectChromeBrowser",
+      "subtype": "select_chrome_browser",
+      "fields": [
+        "subtype",
+        "device_id"
+      ]
+    },
+    {
+      "method": "getSandboxDialog",
+      "subtype": "get_sandbox_dialog",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "readFile",
+      "subtype": "read_file",
+      "fields": [
+        "subtype",
+        "path",
+        "max_bytes",
+        "encoding"
+      ]
+    },
+    {
+      "method": "getPlan",
+      "subtype": "get_plan",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "reloadPlugins",
+      "subtype": "reload_plugins",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "reloadSkills",
+      "subtype": "reload_skills",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "reloadOutputStyles",
+      "subtype": "reload_output_styles",
+      "fields": [
+        "subtype"
+      ]
+    },
+    {
+      "method": "setMcpServers",
+      "subtype": "mcp_set_servers",
+      "fields": [
+        "subtype",
+        "servers"
+      ]
+    }
+  ],
+  "migrationStatus": [
+    {
+      "feature": "会话/流式运行",
+      "status": "已接入：原生流式、Stop、继续、恢复；每轮独立进程。"
+    },
+    {
+      "feature": "Slash commands",
+      "status": "已接入：动态目录、原生分派、可搜索分类菜单；终端专用命令仍受 headless 限制。"
+    },
+    {
+      "feature": "命令菜单常用项",
+      "status": "部分接入：命令入口可搜索、插入并编辑；各管理器完整图形 UI 未迁移。"
+    },
+    {
+      "feature": "原生侧问 /btw",
+      "status": "已接入：同一原生进程的侧问，显示在当前会话；无独立浮动面板。"
+    },
+    {
+      "feature": "模型/Thinking/Effort",
+      "status": "已接入：动态模型、会话/角色 effort、thinking、output style；快速入口按模型能力显示。"
+    },
+    {
+      "feature": "Ultracode/workflows",
+      "status": "未专门迁移；仅保留运行时公开的原生命令，仍受模型/账号门控。"
+    },
+    {
+      "feature": "权限模式",
+      "status": "已接入：原生模式与实际 fallback；每角色隔离，运行中不可直接改模式。"
+    },
+    {
+      "feature": "工具审批",
+      "status": "已接入：允许一次、原生建议允许当前运行、拒绝反馈；不承诺跨轮规则或配置文件规则编辑。"
+    },
+    {
+      "feature": "Plan/AskUserQuestion",
+      "status": "已接入：单选/多选/自由文本、计划正文、修改意见、两种批准模式；无逐段评论编辑器。"
+    },
+    {
+      "feature": "原生用户对话框",
+      "status": "未迁移：工具问题以外的付费同意/实验性 dialog 不自动同意。"
+    },
+    {
+      "feature": "权限规则管理",
+      "status": "部分接入：原生规则查看与运行级审批建议；新增/删除持久规则管理器未迁移。"
+    },
+    {
+      "feature": "Sandbox 管理",
+      "status": "部分接入：原生配置继续生效、状态可查；编辑设置的专用 UI 未迁移。"
+    },
+    {
+      "feature": "Memory/CLAUDE.md",
+      "status": "部分接入：原生文件继续读取、可查看记忆列表；记忆 CRUD 管理器未迁移。"
+    },
+    {
+      "feature": "Skills",
+      "status": "部分接入：发现、搜索、执行、原生列表；图形启禁/编辑器未迁移。"
+    },
+    {
+      "feature": "Hooks",
+      "status": "部分接入：原生 hooks 生效、可阅读列表；增改和策略提示编辑器未迁移。"
+    },
+    {
+      "feature": "MCP",
+      "status": "部分接入：工具执行、状态和运行时公开的管理命令；OAuth/form elicitation 管理器未迁移。"
+    },
+    {
+      "feature": "Plugins/marketplaces",
+      "status": "部分接入：已配置插件/技能运行、列表与原生 reload；市场图形安装器未迁移。"
+    },
+    {
+      "feature": "Output styles",
+      "status": "已接入：原生样式选择并按会话/角色保留；样式创建编辑器未迁移。"
+    },
+    {
+      "feature": "文件/图片/PDF 附件",
+      "status": "部分接入：PNG/JPEG/GIF/WebP 原生图像、文件引用；当前 composer 尚无 PDF/document 内容块入口。"
+    },
+    {
+      "feature": "@mentions/编辑器上下文",
+      "status": "部分接入：App 的文件/skill 引用；VS Code 选区、终端和浏览器上下文桥未迁移。"
+    },
+    {
+      "feature": "输入体验",
+      "status": "部分接入：slash 补全、保留草稿的命令插入、steer/队列撤回；未完整复刻快捷键与大段粘贴交互。"
+    },
+    {
+      "feature": "语音输入",
+      "status": "未迁移 Claude 原生语音服务；现有 App 语音组件不是该原生服务。"
+    },
+    {
+      "feature": "工具卡/输出",
+      "status": "部分接入：原生流式、Bash 和通用工具卡、父子归属；完整专用 renderer/MCP Apps 未迁移。"
+    },
+    {
+      "feature": "代码 Diff/逐 hunk 接受",
+      "status": "未迁移 Claude 的逐 hunk 审批编辑器。"
+    },
+    {
+      "feature": "Checkpoints/Rewind",
+      "status": "部分接入：原生文件 rewind 命令和 App 历史编辑；无统一可点 checkpoint 时间线。"
+    },
+    {
+      "feature": "任务/子代理/Agent map",
+      "status": "部分接入：原生任务状态与当前进程单任务 Stop；无 agent map 和跨轮常驻后台任务。"
+    },
+    {
+      "feature": "Focus view",
+      "status": "未迁移 Claude 插件的专用 Focus view。"
+    },
+    {
+      "feature": "会话管理",
+      "status": "部分接入：App 会话、恢复、历史编辑和切换引擎；未复制插件分组/归档策略及完整原生历史导入 UI。"
+    },
+    {
+      "feature": "导出/复制/评价",
+      "status": "部分接入：复制、下载导出、显式反馈命令；消息评价专用 UI 未迁移。"
+    },
+    {
+      "feature": "Context/usage/status/account",
+      "status": "部分接入：真实 context/status/usage 报告；账号窗口和套餐管理仍依原生服务。"
+    },
+    {
+      "feature": "Remote Control/Cloud teleport",
+      "status": "部分接入：原生 remote-control 保持到 Stop；Cloud teleport UI 未迁移，SSH cluster 是独立路由。"
+    },
+    {
+      "feature": "Chrome/Design/Artifacts",
+      "status": "部分接入：Chrome 状态；浏览器选择、Design 登录和 artifact 宿主未迁移。"
+    },
+    {
+      "feature": "编辑器扩展宿主",
+      "status": "未直接迁移：继续使用 App 自有编辑器/终端/worktree；VS Code debugger/Jupyter 等需独立宿主桥。"
+    },
+    {
+      "feature": "受门控/内部功能",
+      "status": "未绕过门控或开放内部入口。"
+    }
+  ],
+  "appCommandDefinitions": [
+    {
+      "name": "status",
+      "description": "Show native Claude session status",
+      "argumentHint": "",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "status"
+    },
+    {
+      "name": "permissions",
+      "description": "View native permission rules and workspace directories",
+      "argumentHint": "",
+      "aliases": [
+        "allowed-tools"
+      ],
+      "origin": "app",
+      "execution": "control",
+      "control": "permissions"
+    },
+    {
+      "name": "skills",
+      "description": "List available skills",
+      "argumentHint": "",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "skills"
+    },
+    {
+      "name": "help",
+      "description": "Browse available slash commands",
+      "argumentHint": "",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "help"
+    },
+    {
+      "name": "memory",
+      "description": "View Claude memory and instruction files",
+      "argumentHint": "",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "memory"
+    },
+    {
+      "name": "hooks",
+      "description": "View configured Claude hooks",
+      "argumentHint": "",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "hooks"
+    },
+    {
+      "name": "plugins",
+      "description": "View configured Claude plugins",
+      "argumentHint": "",
+      "aliases": [
+        "plugin",
+        "marketplace"
+      ],
+      "origin": "app",
+      "execution": "control",
+      "control": "plugins"
+    },
+    {
+      "name": "plan",
+      "description": "Enable plan mode or view the current plan",
+      "argumentHint": "[open]",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "plan"
+    },
+    {
+      "name": "copy",
+      "description": "Copy Claude's last response",
+      "argumentHint": "[N]",
+      "aliases": [],
+      "origin": "app",
+      "execution": "local"
+    },
+    {
+      "name": "export",
+      "description": "Export the native conversation",
+      "argumentHint": "[filename]",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "export"
+    },
+    {
+      "name": "tasks",
+      "description": "View native tasks or stop a task in the selected live process",
+      "argumentHint": "[stop <taskId>]",
+      "aliases": [
+        "bashes"
+      ],
+      "origin": "app",
+      "execution": "local"
+    },
+    {
+      "name": "context",
+      "description": "View native context usage",
+      "argumentHint": "",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "context"
+    },
+    {
+      "name": "usage",
+      "description": "View native session usage and available rate limits",
+      "argumentHint": "",
+      "aliases": [
+        "cost",
+        "stats"
+      ],
+      "origin": "app",
+      "execution": "control",
+      "control": "usage"
+    },
+    {
+      "name": "effort",
+      "description": "Set effort for this chat or selected role",
+      "argumentHint": "<low|medium|high|xhigh|max|auto>",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "effort"
+    },
+    {
+      "name": "thinking",
+      "description": "Set thinking for this chat or selected role",
+      "argumentHint": "<on|off|adaptive|budgetTokens>",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "thinking"
+    },
+    {
+      "name": "output-style",
+      "description": "Set a native output style for this chat or selected role",
+      "argumentHint": "<name>",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "output-style"
+    },
+    {
+      "name": "btw",
+      "description": "Ask a native side question",
+      "argumentHint": "[question]",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "btw"
+    },
+    {
+      "name": "rewind",
+      "description": "Preview or restore tracked files at a checkpoint",
+      "argumentHint": "[user-message-uuid] [--dry-run|--apply]",
+      "aliases": [
+        "checkpoint",
+        "undo"
+      ],
+      "origin": "app",
+      "execution": "control",
+      "control": "rewind"
+    },
+    {
+      "name": "resume",
+      "description": "Resume an earlier Claude conversation",
+      "argumentHint": "",
+      "aliases": [
+        "continue"
+      ],
+      "origin": "app",
+      "execution": "local"
+    },
+    {
+      "name": "feedback",
+      "description": "Send a feedback report to Anthropic",
+      "argumentHint": "[report]",
+      "aliases": [
+        "bug"
+      ],
+      "origin": "app",
+      "execution": "control",
+      "control": "feedback"
+    },
+    {
+      "name": "remote-control",
+      "description": "Control this native Claude session remotely until Stop",
+      "argumentHint": "",
+      "aliases": [
+        "rc"
+      ],
+      "origin": "app",
+      "execution": "control",
+      "control": "remote-control"
+    },
+    {
+      "name": "chrome",
+      "description": "View Claude in Chrome status and browser connections",
+      "argumentHint": "",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "chrome"
+    },
+    {
+      "name": "sandbox",
+      "description": "View native command sandbox settings",
+      "argumentHint": "",
+      "aliases": [],
+      "origin": "app",
+      "execution": "control",
+      "control": "sandbox"
+    }
+  ],
+  "catalogCounts": {
+    "auditSnapshot": 92,
+    "nativeBuiltin": 43,
+    "nativeSkill": 31,
+    "appFallbackDefinitions": 23,
+    "appFallbackAfterMigration": 19,
+    "totalAfterMigration": 93
+  },
+  "verification": {
+    "regressionCases": 754,
+    "initialPassed": 751,
+    "initialTimeouts": 3,
+    "pollyRetryPassed": 28,
+    "remainingFailures": 0,
+    "manualGuiClicks": false,
+    "perClusterLiveRevalidation": false,
+    "packagedRuntimeParityFiles": 14
+  },
+  "installation": {
+    "installedAt": "2026-09-29T04:35:43.087Z",
+    "asarSha256": "e53c5c2f94f01ea89f7503275b609b7dbd31c8a738660202c865384d05b5214f",
+    "appRestarted": false,
+    "preservedProcessCount": 13
+  }
+}

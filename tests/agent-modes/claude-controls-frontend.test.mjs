@@ -9,6 +9,51 @@ const React = { useSyncExternalStore: (_, read) => read(), useEffect() {}, useMe
 const jsx = { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) };
 const nodes = tree => !tree || typeof tree !== 'object' ? [] : [tree, ...[tree.props?.children].flat(Infinity).flatMap(nodes)];
 
+test('native Claude multi-choice replies preserve all checked options and free text', () => {
+  const api = load();
+  const result = api.serializeClaudeAnswers([
+    { id: 'question_0', isMultiSelect: true, isOther: true, options: [{ label: 'A' }, { label: 'B' }] },
+    { id: 'question_1', isOther: true, options: [{ label: 'C' }] },
+  ], [{ selectedOptionIds: ['A', 'B', 'A', 'injected'], selectedOptionId: 'B', freeformText: '  Also D  ' }, { selectedOptionId: null, freeformText: 'Custom' }]);
+  assert.deepEqual(plain(result), { response: { answers: { question_0: { answers: ['A', 'B', 'Also D'] }, question_1: { answers: ['Custom'] } } }, optionSelectionCount: 2, freeformResponseCount: 2 });
+  assert.deepEqual(plain(api.serializeClaudeAnswers([{ id: 'empty', isMultiSelect: true, options: [] }], [])), { response: { answers: {} }, optionSelectionCount: 0, freeformResponseCount: 0 });
+});
+
+test('Claude command browser inserts editable commands without replacing an existing draft', async () => {
+  const api = load(), scope = { node: {} }, inserted = [];
+  api.setDraftSelection(scope, { engineMode: 'claude' });
+  const composer = { view: { state: { selection: { from: 10, to: 90 }, tr: { insertText: (...args) => { inserted.push(args); return 'transaction'; } } }, dispatch: value => inserted.push(value) }, focus: () => inserted.push('focus') };
+  const manager = { getHostId: () => 'local', sendRequest: async () => ({ commands: [{ name: 'goal', description: 'Native goal' }, { name: 'context', description: 'Context usage' }] }) };
+  await api.refreshClaudeCommands(manager, { cwd: '/project' });
+  api.useClaudeCommands({ React, scope, hostId: 'local', cwd: '/project', composer, nativeCommands: [], getManager: () => manager });
+  assert.equal(api.insertClaudeCommand(scope, null, 'local', 'goal'), true);
+  assert.deepEqual(inserted, [['/goal ', 10, 10], 'transaction', 'focus']);
+  assert.throws(() => api.insertClaudeCommand(scope, null, 'local', '../bad'), /command/i);
+  assert.equal(api.insertClaudeCommand(scope, null, 'other-host', 'goal'), false);
+});
+
+test('session controls use discovered model capabilities and insert explicit commands in the selected composer', async () => {
+  const api = load(), scope = { node: {} }, inserted = [];
+  const state = { engineMode: 'claude', claudeSessionOptions: { effort: 'medium', thinking: { type: 'disabled' }, outputStyle: 'Concise' } };
+  const manager = { getHostId: () => 'local', sendRequest: async method => method === 'engine/capabilities' ? { claudeModels: [{ value: 'test-model', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'bad'], supportsAdaptiveThinking: false }] } : state };
+  await api.refreshThread(scope, 'chat', 'local', manager);
+  await api.refreshCapabilities(manager, { hostId: 'local', threadId: 'chat' });
+  const model = api.getCapabilities(manager, { hostId: 'local', threadId: 'chat' }).claudeModels[0];
+  assert.deepEqual(plain(model.supportedEffortLevels), ['low', 'medium']);
+  const composer = { view: { state: { selection: { from: 5, to: 5 }, tr: { insertText: (...args) => { inserted.push(args); return {}; } } }, dispatch() {} }, focus() {} };
+  api.useClaudeCommands({ React, scope, threadId: 'chat', hostId: 'local', composer, nativeCommands: [], getManager: () => manager });
+  const tree = api.ClaudeCommandBrowser({ React, jsx, scope, threadId: 'chat', hostId: 'local', catalog: { commands: [{ name: 'effort', origin: 'builtin' }, { name: 'thinking', origin: 'app' }], loading: false }, model, sessionOptions: api.getSnapshot(scope, 'chat', 'local').claudeSessionOptions });
+  const options = nodes(tree).find(node => node.props?.['aria-label'] === 'Insert Claude effort command');
+  assert.deepEqual(plain(options.props.children.map(node => node.props.value)), ['', 'auto', 'low', 'medium']);
+  options.props.onChange({ target: { value: 'low' } });
+  assert.deepEqual(inserted, [['/effort low ', 5, 5]]);
+  const thinking = nodes(tree).find(node => node.props?.['aria-label'] === 'Insert Claude thinking command');
+  assert.equal(thinking.props.children.some(node => node.props.value === 'adaptive'), false);
+  assert.match(nodes(tree).map(node => node.props?.children).filter(value => typeof value === 'string').join(' '), /medium.*disabled.*Concise/);
+  assert.equal(api.getSnapshot(scope, 'chat', 'another-host').claudeSessionOptions, undefined);
+  assert.throws(() => api.insertClaudeCommand(scope, 'chat', 'local', 'effort', 'low\n/goal'), /argument/i);
+});
+
 test('Claude native permission and command target survive capture and are isolated by host', () => {
   const api = load(), scope = { node: {} };
   api.setDraftSelection(scope, { engineMode: 'claude', claudePermissionMode: 'plan' });
@@ -66,14 +111,39 @@ test('command discovery is host/project scoped, refreshable, and sanitizes entri
 });
 
 test('Claude slash selection inserts exact editable command text instead of a Codex action', async () => {
-  const api = load(), scope = { node: {} }, inserted = [], manager = { getHostId: () => 'local', sendRequest: async () => ({ commands: [{ name: 'model', description: 'Native Claude model', argumentHint: '[model]' }] }) };
+  const api = load(), scope = { node: {} }, inserted = [], manager = { getHostId: () => 'local', sendRequest: async () => ({ commands: [{ name: 'model', description: 'Native Claude model', argumentHint: '[model]' }, { name: 'goal', description: 'Native Claude goal', argumentHint: '[objective|clear]' }] }) };
   api.setDraftSelection(scope, { engineMode: 'claude' });
   await api.refreshClaudeCommands(manager, { cwd: '/project' });
-  const composer = { view: { state: { tr: { insertText: (...args) => { inserted.push(args); return 'transaction'; } } }, dispatch: value => inserted.push(value) }, focus() {} };
+  const composer = { view: { state: { selection: { from: 1, to: 1 }, tr: { insertText: (...args) => { inserted.push(args); return 'transaction'; } } }, dispatch: value => inserted.push(value) }, focus() {} };
   const entries = api.useClaudeCommands({ React, scope, hostId: 'local', cwd: '/project', composer, nativeCommands: [{ id: 'codex-model' }], getManager: () => manager });
   assert.equal(entries.some(row => row.id === 'codex-model'), false);
   entries.find(row => row.id === 'claude:model').onSelectFromInlineSlash({ range: { from: 1, to: 4 } });
-  assert.deepEqual(inserted, [['/model ', 1, 4], 'transaction']);
+  entries.find(row => row.id === 'claude:goal').onSelectFromInlineSlash({ range: { from: 1, to: 6 } });
+  entries.find(row => row.id === 'claude:goal').onSelect();
+  assert.deepEqual(inserted, [['/model ', 1, 4], 'transaction', ['/goal ', 1, 6], 'transaction', ['/goal ', 1, 1], 'transaction']);
+});
+
+test('native Claude goals use the mixed template and its current role overrides without opening Codex goals', async () => {
+  const api = load(), scope = { node: {} };
+  const template = { id: 'mixed', revision: 1, roles: { host: { engine: 'codex' }, worker: { engine: 'claude' } } };
+  const manager = { getHostId: () => 'cluster', sendRequest: async () => ({ templates: [template] }) };
+  api.registerManager(manager, 'cluster');
+  await api.refreshTemplates(manager, 'cluster');
+  const selection = { engineMode: 'both', template: { id: 'mixed', revision: 1, parameters: {} }, claudeCommandTarget: 'worker' };
+  api.setDraftSelection(scope, selection, 'cluster');
+  assert.equal(api.shouldRouteClaudeGoal(scope, null, 'cluster'), true);
+  assert.equal(api.capture(scope, 'cluster').claudeCommandTarget, 'worker');
+  assert.equal(api.shouldRouteClaudeGoal(scope, null, 'local'), false);
+  assert.match(api.nativeGoalError(scope, null, 'cluster'), /Only Codex/);
+  api.noteStarted(manager, 'chat', selection);
+  assert.equal(api.shouldRouteClaudeGoal(scope, 'chat', 'cluster'), true);
+  api.setDraftSelection(scope, { ...selection, roleOverrides: { worker: { engine: 'codex' } } }, 'cluster');
+  assert.equal(api.shouldRouteClaudeGoal(scope, null, 'cluster'), false, 'An all-Codex mixed template retains the protective goal guard');
+  api.setDraftSelection(scope, { ...selection, template: { ...selection.template, revision: 2 } }, 'cluster');
+  assert.equal(api.shouldRouteClaudeGoal(scope, null, 'cluster'), false, 'An unverified template revision cannot bypass the guard');
+  api.setDraftSelection(scope, { engineMode: 'codex' }, 'cluster');
+  assert.equal(api.shouldRouteClaudeGoal(scope, null, 'cluster'), false);
+  assert.equal(api.nativeGoalError(scope, null, 'cluster'), null);
 });
 
 test('client actions are claimed once before delivery and failed clipboard writes remain retryable', async () => {

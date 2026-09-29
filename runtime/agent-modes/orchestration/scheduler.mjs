@@ -4,6 +4,8 @@ import { resolveParameters, resolveRoleConfig, validateHostDecision, validateTas
 import { renderInputs } from './inputs.mjs';
 import { assertClaudePermissionMode } from '../claude-permissions.mjs';
 import { assertClaudeLiveCommand } from '../claude-commands.mjs';
+import { normalizeClaudeSessionOptions } from '../claude-native-controls.mjs';
+import { claudeNativeContent } from '../claude-input.mjs';
 
 const clone = value => structuredClone(value);
 const freeze = value => { if (value && typeof value === 'object') { for (const item of Object.values(value)) freeze(item); Object.freeze(value); } return value; };
@@ -11,7 +13,7 @@ const frozen = value => freeze(clone(value));
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const errorText = error => error instanceof Error ? error.message : String(error);
 const settled = new Set(['completed', 'failed', 'interrupted', 'cancelled', 'blocked']);
-const resultFields = new Set(['id', 'engine', 'roleId', 'stepId', 'attempt', 'round', 'status', 'requestedModel', 'permissionMode', 'actualPermissionMode', 'cwd', 'text', 'structuredOutput', 'nativeSessionId', 'actualModel', 'usage', 'error', 'nativeTasks']);
+const resultFields = new Set(['id', 'engine', 'roleId', 'stepId', 'attempt', 'round', 'status', 'requestedModel', 'permissionMode', 'actualPermissionMode', 'cwd', 'text', 'structuredOutput', 'nativeSessionId', 'actualModel', 'usage', 'error', 'nativeTasks', 'settingsPatch']);
 const stoppedError = () => new Error('Workflow interrupted.');
 const roleKey = ({ stepId, roleId, round = 0 }) => JSON.stringify([stepId, roleId, round]);
 const bound = (value, parameters) => typeof value === 'number' ? value : parameters[value.parameter];
@@ -48,9 +50,9 @@ export function taskPlanSchema(maxTasks) {
 
 /** Transport/store agnostic interpreter for the validated template graph. */
 export class WorkflowScheduler {
-  constructor({ runner, workspaces, operationsFactory, onEvent, onPermission } = {}) {
+  constructor({ runner, workspaces, operationsFactory, onEvent, onPermission, loadInputCapture } = {}) {
     if (!runner || typeof runner.start !== 'function') throw new TypeError('A native role runner is required.');
-    Object.assign(this, { runner, workspaces, operationsFactory, onEvent, onPermission });
+    Object.assign(this, { runner, workspaces, operationsFactory, onEvent, onPermission, loadInputCapture });
   }
 
   start(options) {
@@ -66,7 +68,8 @@ class WorkflowExecution {
     if (previous && previous.id !== supplied.runId) throw new Error('Workflow recovery ID does not match the saved snapshot.');
     // Snapshot all caller-owned execution data before scheduling even one microtask.
     const data = previous?.config ?? { runId: supplied.runId, template: supplied.template, roleOverrides: supplied.roleOverrides ?? {}, parameters: supplied.parameters ?? {}, models: supplied.models ?? {},
-      nativeOptions: supplied.nativeOptions ?? {}, cwd: supplied.cwd, input: supplied.input ?? '', history: supplied.history ?? [], ...(supplied.throughSeq !== undefined ? { throughSeq: supplied.throughSeq } : {}) };
+      nativeOptions: supplied.nativeOptions ?? {}, cwd: supplied.cwd, input: supplied.input ?? '', history: supplied.history ?? [],
+      ...(supplied.inputCapture ? { inputCapture: supplied.inputCapture } : {}), ...(supplied.throughSeq !== undefined ? { throughSeq: supplied.throughSeq } : {}) };
     const { template, roleOverrides } = resolveRoleConfig(data.template, data.roleOverrides ?? {}, data.models);
     const parameters = resolveParameters(template, data.parameters);
     if (typeof data.cwd !== 'string' || !isAbsolute(data.cwd)) throw new TypeError('Workflow requires an absolute working directory.');
@@ -128,13 +131,32 @@ class WorkflowExecution {
 
   latestRuns() { const runs = new Map(); for (const run of this.state.runs) if ((runs.get(roleKey(run))?.attempt ?? 0) < run.attempt) runs.set(roleKey(run), run); return [...runs.values()]; }
   alive() { if (this.stopping) throw stoppedError(); }
+  async capturedContent(capture, signal) {
+    if (typeof this.owner.loadInputCapture !== 'function') throw new Error('This workflow host cannot load captured image input. Update the host runtime before retrying.');
+    signal?.throwIfAborted();
+    const interrupted = deferred(), abort = () => interrupted.reject(signal.reason ?? stoppedError());
+    signal?.addEventListener('abort', abort, { once: true });
+    // Reloads have the same cancellation boundary as the original capture: a
+    // stalled reader may drain later but cannot keep Stop or steering pending.
+    const loading = Promise.resolve().then(() => { signal?.throwIfAborted(); return this.owner.loadInputCapture(clone(capture), { signal }); });
+    try {
+      const content = await Promise.race([loading, interrupted.promise]);
+      signal?.throwIfAborted();
+      return claudeNativeContent(content);
+    } finally { signal?.removeEventListener('abort', abort); }
+  }
   async steer(text) {
     this.alive();
     if (this.terminal) throw new Error('Workflow ended. Send the prompt as a new turn.');
-    if (typeof text !== 'string' || !text.trim()) throw new Error('Steering requires a nonempty text prompt.');
+    const inputCapture = typeof text === 'object' && text ? clone(text.inputCapture) : undefined;
+    if (typeof text === 'object' && text) text = text.text;
+    if (typeof text !== 'string' || (!text.trim() && !inputCapture)) throw new Error('Steering requires text or a captured image.');
+    const content = inputCapture ? await this.capturedContent(inputCapture, this.controller.signal) : text;
+    this.alive();
+    if (this.terminal) throw new Error('Workflow ended before it could accept steering.');
     // Save before fan-out so recovery and roles waiting for a concurrency slot
     // see the same user guidance. Completed roles are never replayed.
-    const guidance = { id: randomUUID(), text, deliveries: [] };
+    const guidance = { id: randomUUID(), text, ...(inputCapture ? { inputCapture } : {}), deliveries: [] };
     this.state.guidance.push(guidance); this.notify(); this.alive();
     const targets = [...this.active.entries()].filter(([, active]) => active.handle && !active.controller.signal.aborted);
     const receipt = { accepted: [], failures: [] };
@@ -142,7 +164,7 @@ class WorkflowExecution {
       const run = this.state.runs.find(run => run.id === id);
       try {
         if (typeof active.handle.steer !== 'function') throw new Error('Native role does not support live steering.');
-        await active.handle.steer(text);
+        await active.handle.steer(clone(content));
         receipt.accepted.push(id); guidance.deliveries.push({ runId: id, status: 'accepted' });
       } catch (error) {
         const failure = { runId: id, roleId: run.roleId, error: errorText(error) };
@@ -370,9 +392,11 @@ class WorkflowExecution {
     if (this.jobs.has(key)) return clone(await this.jobs.get(key));
     const slots = this.options.nativeOptions;
     const nativeOptions = Object.hasOwn(slots, 'codex') || Object.hasOwn(slots, 'claude') ? slots[role.engine] ?? {} : slots;
+    const claudeOptions = role.engine === 'claude' ? normalizeClaudeSessionOptions(this.binding({ roleId: input.roleId, cwd, purpose: input.purpose ?? 'default', requestedModel: role.model }).value?.claudeOptions) : undefined;
     const proposed = frozen({ roleId: input.roleId, stepId: input.stepId, round, engine: role.engine,
       prompt: input.prompt, cwd, access, instructions: input.instructions ?? role.prompt, requestedModel: role.model, nativeOptions,
-      ...(role.engine === 'claude' ? { permissionMode: role.permissionMode } : {}),
+      ...(this.options.inputCapture && (Object.hasOwn(input.inputValues ?? {}, 'request') || Object.hasOwn(input.inputValues?.workflowContext ?? {}, 'request')) ? { inputCapture: this.options.inputCapture } : {}),
+      ...(role.engine === 'claude' ? { permissionMode: role.permissionMode, claudeOptions } : {}),
       purpose: input.purpose ?? 'default', ...(input.outputSchema === undefined ? {} : { outputSchema: input.outputSchema }),
       ...(input.inputValues === undefined ? {} : { inputValues: input.inputValues }),
     });
@@ -402,6 +426,7 @@ class WorkflowExecution {
       }
       // Older snapshots predate per-role modes and ran Claude with default.
       if (descriptor.engine === 'claude' && descriptor.permissionMode === undefined) descriptor = { ...descriptor, permissionMode: 'default' };
+      if (descriptor.engine === 'claude') descriptor = { ...descriptor, claudeOptions: normalizeClaudeSessionOptions(descriptor.claudeOptions) };
       return await this.invokeUntilSuccess(key, frozen(descriptor), input.validateResult);
     })();
     this.jobs.set(key, job);
@@ -463,8 +488,19 @@ class WorkflowExecution {
       const binding = this.binding(descriptor);
       const role = this.options.template.roles[roleId];
       if (binding.value && binding.value.engine !== engine) throw new Error('Native session binding engine does not match this role.');
-      const guidance = this.state.guidance.map(entry => entry.text);
+      const inputContent = descriptor.inputCapture ? (await this.capturedContent(descriptor.inputCapture, active.controller.signal)).filter(block => block.type === 'image') : [];
+      // Guidance can arrive while a capture is loading, before this role has a
+      // native handle. Drain the latest saved entries before starting its run.
+      let guidanceCount = 0;
+      while (guidanceCount < this.state.guidance.length) {
+        const entry = this.state.guidance[guidanceCount++];
+        if (entry.inputCapture) inputContent.push(...(await this.capturedContent(entry.inputCapture, active.controller.signal)).filter(block => block.type === 'image'));
+      }
+      this.alive();
+      if (active.controller.signal.aborted) throw stoppedError();
+      const guidance = this.state.guidance.slice(0, guidanceCount).map(entry => entry.text).filter(text => text.trim());
       active.handle = this.owner.runner.start({ ...clone(descriptor),
+        ...(inputContent.length ? { inputContent: clone(inputContent) } : {}),
         ...(guidance.length ? { prompt: `${descriptor.prompt}\n\n[Additional user guidance]\n${guidance.join('\n\n')}` } : {}),
         runId: run.id, model: requestedModel,
         ...(role.session === 'reuse' && binding.value?.sessionId ? { nativeSessionId: binding.value.sessionId } : {}),
@@ -482,6 +518,11 @@ class WorkflowExecution {
       if (summary.status === 'completed' && validateResult) {
         const validated = await validateResult(frozen(summary));
         for (const [key, value] of Object.entries(validated ?? {})) if (!resultFields.has(key)) summary[key] = clone(value);
+      }
+      if (summary.status === 'completed' && engine === 'claude' && summary.settingsPatch?.claudeOptions !== undefined) {
+        const { key, value } = this.binding(descriptor);
+        const claudeOptions = normalizeClaudeSessionOptions({ ...normalizeClaudeSessionOptions(value?.claudeOptions), ...normalizeClaudeSessionOptions(summary.settingsPatch.claudeOptions) });
+        this.state.bindings[key] = { ...value, engine: 'claude', consumedSeq: value?.consumedSeq ?? 0, claudeOptions };
       }
     } catch (error) {
       summary = { ...(summary ?? {}), status: this.stopping || active.controller.signal.aborted ? 'interrupted' : 'failed', error: errorText(error) };

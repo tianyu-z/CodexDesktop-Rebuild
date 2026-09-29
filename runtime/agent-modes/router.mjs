@@ -2,10 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { writeFileSync, statSync, realpathSync } from 'node:fs';
 import { assertMode } from './store.mjs';
 import { WorkflowRouter } from './orchestration/router.mjs';
-import { buildHandoff, inputText, publicHistory, writeHistorySnapshot } from './handoff.mjs';
+import { buildHandoff, publicHistory, writeHistorySnapshot } from './handoff.mjs';
+import { claudeInputText, claudeInputContent, isClaudeCommandInput } from './claude-input.mjs';
 import { page, presentItem, presentTurn, toolItem } from './codex-events.mjs';
 import { assertClaudeModel } from './claude-models.mjs';
 import { assertClaudePermissionMode } from './claude-permissions.mjs';
+import { normalizeClaudeSessionOptions } from './claude-native-controls.mjs';
+import { createClaudeInteraction } from './claude-interactions.mjs';
 import { ClaudeCommandRouter } from './claude-command-router.mjs';
 import { liveClaudeControl } from './claude-live-controls.mjs';
 import { steerManagedTurn } from './steering.mjs';
@@ -26,12 +29,33 @@ export class EngineRouter {
     this.claudeCommands = new ClaudeCommandRouter(this);
   }
   assertOpen() { if (this.closed) throw new Error('Engine gateway is shutting down.'); }
+  async prepareInput(prepare, signal) {
+    this.assertOpen(); signal.throwIfAborted();
+    let abort;
+    const interrupted = new Promise((_, reject) => {
+      abort = () => reject(signal.reason ?? new Error('Input preparation interrupted.'));
+      signal.addEventListener('abort', abort, { once: true });
+    });
+    // A cloud-backed open may not settle promptly. Stop releases the owned turn
+    // now; Promise.race still drains late rejection, and the reader closes its
+    // descriptor after seeing this same aborted signal.
+    const preparing = Promise.resolve().then(() => { signal.throwIfAborted(); return prepare(signal); });
+    try {
+      const result = await Promise.race([preparing, interrupted]);
+      signal.throwIfAborted(); this.assertOpen();
+      return result;
+    } finally { signal.removeEventListener('abort', abort); }
+  }
   state(id) {
     const value = this.store.get(id);
+    let claudeSessionOptions = {};
+    try { if (value && ['claude', 'both'].includes(value.mode)) claudeSessionOptions = this.claudeCommands.context(id).claudeOptions; }
+    catch { /* Codex-only templates and unavailable role contexts have no Claude selection. */ }
     const claudeActiveRuns = (value?.turns.find(row => row.turn.id === value?.activeRun?.turnId)?.runs ?? []).filter(run => run.engine === 'claude' && run.roleId && ['running', 'awaitingApproval'].includes(run.status)).map(({ id, roleId, stepId, round }) => ({ id, roleId, stepId, round }));
     return { threadId: id, engineMode: value?.mode ?? 'codex', models: value?.models ?? { codex: null, claude: 'default' }, busy: !!value?.activeRun,
       claudePermissionMode: value?.claudePermissionMode ?? 'default', claudeActualPermissionMode: value?.claudeActualPermissionMode ?? null,
       claudeCommandTarget: value?.claudeCommandTarget ?? null,
+      claudeSessionOptions,
       claudeActiveRuns, claudeCommandRunId: claudeActiveRuns.some(run => run.id === value?.claudeCommandRunId) ? value.claudeCommandRunId : null,
       claudeClientActions: (value?.claudeClientActions ?? []).map(({ id, type, roleId }) => ({ id, type, roleId })),
       claudeRoleActualPermissionModes: Object.fromEntries((value?.turns ?? []).flatMap(row => row.runs ?? []).filter(run => run.engine === 'claude' && run.roleId && run.actualPermissionMode).map(run => [run.roleId, run.actualPermissionMode])),
@@ -242,7 +266,7 @@ export class EngineRouter {
       this.assertOpen();
       if (value.activeRun) {
         if (value.activeRun.engine === 'codex' && value.mode === 'codex') return this.native.request(method, nativeParams(params));
-        if (inputText(params.input).trim().startsWith('/')) return liveClaudeControl(this, method, params);
+        if (isClaudeCommandInput(params.input)) return liveClaudeControl(this, method, params);
         throw new Error('An engine workflow is active. Stop it before submitting another turn.');
       }
       if ((value.mode !== 'codex' || value.turns.some(row => row.engine !== 'codex')) && params.cwd && realpathSync(params.cwd) !== realpathSync(value.cwd)) throw new Error('Changing workspace inside a managed chat is not supported. Create a new chat in that workspace.');
@@ -262,7 +286,7 @@ export class EngineRouter {
       if (value.mode === 'claude') return this.startClaude(id, params);
       return this.startCodex(id, params);
     }
-    if (method === 'turn/steer' && this.store.get(id)?.mode !== 'codex' && this.store.get(id)?.activeRun && inputText(params.input).trim().startsWith('/')) return liveClaudeControl(this, method, params);
+    if (method === 'turn/steer' && this.store.get(id)?.mode !== 'codex' && this.store.get(id)?.activeRun && isClaudeCommandInput(params.input)) return liveClaudeControl(this, method, params);
     if (method === 'turn/steer' && ['claude', 'both'].includes(this.store.get(id)?.mode)) return steerManagedTurn(this, params);
     if (method === 'turn/interrupt' && (this.store.get(id)?.activeTurn?.mode === 'both' || this.store.get(id)?.activeRun?.engine === 'claude')) return this.interruptManagedTurn(id, params.turnId);
     const value = id && this.store.get(id);
@@ -353,15 +377,16 @@ export class EngineRouter {
       throw error;
     }
   }
-  startClaude(id, params, commandContext = null) {
+  async startClaude(id, params, commandContext = null) {
     this.assertOpen();
     if (params.outputSchema || params.toolOutput) throw new Error('Structured output/tool continuation is unavailable in Claude Code mode.');
-    const prompt = inputText(params.input);
+    const publicInput = structuredClone(params.input), prompt = claudeInputText(publicInput);
     const value = this.store.get(id);
     if (!statSync(value.cwd).isDirectory()) throw new Error('Claude workspace is not a directory.');
     const handoff = commandContext ? { text: '' } : this.handoff(id, 'claude');
+    const claudeOptions = normalizeClaudeSessionOptions(commandContext?.claudeOptions ?? this.claudeCommands.binding(id, commandContext)?.claudeOptions);
     const runId = `claude-run:${randomUUID()}`, turnId = `claude-turn:${randomUUID()}`;
-    const turn = { id: turnId, status: 'inProgress', items: [{ type: 'userMessage', id: `user:${randomUUID()}`, content: structuredClone(params.input), ...(params.clientUserMessageId ? { clientId: params.clientUserMessageId } : {}) }], startedAt: now(), error: null };
+    const turn = { id: turnId, status: 'inProgress', items: [{ type: 'userMessage', id: `user:${randomUUID()}`, content: publicInput, ...(params.clientUserMessageId ? { clientId: params.clientUserMessageId } : {}) }], startedAt: now(), error: null };
     this.store.beginRun(id, { id: runId, turnId, engine: 'claude', permissionMode: value.claudePermissionMode });
     this.store.putTurn(id, turn, { engine: 'claude', runId });
     const run = { id: runId, threadId: id, turn, commandContext, controller: new AbortController(), adapterRun: null, done: null };
@@ -373,6 +398,9 @@ export class EngineRouter {
       try {
         if (run.controller.signal.aborted) result = { status: 'interrupted' };
         else {
+          const content = publicInput.some(item => item.type !== 'text')
+            ? await this.prepareInput(signal => claudeInputContent(publicInput, { signal,
+              prefix: handoff.text ? `${handoff.text}\n\n[Current user request]` : '[Current user request]' }), run.controller.signal) : undefined;
           // The installed CLI does not durably create an empty thread until an
           // item is injected. An empty public message materializes the container
           // without invoking a model or adding instructions to its context.
@@ -389,8 +417,10 @@ export class EngineRouter {
           else {
             const model = commandContext ? commandContext.model : value.models.claude;
             run.adapterRun = this.adapter.start({ prompt: handoff.text ? `${handoff.text}\n\n[Current user request]\n${prompt}` : prompt, cwd: commandContext?.cwd ?? value.cwd,
+              ...(content ? { content } : {}),
               nativeSessionId: this.claudeCommands.binding(id, commandContext).sessionId, model: model === 'default' || model == null ? undefined : model,
               permissionMode: commandContext?.permissionMode ?? value.claudePermissionMode,
+              claudeOptions,
               ...(commandContext ? { command: commandContext.command, access: commandContext.access, instructions: commandContext.instructions } : {}),
               signal: run.controller.signal, onEvent: event => this.claudeEvent(run, event), onPermission: request => this.permission(run, request) });
             result = await run.adapterRun.done;
@@ -408,6 +438,9 @@ export class EngineRouter {
         const acknowledged = result.status === 'completed' || this.store.get(id).activeRun?.acknowledgedSeq != null;
         if (commandContext) this.claudeCommands.finish(id, commandContext, result, row.seq);
         else if (sessionId) this.claudeCommands.setBinding(id, null, { sessionId, ...(acknowledged ? { consumedSeq: row.seq } : {}) });
+        if (!commandContext && result.status === 'completed' && result.settingsPatch?.claudeOptions !== undefined) {
+          this.claudeCommands.setBinding(id, null, { claudeOptions: normalizeClaudeSessionOptions({ ...normalizeClaudeSessionOptions(this.claudeCommands.binding(id, null).claudeOptions), ...normalizeClaudeSessionOptions(result.settingsPatch.claudeOptions) }) });
+        }
         if (!commandContext && result.status === 'completed' && result.settingsPatch?.permissionMode !== undefined) {
           const current = this.store.require(id);
           current.claudePermissionMode = assertClaudePermissionMode(result.settingsPatch.permissionMode);
@@ -470,20 +503,24 @@ export class EngineRouter {
   }
   permission(run, request) {
     if (run.controller.signal.aborted || request.signal?.aborted) return Promise.resolve(deny());
+    let interaction;
+    try { interaction = createClaudeInteraction(request); }
+    catch (error) { return Promise.resolve({ decision: 'decline', message: messageOf(error) }); }
     const id = `claude-approval:${randomUUID()}`;
     const base = { threadId: run.threadId, turnId: run.turn.id, itemId: request.id };
     return new Promise(resolve => {
       const finish = response => {
         if (!this.approvals.delete(id)) return;
         request.signal?.removeEventListener('abort', cancel);
+        run.controller.signal.removeEventListener('abort', cancel);
         this.notify('serverRequest/resolved', { threadId: run.threadId, requestId: id });
         resolve(response);
       };
       const cancel = () => finish(deny());
-      this.approvals.set(id, { runId: run.id, finish, request });
+      this.approvals.set(id, { runId: run.id, finish, request, interaction });
       request.signal?.addEventListener('abort', cancel, { once: true });
-      if (request.name === 'Bash') this.emit({ id, method: 'item/commandExecution/requestApproval', params: { ...base, startedAtMs: Date.now(), command: request.input.command, cwd: this.store.get(run.threadId).cwd, commandActions: [], reason: `Claude Code requests this command. Approval applies once.${request.reason ? ` ${request.reason}` : ''}` } });
-      else this.emit({ id, method: 'item/tool/requestUserInput', params: { ...base, isBlocking: true, questions: [{ id: 'permission', header: 'Claude Code', question: `Allow Claude Code tool ${request.name} once?\n${JSON.stringify(request.input, null, 2)}`, options: [{ label: 'Allow once', description: 'Authorize only this tool request.' }, { label: 'Deny', description: 'Do not execute this tool request.' }], isOther: false }] } });
+      run.controller.signal.addEventListener('abort', cancel, { once: true });
+      this.emit({ id, method: interaction.method, params: { ...base, ...interaction.params } });
     });
   }
   respond(message) {
@@ -491,9 +528,8 @@ export class EngineRouter {
     const pending = this.approvals.get(message.id);
     if (!pending) return false;
     const run = this.runs.get(pending.runId);
-    if (!run || run.controller.signal.aborted) { pending.finish(deny()); return true; }
-    const accepted = pending.request.name === 'Bash' ? message.result?.decision === 'accept' || message.result?.decision === 'acceptForSession' : message.result?.answers?.permission?.answers?.[0] === 'Allow once';
-    pending.finish(accepted ? { decision: 'accept', updatedInput: pending.request.input } : deny());
+    if (!run || run.controller.signal.aborted || pending.request.signal?.aborted || message.error) { pending.finish(deny()); return true; }
+    pending.finish(pending.interaction.respond(message.result));
     if (message.result?.decision === 'cancel') { run.controller.abort(); void run.adapterRun?.interrupt(); }
     return true;
   }

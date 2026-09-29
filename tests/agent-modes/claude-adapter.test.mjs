@@ -2,6 +2,7 @@ import nodeTest from 'node:test';
 import assert from 'node:assert/strict';
 import { getEventListeners } from 'node:events';
 import { ClaudeAdapter } from '../../runtime/agent-modes/claude-adapter.mjs';
+import { createClaudeInteraction } from '../../runtime/agent-modes/claude-interactions.mjs';
 
 const test = (name, fn) => nodeTest(name, { timeout: 3000 }, fn);
 test('interrupt during asynchronous provider resolution never starts the native query', async () => {
@@ -24,6 +25,7 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise((accept) => { resolve = accept; }); return { promise, resolve }; };
 const result = (extra = {}) => ({ type: 'result', subtype: 'success', is_error: false, uuid: 'result-uuid', session_id: session, duration_ms: 12, duration_api_ms: 10, num_turns: 1, stop_reason: 'end_turn', result: 'Done', usage: { input_tokens: 12, output_tokens: 4 }, modelUsage: {}, total_cost_usd: 0, permission_denials: [], ...extra });
 const init = { type: 'system', subtype: 'init', uuid: 'init-uuid', session_id: session, cwd, tools: ['Bash'], mcp_servers: [], model: 'claude-sonnet-4-6', permissionMode: 'default', apiKeySource: 'none', slash_commands: [], output_style: 'default', skills: [], plugins: [], claude_code_version: '2.1.283' };
+const imageContent = () => ({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC' } });
 function scripted(events, observed = {}) {
   return (request) => {
     observed.request = request;
@@ -69,6 +71,40 @@ test('start synchronously returns a run and preserves native session, cwd, model
   assert.deepEqual(events.at(-1), { type: 'result', ...summary });
 });
 
+test('captured image content and steering use the same native stream without slash dispatch or mutation', async () => {
+  const ready = deferred(), finish = deferred(); let prompt, first;
+  const content = [{ type: 'text', text: '/clear with this picture' }, imageContent()];
+  const queryImpl = request => {
+    prompt = request.prompt;
+    const iterator = (async function* () { first = (await prompt.next()).value; yield init; ready.resolve(); await finish.promise; yield result({ user_message_uuids: [first.uuid] }); })();
+    iterator.close = () => finish.resolve(); iterator.interrupt = async () => finish.resolve(); return iterator;
+  };
+  const { run } = startWith(queryImpl, { content });
+  content[1].source.data = 'edited after start';
+  await ready.promise;
+  try {
+    assert.equal(Array.isArray(first.message.content), true);
+    assert.deepEqual(first.message.content.filter(block => block.type === 'image'), [imageContent()]);
+    assert.match(first.message.content[0].text, /^\[User input with attachments\]/);
+    const following = [imageContent()], sending = run.steer(following);
+    following[0].source.data = 'edited after steer';
+    const next = await prompt.next();
+    assert.deepEqual(next.value.message.content.filter(block => block.type === 'image'), [imageContent()]);
+    const waiting = prompt.next(); await sending;
+    await run.interrupt(); await waiting;
+    assert.equal((await run.done).status, 'interrupted');
+  } finally { finish.resolve(); await run.interrupt(); }
+});
+
+test('invalid native image content fails before the SDK query starts', async () => {
+  let calls = 0;
+  const { run } = startWith(() => { calls++; throw new Error('unexpected launch'); }, { content: [{ type: 'image', source: { type: 'url', url: 'https://example.invalid/image' } }] });
+  const result = await run.done;
+  assert.equal(calls, 0);
+  assert.equal(result.status, 'failed');
+  assert.match(result.error, /content|image/i);
+});
+
 test('read roles retain native auth and preset while disabling mutating tools, MCP, and hooks', async () => {
   const observed = {};
   const schema = { type: 'object', properties: { summary: { type: 'string' } } };
@@ -89,14 +125,14 @@ test('read role mutation is denied before user approval, including surprising na
   const answers = {};
   const queryImpl = request => {
     const iterator = (async function* () {
-      for (const name of ['Write', 'Bash', 'Agent', 'mcp__server__write', 'Read', 'StructuredOutput']) answers[name] = await request.options.canUseTool(name, {}, { toolUseID: name, signal: new AbortController().signal });
+      for (const name of ['Write', 'Bash', 'Agent', 'mcp__server__write', 'AskUserQuestion', 'ExitPlanMode', 'Read', 'StructuredOutput']) answers[name] = await request.options.canUseTool(name, {}, { toolUseID: name, signal: new AbortController().signal });
       yield result();
     })();
     iterator.close = () => {};
     return iterator;
   };
   await startWith(queryImpl, { access: 'read', outputSchema: { type: 'object' }, onPermission: async () => { approvals++; return { decision: 'accept' }; } }).run.done;
-  for (const name of ['Write', 'Bash', 'Agent', 'mcp__server__write']) assert.equal(answers[name].behavior, 'deny');
+  for (const name of ['Write', 'Bash', 'Agent', 'mcp__server__write', 'AskUserQuestion', 'ExitPlanMode']) assert.equal(answers[name].behavior, 'deny');
   assert.equal(answers.Read.behavior, 'allow');
   assert.equal(answers.StructuredOutput.behavior, 'allow');
   assert.equal(approvals, 2, 'read tools still respect configured permission checks');
@@ -178,6 +214,80 @@ test('fails permissions closed for missing, thrown, or malformed permission deci
     await startWith(queryImpl, { onPermission }).run.done;
     assert.equal(answer.behavior, 'deny');
     assert.equal(answer.toolUseID, 'tool-deny');
+  }
+});
+
+test('native permission metadata, selected suggestions, and rejection guidance survive the adapter', async () => {
+  const suggestions = [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'npm test:*' }], behavior: 'allow', destination: 'session' }];
+  const prompts = [], answers = [];
+  const queryImpl = request => {
+    const iterator = (async function* () {
+      for (const id of ['allow', 'deny']) answers.push(await request.options.canUseTool('Bash', { command: 'npm test' }, {
+        toolUseID: id, signal: new AbortController().signal, title: 'Run project tests?', decisionReason: 'Native rule requires approval', blockedPath: '/workspace/project', suggestions,
+      }));
+      yield result();
+    })();
+    iterator.close = () => {};
+    return iterator;
+  };
+  await startWith(queryImpl, { onPermission: async request => {
+    prompts.push(request);
+    return request.id === 'allow' ? { decision: 'accept', updatedPermissions: suggestions } : { decision: 'decline', message: 'Use the isolated test database.' };
+  } }).run.done;
+  assert.equal(prompts[0].title, 'Run project tests?');
+  assert.equal(prompts[0].blockedPath, '/workspace/project');
+  assert.deepEqual(prompts[0].suggestions, suggestions);
+  assert.deepEqual(answers[0].updatedPermissions, suggestions);
+  assert.equal(answers[1].message, 'Use the isolated test database.');
+});
+
+test('adapter rejects broadened or mutated permission updates at the SDK boundary', async () => {
+  for (const attack of ['scope', 'mode', 'mutate', 'partial']) {
+    const suggestions = [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'npm test:*' }], behavior: 'allow', destination: 'session' }, { type: 'addDirectories', directories: ['/workspace/tests'], destination: 'session' }];
+    let answer;
+    const queryImpl = request => {
+      const iterator = (async function* () {
+        answer = await request.options.canUseTool('Bash', { command: 'npm test' }, { toolUseID: 'native-attack', signal: new AbortController().signal, suggestions });
+        yield result();
+      })();
+      iterator.close = () => {}; return iterator;
+    };
+    await startWith(queryImpl, { onPermission: request => {
+      if (attack === 'mode') return { decision: 'accept', permissionMode: 'bypassPermissions' };
+      if (attack === 'scope') request.suggestions[0].destination = 'userSettings';
+      if (attack === 'mutate') request.suggestions[0].rules[0].ruleContent = '*';
+      if (attack === 'partial') request.suggestions.pop();
+      return { decision: 'accept', updatedPermissions: request.suggestions };
+    } }).run.done;
+    assert.equal(answer.behavior, 'deny');
+    assert.equal(answer.updatedPermissions, undefined);
+    assert.equal(suggestions[0].destination, 'session');
+    assert.equal(suggestions[0].rules[0].ruleContent, 'npm test:*');
+  }
+});
+
+test('native plan decisions return setMode and persist only the mode confirmed by Claude status', async () => {
+  for (const [label, mode] of [['Approve with manual permissions', 'default'], ['Approve with automatic edits', 'acceptEdits'], ['Add a rollback strategy.', null]]) {
+    let answer;
+    const input = { plan: '# Plan\nImplement a small patch.', allowedPrompts: [{ tool: 'Bash', prompt: 'unrestricted' }] };
+    const queryImpl = request => {
+      const iterator = (async function* () {
+        yield { ...init, permissionMode: 'plan' };
+        answer = await request.options.canUseTool('ExitPlanMode', input, { toolUseID: 'native-plan', signal: new AbortController().signal });
+        if (answer.behavior === 'allow') yield { type: 'system', subtype: 'status', permissionMode: mode, session_id: session, uuid: 'mode-status' };
+        yield result();
+      })();
+      iterator.close = () => {}; return iterator;
+    };
+    const summary = await startWith(queryImpl, { permissionMode: 'plan', onPermission: request => createClaudeInteraction(request).respond({ answers: { plan: { answers: [label] } } }) }).run.done;
+    if (mode) {
+      assert.deepEqual(answer, { behavior: 'allow', updatedInput: input, updatedPermissions: [{ type: 'setMode', mode, destination: 'session' }], toolUseID: 'native-plan' });
+      assert.equal(summary.settingsPatch.permissionMode, mode);
+      assert.equal(summary.actualPermissionMode, mode);
+    } else {
+      assert.equal(answer.behavior, 'deny'); assert.equal(answer.message, label);
+      assert.equal(summary.settingsPatch, undefined); assert.equal(summary.actualPermissionMode, 'plan');
+    }
   }
 });
 
@@ -474,3 +584,89 @@ test('stop rejects steering waiting for native transport and never consumes it l
   await run.interrupt(); await rejected;
   assert.equal((await prompt.next()).done, true);
 });
+
+test('native goal model turns accept steering in their original input stream', async () => {
+  const ready = deferred(), finish = deferred(); let prompt, initialId, followId;
+  const queryImpl = request => {
+    prompt = request.prompt;
+    const iterator = (async function* () {
+      initialId = (await prompt.next()).value.uuid; yield init; ready.resolve();
+      await finish.promise;
+      yield result({ user_message_uuids: [initialId, followId] });
+    })();
+    iterator.close = () => finish.resolve(); iterator.interrupt = async () => finish.resolve(); return iterator;
+  };
+  const command = { name: 'goal', origin: 'builtin', execution: 'native', args: 'Finish the task', input: '/goal Finish the task' };
+  const { run } = startWith(queryImpl, { command }); await ready.promise;
+  try {
+    const sending = run.steer('Use the updated requirements');
+    const next = await prompt.next(); followId = next.value.uuid;
+    assert.equal(next.value.message.content, 'Use the updated requirements');
+    const waiting = prompt.next(); await sending;
+    finish.resolve(); assert.equal((await run.done).status, 'completed'); await waiting;
+  } finally { finish.resolve(); await run.interrupt(); }
+});
+
+test('a native goal control result cannot close the original model turn', async () => {
+  const ready = deferred(), commandResult = deferred(), finish = deferred(); let prompt, initialId, commandId;
+  const queryImpl = request => {
+    prompt = request.prompt;
+    const iterator = (async function* () {
+      initialId = (await prompt.next()).value.uuid; yield init; ready.resolve();
+      await commandResult.promise;
+      yield result({ uuid: 'goal-result', local_command: 'goal', num_turns: 0, user_message_uuids: [commandId], result: 'Goal cleared' });
+      await finish.promise;
+      yield result({ uuid: 'original-result', user_message_uuids: [initialId], result: 'Original turn finished' });
+    })();
+    iterator.close = () => { commandResult.resolve(); finish.resolve(); };
+    iterator.interrupt = async () => { commandResult.resolve(); finish.resolve(); }; return iterator;
+  };
+  const { run } = startWith(queryImpl); await ready.promise;
+  try {
+    const sending = run.control({ name: 'goal', origin: 'builtin', execution: 'native', args: 'clear', input: '/goal clear' });
+    const next = await prompt.next(); commandId = next.value.uuid;
+    assert.equal(next.value.message.content, '/goal clear');
+    const waiting = prompt.next(); assert.equal((await sending).nativeInput, true);
+    let finished = false; run.done.then(() => { finished = true; });
+    commandResult.resolve(); await tick(); assert.equal(finished, false);
+    finish.resolve(); assert.equal((await run.done).text, 'Original turn finished'); await waiting;
+  } finally { commandResult.resolve(); finish.resolve(); await run.interrupt(); }
+});
+
+for (const order of ['control-during-stream', 'control-after-main']) {
+  test(`native goal ${order} preserves the main output and result metadata`, async () => {
+    const ready = deferred(), proceed = deferred(); let prompt, initialId, commandId;
+    const partial = event => ({ type: 'stream_event', session_id: session, event });
+    const queryImpl = request => {
+      prompt = request.prompt;
+      const iterator = (async function* () {
+        initialId = (await prompt.next()).value.uuid; yield init; ready.resolve(); await proceed.promise;
+        const side = result({ uuid: 'side-result', local_command: 'goal', num_turns: 0, user_message_uuids: [commandId], result: 'Goal active: test', usage: { input_tokens: 0, output_tokens: 0 } });
+        yield partial({ type: 'message_start', message: { id: 'main-message', role: 'assistant', model: 'claude-opus-4-6', content: [] } });
+        yield partial({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+        yield partial({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'First ' } });
+        if (order === 'control-during-stream') yield side;
+        yield partial({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'second.' } });
+        yield partial({ type: 'content_block_stop', index: 0 });
+        yield partial({ type: 'message_stop' });
+        yield result({ uuid: 'main-result', user_message_uuids: [initialId], result: 'First second.', structured_output: { ok: true }, usage: { input_tokens: 30, output_tokens: 8 } });
+        if (order === 'control-after-main') yield side;
+      })();
+      iterator.close = () => proceed.resolve(); iterator.interrupt = async () => proceed.resolve(); return iterator;
+    };
+    const { run, events } = startWith(queryImpl); await ready.promise;
+    try {
+      const sending = run.control({ name: 'goal', origin: 'builtin', execution: 'native' });
+      commandId = (await prompt.next()).value.uuid;
+      const waiting = prompt.next(); await sending; proceed.resolve();
+      const summary = await run.done; await waiting;
+      assert.deepEqual(events.filter(event => event.type === 'message-completed' && event.id === 'claude-message:main:main-message:0').map(event => event.text), ['First second.'], 'The original public main message must remain complete');
+      assert.equal(events.filter(event => event.type === 'text-delta' && event.id === 'claude-message:main:main-message:0').map(event => event.delta).join(''), 'First second.');
+      assert.equal(summary.text, 'First second.');
+      assert.deepEqual(summary.structuredOutput, { ok: true });
+      assert.deepEqual(summary.usage, { input_tokens: 30, output_tokens: 8, modelUsage: {}, total_cost_usd: 0 });
+      assert.equal(summary.localCommand, undefined);
+      assert.deepEqual(events.filter(event => event.type === 'message-completed' && event.text === 'Goal active: test').map(event => event.text), ['Goal active: test']);
+    } finally { proceed.resolve(); await run.interrupt(); }
+  });
+}

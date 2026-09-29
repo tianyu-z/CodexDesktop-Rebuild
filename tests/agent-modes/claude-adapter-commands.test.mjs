@@ -99,6 +99,7 @@ for (const command of [
   { name: 'config', origin: 'builtin', execution: 'native', args: 'disableAllHooks=false' },
   { name: 'mcp', origin: 'builtin', execution: 'native', args: 'enable server' },
   { name: 'reload-plugins', origin: 'builtin', execution: 'native', args: '' },
+  { name: 'output-style', origin: 'builtin', execution: 'native', args: 'Concise' },
 ]) {
   test(`read roles reject mutating /${command.name} commands before native startup`, async () => {
     let calls = 0;
@@ -180,6 +181,122 @@ test('native commands preserve the exact resolved input without workflow wrappin
   }, { prompt: 'wrapped workflow prompt', command: { name: 'context', execution: 'native', input: '/context  exact arguments' } });
   await run.done;
   assert.equal(input.value?.message.content, '/context  exact arguments');
+});
+
+test('Claude session options reach query without weakening read-role hook isolation', async () => {
+  const observed = {}, claudeOptions = { effort: 'high', thinking: { type: 'disabled' }, outputStyle: 'Concise' };
+  const { run } = runWith(sequence([result()], observed), { access: 'read', claudeOptions });
+  assert.equal((await run.done).status, 'completed');
+  assert.equal(observed.request.options.effort, 'high');
+  assert.deepEqual(observed.request.options.thinking, { type: 'disabled' });
+  assert.deepEqual(observed.request.options.settings, { outputStyle: 'Concise', disableAllHooks: true });
+  assert.deepEqual(claudeOptions, { effort: 'high', thinking: { type: 'disabled' }, outputStyle: 'Concise' });
+});
+
+test('explicit auto effort initializes and resets before the first native input is released', async () => {
+  const order = []; let initialize, reset, input;
+  const initialized = new Promise(resolve => { initialize = resolve; });
+  const resetDone = new Promise(resolve => { reset = resolve; });
+  const { run } = runWith(request => {
+    input = request.prompt[Symbol.asyncIterator]().next().then(value => { order.push(value.done ? 'input-closed' : 'input'); return value; });
+    const stream = (async function* () { await input; yield result(); })();
+    return Object.assign(stream, { initializationResult: async () => { order.push('initialize'); await initialized; return {}; }, applyFlagSettings: async value => { assert.deepEqual(value, { effortLevel: null }); order.push('reset'); await resetDone; }, close() { order.push('close'); } });
+  }, { claudeOptions: { effort: null } });
+  await tick(); assert.deepEqual(order, ['initialize']);
+  initialize(); await tick(); assert.deepEqual(order, ['initialize', 'reset']);
+  reset(); assert.equal((await run.done).status, 'completed');
+  assert.deepEqual(order, ['initialize', 'reset', 'input', 'close']);
+});
+
+test('Stop while auto-effort initialization is pending closes input without sending a prompt', async () => {
+  let input, resets = 0;
+  const { run } = runWith(request => {
+    input = request.prompt[Symbol.asyncIterator]().next();
+    return { initializationResult: () => new Promise(() => {}), applyFlagSettings: async () => resets++, close() {}, async interrupt() {}, async return() { return { done: true }; }, next() { throw Error('first input was released'); } };
+  }, { claudeOptions: { effort: null } });
+  await tick(); await run.interrupt();
+  assert.equal((await run.done).status, 'interrupted');
+  assert.equal((await input).done, true);
+  assert.equal(resets, 0);
+});
+
+test('only successful builtin effort and output-style results capture native settings before close', async () => {
+  for (const name of ['effort', 'output-style']) {
+    const order = [];
+    const { run } = runWith(request => {
+      const stream = (async function* () { await request.prompt[Symbol.asyncIterator]().next(); order.push('result'); yield result({ local_command: name === 'output-style' ? 'output_style' : name }); })();
+      return Object.assign(stream, { initializationResult: async () => ({ available_output_styles: ['default', 'Concise'] }), getSettings: async () => { order.push('settings'); return { applied: { effort: 'xhigh' }, effective: { outputStyle: 'Concise', env: { SECRET: 'fixture-secret' } } }; }, close() { order.push('close'); } });
+    }, { claudeOptions: { thinking: { type: 'disabled' } }, command: { name, origin: 'builtin', execution: 'native', input: `/${name} ${name === 'effort' ? 'max' : 'concise'}` } });
+    const summary = await run.done;
+    assert.equal(summary.status, 'completed');
+    assert.deepEqual(summary.settingsPatch.claudeOptions, { thinking: { type: 'disabled' }, ...(name === 'effort' ? { effort: 'xhigh' } : { outputStyle: 'Concise' }) });
+    assert.deepEqual(order, ['result', 'settings', 'close']);
+    assert.doesNotMatch(JSON.stringify(summary), /fixture-secret/);
+  }
+  for (const extra of [{ origin: 'skill', terminal: result({ local_command: 'effort' }) }, { origin: 'builtin', terminal: result({ local_command: 'effort', is_error: true, subtype: 'error_during_execution', errors: ['failure'] }) }]) {
+    let reads = 0;
+    const { run } = runWith(sequence([extra.terminal], {}, { getSettings: async () => { reads++; return { applied: { effort: 'high' } }; } }), { command: { name: 'effort', origin: extra.origin, execution: 'native', input: '/effort high' } });
+    const summary = await run.done;
+    assert.equal(reads, 0);
+    assert.equal(summary.settingsPatch?.claudeOptions, undefined);
+  }
+});
+
+test('fallback session controls merge options from their frozen native binding', async () => {
+  const { run } = runWith(() => ({ initializationResult: async () => ({}), setMaxThinkingTokens: async value => assert.equal(value, 0), close() {}, async return() { return { done: true }; } }),
+    { claudeOptions: { effort: 'high' }, command: { name: 'thinking', origin: 'app', execution: 'control', args: 'off' } });
+  assert.deepEqual((await run.done).settingsPatch.claudeOptions, { effort: 'high', thinking: { type: 'disabled' } });
+});
+
+test('native option inspections and invalid arguments never create app session overrides', async () => {
+  for (const name of ['effort', 'output-style']) {
+    for (const args of ['', 'current', 'status', 'help', 'list', 'not-a-setting']) {
+    let reads = 0;
+    const { run } = runWith(sequence([result({ local_command: name === 'output-style' ? 'output_style' : name })], {}, {
+      initializationResult: async () => ({ available_output_styles: ['default', 'Concise'] }),
+      getSettings: async () => { reads++; return { applied: { effort: 'high' }, effective: { outputStyle: 'Concise' } }; },
+    }), { command: { name, origin: 'builtin', execution: 'native', args, input: `/${name}${args ? ` ${args}` : ''}` } });
+    const summary = await run.done;
+    assert.equal(summary.status, 'completed');
+    assert.equal(summary.settingsPatch?.claudeOptions, undefined);
+    assert.equal(reads, 0);
+    }
+  }
+});
+
+test('a native output-style change does not shadow its file setting with the previous app flag', async () => {
+  const order = []; let fileStyle = 'default';
+  const { run } = runWith(request => {
+    assert.equal(request.options.settings?.outputStyle, undefined);
+    const flag = request.options.settings?.outputStyle;
+    const stream = (async function* () { await request.prompt[Symbol.asyncIterator]().next(); order.push('input'); fileStyle = 'Explanatory'; yield result({ local_command: 'output_style' }); })();
+    return Object.assign(stream, { initializationResult: async () => { order.push('initialized'); return { available_output_styles: ['default', 'Concise', 'Explanatory'] }; }, applyFlagSettings: async () => assert.fail('native null cannot clear initial inline settings in this installed version'), getSettings: async () => ({ effective: { outputStyle: flag ?? fileStyle } }), close() {} });
+  }, { claudeOptions: { outputStyle: 'Concise' }, command: { name: 'output-style', origin: 'builtin', execution: 'native', args: 'explanatory', input: '/output-style explanatory' } });
+  assert.equal((await run.done).settingsPatch.claudeOptions.outputStyle, 'Explanatory');
+  assert.deepEqual(order, ['initialized', 'input']);
+});
+
+test('a native output-style file write failure cannot replace the existing app override', async () => {
+  const { run } = runWith(sequence([result({ local_command: 'output_style', result: 'Could not save output style: policy denied' })], {}, {
+    initializationResult: async () => ({ available_output_styles: ['default', 'Concise', 'Explanatory'] }),
+    applyFlagSettings: async () => {}, getSettings: async () => ({ effective: { outputStyle: 'default' } }),
+  }), { claudeOptions: { outputStyle: 'Concise' }, command: { name: 'output-style', origin: 'builtin', execution: 'native', args: 'Explanatory', input: '/output-style Explanatory' } });
+  const summary = await run.done;
+  assert.equal(summary.settingsPatch?.claudeOptions, undefined);
+  assert.match(summary.text, /Could not save/);
+});
+
+test('read-role output-style inspection aliases cannot hide a configured style mutation', async () => {
+  let input, calls = 0;
+  const { run } = runWith(request => {
+    input = request.prompt[Symbol.asyncIterator]().next();
+    return { initializationResult: async () => ({ available_output_styles: ['default', 'help'] }), applyFlagSettings: async () => calls++, next() { throw Error('native input should remain gated'); }, close() {}, async return() { return { done: true }; } };
+  }, { access: 'read', command: { name: 'output-style', origin: 'builtin', execution: 'native', args: 'help', input: '/output-style help' } });
+  const summary = await run.done;
+  assert.equal(summary.status, 'failed');
+  assert.match(summary.error, /read.only|write access/);
+  assert.equal(calls, 0);
+  assert.equal((await input).done, true);
 });
 
 test('synthetic workflow prompts retain native provenance metadata', async () => {

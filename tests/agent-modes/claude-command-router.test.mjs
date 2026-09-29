@@ -26,6 +26,96 @@ async function fixture(t, mode = 'claude') {
 }
 async function submit(f, text, extra = {}) { const response = await f.router.request('turn/start', { threadId: 'chat', input: [{ type: 'text', text }], ...extra }); await tick(); return response; }
 
+test('confirmed session options persist on the Only-Claude binding and freeze for subsequent turns', async t => {
+  const f = await fixture(t);
+  f.router.adapter.listCommands = async () => ({ commands: [{ name: 'thinking', origin: 'app', execution: 'control' }] });
+  f.store.setBinding('chat', 'claude', { claudeOptions: { effort: 'high' } });
+  await submit(f, '/thinking off');
+  assert.deepEqual(f.runs[0].options.claudeOptions, { effort: 'high' });
+  f.runs[0].finish({ status: 'completed', settingsPatch: { claudeOptions: { thinking: { type: 'disabled' } } } }); await tick();
+  assert.deepEqual(f.store.get('chat').bindings.claude.claudeOptions, { effort: 'high', thinking: { type: 'disabled' } });
+  assert.deepEqual(f.router.state('chat').claudeSessionOptions, { effort: 'high', thinking: { type: 'disabled' } });
+  await submit(f, 'Continue');
+  const selected = f.runs[1].options.claudeOptions;
+  f.store.setBinding('chat', 'claude', { claudeOptions: { effort: 'low' } });
+  assert.deepEqual(selected, { effort: 'high', thinking: { type: 'disabled' } });
+  f.runs[1].finish({ status: 'completed' }); await tick();
+  await submit(f, '/thinking off');
+  f.runs[2].finish({ status: 'failed', settingsPatch: { claudeOptions: { effort: 'max' } } }); await tick();
+  assert.deepEqual(f.store.get('chat').bindings.claude.claudeOptions, { effort: 'low' });
+});
+
+test('Claude role session options update only the selected binding and move with a native model change', async t => {
+  const f = await fixture(t, 'both');
+  await f.router.request('engine/mode/set', { threadId: 'chat', engineMode: 'both', roleOverrides: { participant_a: { engine: 'claude', model: 'opus' }, participant_b: { engine: 'claude', model: 'sonnet' } }, claudeCommandTarget: 'participant_b' });
+  const a = f.router.claudeCommands.context('chat', { target: 'participant_a' }), b = f.router.claudeCommands.context('chat', { target: 'participant_b' });
+  f.store.setRoleBinding('chat', a.bindingKey, { engine: 'claude', sessionId: 'role-a', claudeOptions: { effort: 'low' } });
+  f.store.setRoleBinding('chat', b.bindingKey, { engine: 'claude', sessionId: 'role-b', claudeOptions: { outputStyle: 'Concise' } });
+  f.store.setBinding('chat', 'claude', { claudeOptions: { effort: 'medium' } });
+  await submit(f, '/model opus');
+  assert.deepEqual(f.runs[0].options.claudeOptions, { outputStyle: 'Concise' });
+  f.runs[0].finish({ status: 'completed', nativeSessionId: 'role-b', localCommand: 'model', settingsPatch: { model: 'opus', claudeOptions: { effort: 'high' } } }); await tick();
+  const selected = f.router.claudeCommands.context('chat');
+  assert.notEqual(selected.bindingKey, b.bindingKey);
+  assert.deepEqual(selected.claudeOptions, { outputStyle: 'Concise', effort: 'high' });
+  assert.deepEqual(f.router.state('chat').claudeSessionOptions, selected.claudeOptions);
+  assert.deepEqual(f.store.get('chat').roleBindings[a.bindingKey].claudeOptions, { effort: 'low' });
+  assert.deepEqual(f.store.get('chat').bindings.claude.claudeOptions, { effort: 'medium' });
+  assert.equal(f.store.get('chat').roleBindings[b.bindingKey], undefined);
+});
+
+test('idle task stops fail instead of treating historical task IDs as live targets', async t => {
+  const f = await fixture(t);
+  f.router.adapter.listCommands = async () => ({ commands: [{ name: 'tasks', origin: 'app', execution: 'local' }] });
+  await assert.rejects(submit(f, '/tasks stop historical'), /active|live/);
+  assert.equal(f.runs.length, 0);
+});
+
+test('live side controls reject mixed reference inputs before dispatching a native command', async t => {
+  const f = await fixture(t);
+  f.router.adapter.listCommands = async () => ({ commands: [{ name: 'btw', origin: 'app', execution: 'control' }] });
+  await submit(f, 'Work');
+  let calls = 0; f.runs[0].control = async () => { calls++; return { text: 'side answer' }; };
+  await assert.rejects(f.router.request('engine/claude/control', { threadId: 'chat', input: [{ type: 'text', text: '/btw question' }, { type: 'mention', path: '/work/readme.md' }] }), /text.only|text only/i);
+  assert.equal(calls, 0);
+  f.runs[0].finish({ status: 'completed' }); await tick();
+});
+
+test('native goal lifecycle uses the Claude session and never calls Codex goal management', async t => {
+  const f = await fixture(t);
+  f.router.adapter.listCommands = async () => ({ commands: [{ name: 'goal', origin: 'builtin', execution: 'native' }] });
+  for (const text of ['/goal Finish the task', '/goal', '/goal clear']) {
+    await submit(f, text);
+    const run = f.runs.at(-1);
+    assert.equal(run.options.command.input, text);
+    assert.equal(run.options.prompt, text);
+    if (f.runs.length > 1) assert.equal(run.options.nativeSessionId, 'native-goal-session');
+    run.finish({ status: 'completed', nativeSessionId: 'native-goal-session', localCommand: 'goal' }); await tick();
+  }
+  assert.equal(f.calls.some(call => call.method.startsWith('thread/goal/')), false);
+});
+
+test('live goal commands enter the owned Claude stream and retain accepted input after Stop', async t => {
+  const f = await fixture(t);
+  f.router.adapter.listCommands = async () => ({ commands: [{ name: 'goal', origin: 'builtin', execution: 'native' }] });
+  const { turn } = await submit(f, '/goal Finish the task');
+  const controls = []; let accept;
+  f.runs[0].control = command => { controls.push(command); return new Promise(resolve => { accept = resolve; }); };
+  const params = { threadId: 'chat', expectedTurnId: turn.id, clientUserMessageId: 'goal-clear', input: [{ type: 'text', text: '/goal clear' }] };
+  await assert.rejects(f.router.request('turn/steer', { ...params, expectedTurnId: 'unowned-turn' }), /ownership/);
+  const sending = f.router.request('turn/steer', params);
+  await tick(); assert.equal(controls.length, 1); assert.equal(controls[0].name, 'goal');
+  await f.router.request('turn/interrupt', { threadId: 'chat', turnId: turn.id });
+  accept({ nativeInput: true });
+  assert.deepEqual(await sending, { turnId: turn.id });
+  const stored = f.store.get('chat');
+  assert.equal(stored.turns[0].turn.status, 'interrupted');
+  assert.equal(stored.turns[0].turn.items.filter(item => item.clientId === 'goal-clear').length, 1);
+  assert.equal(stored.turns[0].turn.items.some(item => item.type === 'agentMessage' && !item.text), false);
+  assert.equal(f.runs.length, 1);
+  assert.equal(f.calls.some(call => call.method.startsWith('thread/goal/')), false);
+});
+
 for (const name of ['tasks', 'copy', 'resume', 'permissions', 'rename']) {
   test(`native skill /${name} is not intercepted by an app command`, async t => {
     const f = await fixture(t);

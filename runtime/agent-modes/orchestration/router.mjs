@@ -4,7 +4,9 @@ import { join } from 'node:path';
 import { resolveParameters, resolveRoleConfig } from '../templates/schema.mjs';
 import { assertClaudeModel } from '../claude-models.mjs';
 import { CLAUDE_PERMISSION_MODES } from '../claude-permissions.mjs';
-import { inputText, publicHistory, writeHistorySnapshot } from '../handoff.mjs';
+import { createClaudeInteraction } from '../claude-interactions.mjs';
+import { publicHistory, writeHistorySnapshot } from '../handoff.mjs';
+import { claudeInputText, captureClaudeInput, readClaudeInputCapture } from '../claude-input.mjs';
 import { presentItem, presentTurn, toolItem } from '../codex-events.mjs';
 
 const clone = value => structuredClone(value);
@@ -79,14 +81,14 @@ export class WorkflowRouter {
     const latestTurnId = chat?.turns.at(-1)?.turn.id;
     return { workflows: (chat?.turns ?? []).filter(row => row.workflow && (!turnId || row.turn.id === turnId)).map(row => ({ turnId: row.turn.id, isLatestTurn: row.turn.id === latestTurnId, workflowId: row.workflow.id, status: row.workflow.status, config: row.workflow.config, runs: row.runs, state: row.workflow.state })) };
   }
-  start(id, params) {
+  async start(id, params) {
     this.router.assertOpen();
     if (params.outputSchema || params.toolOutput) throw new Error('Output schema and tool continuations are controlled by the selected workflow template.');
-    const input = inputText(params.input), chat = this.store.get(id);
+    const publicInput = clone(params.input), input = claudeInputText(publicInput), chat = this.store.get(id);
     if (!statSync(chat.cwd).isDirectory()) throw new Error('Workflow workspace is not a directory.');
     const selected = this.selection(params, chat, { nativeModel: true });
     const idRun = `workflow:${randomUUID()}`, turnId = `workflow-turn:${randomUUID()}`;
-    const turn = { id: turnId, status: 'inProgress', startedAt: now(), error: null, items: [{ id: `user:${randomUUID()}`, type: 'userMessage', content: clone(params.input), ...(params.clientUserMessageId ? { clientId: params.clientUserMessageId } : {}) }] };
+    const turn = { id: turnId, status: 'inProgress', startedAt: now(), error: null, items: [{ id: `user:${randomUUID()}`, type: 'userMessage', content: publicInput, ...(params.clientUserMessageId ? { clientId: params.clientUserMessageId } : {}) }] };
     const nativeKeys = ['approvalPolicy', 'approvalsReviewer', 'sandbox', 'sandboxPolicy', 'permissions', 'serviceTier', 'modelProvider', 'effort'];
     const nativeOptions = Object.fromEntries(nativeKeys.filter(key => params[key] !== undefined).map(key => [key, clone(params[key])]));
     nativeOptions.cwd = chat.cwd;
@@ -112,6 +114,13 @@ export class WorkflowRouter {
       let result, crashed = false;
       try {
         if (run.controller.signal.aborted) throw new Error('Workflow interrupted before startup.');
+        const publicInput = run.turn.items.find(item => item.type === 'userMessage')?.content;
+        if (!config.inputCapture && publicInput?.some(item => ['image', 'localImage'].includes(item.type))) {
+          const inputCapture = await this.router.prepareInput(signal => captureClaudeInput(publicInput, { directory: this.store.directory, signal }), run.controller.signal);
+          config = { ...config, inputCapture };
+          const { value, row } = this.store.workflowRecord(id, workflowId);
+          row.workflow.config = clone(config); this.store.save(value);
+        }
         const chat = this.store.get(id);
         if (!chat.nativeMaterialized && !chat.turns.some(row => row.engine === 'codex')) {
           const inject = () => abortable(this.router.native.request('thread/inject_items', { threadId: id, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: '' }] }] }), run.controller.signal);
@@ -127,7 +136,8 @@ export class WorkflowRouter {
           if (!current.thread.name && config.input.trim()) await abortable(this.router.native.request('thread/name/set', { threadId: id, name: config.input.trim().slice(0, 80) }), run.controller.signal);
         }
         if (run.controller.signal.aborted || this.router.closed) throw new Error('Workflow interrupted before startup.');
-        const scheduler = this.factory({ onEvent: event => this.event(run, event), onPermission: request => this.permission(run, request) });
+        const scheduler = this.factory({ onEvent: event => this.event(run, event), onPermission: request => this.permission(run, request),
+          loadInputCapture: (capture, { signal } = {}) => readClaudeInputCapture(capture, { directory: this.store.directory, signal }) });
         run.handle = scheduler.start({ ...clone(config), runId: workflowId, bindings: this.store.get(id).roleBindings, signal: run.controller.signal, onSnapshot: snapshot => this.snapshot(run, snapshot), ...recovery });
         result = await run.handle.done;
       } catch (error) { crashed = true; result = { status: run.controller.signal.aborted ? 'interrupted' : 'failed', error: messageOf(error) }; }
@@ -207,6 +217,11 @@ export class WorkflowRouter {
   permission(run, request) {
     const child = this.store.get(run.threadId)?.turns.find(row => row.workflow?.id === run.id)?.runs.find(child => child.id === request.runId);
     if (!child || child.engine !== request.engine || terminal.has(child.status) || run.controller.signal.aborted || request.signal?.aborted) return Promise.resolve(deny(request));
+    let interaction;
+    if (request.engine === 'claude') {
+      try { interaction = createClaudeInteraction(request); }
+      catch (error) { return Promise.resolve({ decision: 'decline', message: messageOf(error) }); }
+    }
     const id = `workflow-approval:${randomUUID()}`;
     return new Promise(resolve => {
       const finish = result => {
@@ -215,24 +230,21 @@ export class WorkflowRouter {
         this.router.notify('serverRequest/resolved', { threadId: run.threadId, requestId: id }); resolve(result);
       };
       const cancel = () => finish(deny(request));
-      this.approvals.set(id, { run, request, finish });
+      this.approvals.set(id, { run, request, finish, interaction });
       request.signal?.addEventListener('abort', cancel, { once: true }); run.controller.signal.addEventListener('abort', cancel, { once: true });
       const base = { threadId: run.threadId, turnId: run.turn.id, itemId: request.id, cdxRunId: child.id, cdxRoleId: child.roleId, cdxEngineSource: child.engine };
       if (request.engine === 'codex') this.router.emit({ id, method: request.method, params: { ...request.params, ...base, itemId: request.params?.itemId ? `${child.id}:${request.params.itemId}` : request.id, reason: `${child.engine} · ${child.roleId}${request.params?.reason ? `: ${request.params.reason}` : ''}` } });
-      else if (request.name === 'Bash') this.router.emit({ id, method: 'item/commandExecution/requestApproval', params: { ...base, cwd: child.cwd, command: request.input.command, commandActions: [], startedAtMs: Date.now(), reason: `Claude Code · ${child.roleId}: approve this command once.` } });
-      else this.router.emit({ id, method: 'item/tool/requestUserInput', params: { ...base, isBlocking: true, questions: [{ id: 'permission', header: 'Claude Code', question: `${child.roleId}: Allow ${request.name} once?\n${JSON.stringify(request.input, null, 2)}`, options: [{ label: 'Allow once', description: 'Authorize this request.' }, { label: 'Deny', description: 'Decline this request.' }], isOther: false }] } });
+      else this.router.emit({ id, method: interaction.method, params: { ...base, ...interaction.params } });
     });
   }
   respond(message) {
     const pending = this.approvals.get(message.id);
     if (!pending) return typeof message.id === 'string' && message.id.startsWith('workflow-approval:');
     const { request, run } = pending;
-    if (run.controller.signal.aborted || request.signal?.aborted || message.error) { pending.finish(deny(request)); return true; }
+    const child = this.store.get(run.threadId)?.turns.find(row => row.workflow?.id === run.id)?.runs.find(child => child.id === request.runId);
+    if (!child || child.engine !== request.engine || terminal.has(child.status) || run.controller.signal.aborted || request.signal?.aborted || message.error) { pending.finish(deny(request)); return true; }
     if (request.engine === 'codex') pending.finish(message.result ?? deny(request));
-    else {
-      const accepted = request.name === 'Bash' ? ['accept', 'acceptForSession'].includes(message.result?.decision) : message.result?.answers?.permission?.answers?.[0] === 'Allow once';
-      pending.finish(accepted ? { decision: 'accept', updatedInput: request.input } : deny(request));
-    }
+    else pending.finish(pending.interaction.respond(message.result));
     return true;
   }
   cancelApprovals(workflowId, roleId) { for (const pending of this.approvals.values()) if (pending.run.id === workflowId && (!roleId || pending.request.runId === roleId)) pending.finish(deny(pending.request)); }

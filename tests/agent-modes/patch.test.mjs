@@ -4,11 +4,26 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 const require = createRequire(import.meta.url);
-const { patchAppBundle, patchTurnBundle, replaceExactOnce } = require('../../scripts/patch-agent-modes.js');
+const { patchAppBundle, patchTurnBundle, replaceExactOnce, patchClaudeQuestions } = require('../../scripts/patch-agent-modes.js');
+
+const questionnaireFixture = [
+  'questions:e.params.questions.map(e=>({id:e.id,header:e.header,question:e.question,isOther:e.isOther===!0,options:',
+  'i=t.questions.map(e=>({id:e.id,header:e.header,question:e.question,isOther:e.isOther===!0,options:',
+  'questions:n.questions.map(e=>({id:e.id,header:e.header,options:(e.options??[]).map(e=>({description:e.description,label:e.label})),question:e.question}))',
+  'questions:n.questions.map(e=>({id:e.id,header:e.header,question:e.question,isOther:!1,options:',
+  'question:e.question,isOther:s||e.isOther,options:e.options.map(zGc)',
+  'function WGc(e,t){let n={},r=0,i=0;return {response:{answers:n},optionSelectionCount:r,freeformResponseCount:i}}',
+].join('\n');
+
+// Upstream goal preparation runs before engine selection reaches turn/start.
+const goalSubmitFixture = 'async function goalSubmitFixture(u,i,h){return lel({confirmedGoalReplacementDraft:null,getImageAttachments:()=>u.get(OH),getPastedTextAttachments:()=>u.get(cPa),isGoalActionAvailable:bMc(u.value,i),isGoalModeActive:u.get(nPa)!=null,promptRaw:h})}';
+const goalParserFixture = 'async function lel({confirmedGoalReplacementDraft:e,getImageAttachments:t,getPastedTextAttachments:n,isGoalActionAvailable:r,isGoalModeActive:i,promptRaw:a}){if(e!=null)return{status:`ready`,draft:e};let o=r?EVt(a):null;if(r&&o==null&&i&&(o=a),o==null)return{status:`not-goal`};o=o.trim();let s=n(),c=t();return o.length===0&&s.length===0&&c.length===0?{status:`empty`}:{status:`ready`,draft:{objective:o,pastedTextAttachments:[...s],imageAttachments:c.map(({src:e,localPath:t,filename:n})=>({src:e,localPath:t,filename:n}))}}}';
 
 // Deliberately literal upstream seams: a renamed binding must fail a build.
 const appFixture = [
+  questionnaireFixture,
   'FKs(at,!ht&&!bo);',
+  goalSubmitFixture,
   'Lee,(0,Y3.jsx)(AZc,{conversationId:le,children:vte??(0,Y3.jsx)(sFc,{',
 
   'function fNc(e){let t=(0,_Nc.c)(167),',
@@ -51,6 +66,20 @@ const appFixture = [
 ].join('\n');
 const turnFixture = 't[71]=i,t[72]=N):N=t[72],N})}));';
 
+test('native questionnaire preserves multi-select through live and restored requests', () => {
+  const patched = patchClaudeQuestions(questionnaireFixture);
+  assert.equal(patchClaudeQuestions(patched), patched);
+  assert.equal(patched.split('isMultiSelect:e.isMultiSelect===!0').length - 1, 5);
+  const serializer = patched.slice(patched.indexOf('function WGc'));
+  const seen = [];
+  const context = { globalThis: { __cdxEngineModes: { serializeClaudeAnswers: (q, a) => { seen.push({ q, a }); return 'multi'; } } } };
+  vm.runInNewContext(serializer + '; this.reply=WGc', context);
+  assert.equal(context.reply([{ isMultiSelect: true }], [{ selectedOptionIds: ['A', 'B'] }]), 'multi');
+  assert.equal(seen.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(context.reply([{ options: [] }], []))), { response: { answers: {} }, optionSelectionCount: 0, freeformResponseCount: 0 });
+  assert.throws(() => patchClaudeQuestions('new incompatible frontend'), /missing|expected|anchor/i);
+});
+
 test('exact replacement rejects missing, ambiguous, and mixed upstream anchors', () => {
   assert.equal(replaceExactOnce('A target B', 'target', 'patched-target', 'seam'), 'A patched-target B');
   for (const text of ['none', 'target target', 'patched-target target', 'patched-target patched-target']) {
@@ -79,6 +108,42 @@ test('goal submissions fail before creating a managed chat or starting its nativ
   api.setDraftSelection(scope, { engineMode: 'codex' }, 'local');
   await prepare({ threadGoalDraft: { objective: 'work' } }, 'local');
   assert.deepEqual(calls, ['materialize', 'materialize']);
+});
+
+test('Claude goal text bypasses the upstream parser in new and existing chats on the selected host', async () => {
+  const context = {};
+  vm.runInNewContext(readFileSync(new URL('../../scripts/assets/agent-modes-ui.js', import.meta.url), 'utf8'), context);
+  const api = context.__cdxEngineModes, atoms = { OH: {}, cPa: {}, nPa: {}, Rk: {} };
+  const scope = { node: {}, value: { kind: 'local', placement: 'main' }, get: atom => atom === atoms.Rk ? scope.hostId : atom === atoms.nPa ? scope.pendingGoal : [] };
+  const line = patchAppBundle(appFixture).split('\n').find(line => line.startsWith('async function goalSubmitFixture('));
+  const prepare = new Function('globalThis', 'OH', 'cPa', 'nPa', 'Rk', 'FB', 'bMc', 'EVt', `${goalParserFixture};${line};return goalSubmitFixture`)(context, atoms.OH, atoms.cPa, atoms.nPa, atoms.Rk, () => scope.threadId, () => true, text => {
+    const input = text.trimStart(), prefix = /^\/go+al(?=$| )/.exec(input)?.[0];
+    return prefix == null ? null : input.slice(prefix.length).trimStart();
+  });
+  for (const threadId of [null, 'chat']) {
+    scope.threadId = threadId;
+    api.setDraftSelection(scope, { engineMode: 'claude' }, 'cluster');
+    api.noteStarted({ getHostId: () => 'cluster' }, 'chat', { engineMode: 'claude' });
+    for (const text of ['/goal', '/goal clear', '/goal finish the tests', '/gooal native-command-error', '  /goal status']) {
+      scope.hostId = 'cluster';
+      assert.equal((await prepare(scope, 'local', text)).status, 'not-goal', `${threadId ?? 'new'}: ${text}`);
+      scope.hostId = 'local';
+      const native = await prepare(scope, 'local', text);
+      assert.equal(native.status, text === '/goal' ? 'empty' : 'ready', 'Codex goal parsing must remain unchanged on another host');
+    }
+    scope.hostId = 'cluster'; scope.pendingGoal = '';
+    assert.equal((await prepare(scope, 'local', 'ordinary Claude message')).status, 'not-goal', 'A stale Codex goal mode must not consume Claude text');
+    scope.pendingGoal = null;
+  }
+});
+
+test('the Claude goal parser seam is unique and patches idempotently', () => {
+  const anchor = 'isGoalActionAvailable:bMc(u.value,i),isGoalModeActive:u.get(nPa)!=null,promptRaw:h';
+  const patched = patchAppBundle(appFixture);
+  assert.equal(patched.split('globalThis.__cdxEngineModes.shouldRouteClaudeGoal(').length - 1, 1);
+  assert.equal(patchAppBundle(patched), patched);
+  assert.throws(() => patchAppBundle(appFixture.replace(anchor, 'isGoalActionAvailable:!0')), /goal.*parser/i);
+  assert.throws(() => patchAppBundle(`${appFixture}\n${goalSubmitFixture}`), /goal.*parser/i);
 });
 
 test('exact replacement is idempotent even when replacement contains original text', () => {

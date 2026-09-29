@@ -73,9 +73,13 @@ Claude 历史消息也可使用消息旁的编辑按钮。默认先创建旧版�
 
 选择 **Only Claude Code** 后，在原输入框键入 `/` 可搜索当前主机、项目中的 Claude 原生命令、技能和插件命令。目录来自已安装 Claude Code 的初始化结果，数量随项目和插件变化；命令栏的刷新按钮重新读取目录。Codex-only 保留原有 Codex 菜单。
 
-`/goal` 属于 Codex 原生自动续跑控制，目前只支持 **Only Codex**。Claude-only 和多代理模式会在启动前提示改用 Only Codex，或删除 `/goal` 作为普通消息发送；不会额外启动一个 Codex 任务。旧版本若已造成同一会话的原生 Codex 与托管任务重叠，停止会结束该会话内对应的任务，同时继续拒绝其他会话或已结束轮次的 ID。暂停和清除旧 goal 仍可使用。
+**Only Claude Code** 的 `/goal <完成条件>` 直接调用 Claude 原生命令，由 Claude 的 Stop hook 评估是否完成并继续执行。`/goal` 查看原生目标状态，`/goal clear` 清除目标。Stop 中断当前执行；未完成的目标保留在 Claude 原生会话中，Resume 或下一条普通消息会继续该会话。运行中仍可 Steer，也可发送 `/goal` 或 `/goal clear`；清除目标移除完成条件，不等于批准工具或强制中断当前工具。
 
-多代理模板中有 Claude 角色时，**Claude / commands →** 选择命令作用的角色，默认选 Claude host，否则选第一个 Claude 角色。发送命令只操作该角色的原生会话，不启动整个模板。任务运行中支持 `/status`、`/permissions`、`/tasks` 和 `/btw <问题>`，使用该任务已有的 Claude 进程；同一角色同时运行多个任务时，再选择 **Claude command task**。其他命令在当前任务结束或停止后执行。相同引擎、相同模型的两个角色仍各自持有独立会话。
+输入框根据所选引擎分流 `/goal`。Codex 的 `thread/goal/*` 自动续跑接口继续只用于 **Only Codex**，不会在 Claude 会话中额外启动 Codex。多代理中的 Claude 命令仍作用于所选 Claude 角色；角色或主机禁止 hooks 时遵循 Claude 的原生限制。旧版本造成的原生 Codex 与托管任务重叠仍可通过 Stop 一并停止；暂停和清除旧 Codex goal 仍可使用。
+
+原生 Goal 已在本地 Claude Code 2.1.283 / Agent SDK 0.3.282 上验证：目标达成后自动清除、审批期间 Stop、恢复目标、清除目标后继续、运行中清除目标。新增功能尚未在集群上逐一实测；不支持 `/goal` 的旧版 Claude 不会回退调用 Codex。
+
+多代理模板中有 Claude 角色时，**Claude / commands →** 选择命令作用的角色，默认选 Claude host，否则选第一个 Claude 角色。发送命令只操作该角色的原生会话，不启动整个模板。任务运行中支持 `/status`、`/permissions`、`/tasks`、`/goal` 和 `/btw <问题>`，使用该任务已有的 Claude 进程；同一角色同时运行多个任务时，再选择 **Claude command task**。其他命令在当前任务结束或停止后执行。相同引擎、相同模型的两个角色仍各自持有独立会话。
 
 - `/model <模型 ID>` 调用原生模型命令，并将选择保存到 Claude-only 或选中的 Claude 角色。
 - `/context`、`/compact`、`/config` 以及原生技能命令交给 Claude；`/config key=value` 遵循 Claude 自己的配置作用域，会修改原生设置。
@@ -275,3 +279,15 @@ Claude 命令与权限版本已于 2026-09-28T08:14:27.800Z 安装到正式 App�
 2026-09-28 20:11 UTC 已确认并解决生产 rno 仍拒绝历史编辑的问题：此前的远程编辑验收使用独立测试网关，生产网关为保留活动任务仍运行旧版本；11:49 UTC 的流式性能修复没有加入历史编辑支持。确认生产网关空闲、备份附加会话数据后，通过正常 `ensure` 升级到 `180f1491f2b0ca0aba47a1f7a3539a9df519017e8c24dff90b2784ab1dcc54b1`，未强制停止网关或重启 App。
 
 随后直接在 App 中分支用户既有的 rno Claude 会话，编辑历史消息并由 `claude-opus-5-5` 返回验证文本；`1/2 ↔ 2/2` 双向版本切换通过。核对持久化记录确认原会话 11 轮正文未改动，编辑副本保留前缀，旧版本保留完整原问答，新回复使用独立 Claude 原生会话。两个测试副本已归档。记录见 `.artifacts/rno-history-activate.json`、`.artifacts/rno-history-verification.json` 和 `.artifacts/rno-history-gui-*.txt`。这些验收日志及会话数据仅保存在本机，不随源码发布。
+
+## Claude 原生交互迁移（2026-09-29）
+
+完整已安装版本功能清单、所有插件命令/快捷键/设置及逐项迁移状态见 [Claude 原生功能清单](claude-native-feature-matrix.md)，机器可读版本见 [inventory](claude-native-inventory.json)。
+
+本轮接入原生问题的单选、多选和自由回答，计划正文及修改反馈，手动/自动编辑两种原生计划批准模式，以及准确限定为当前运行的权限建议。Claude-only 和工作流角色共用转换器；Stop 和迟到回复仍按原运行归属处理。
+
+PNG/JPEG/GIF/WebP 可作为原生图片单独发送、附加到文字、或运行中 steer。工作流图片保存为私有不可变快照，Claude 与 Codex 角色接收相同图片；成功捕获后重试不再读取后来改变的源文件。图片解码/文件读取失败显示失败轮次且不启动模型；读取期间已有可停止的公开轮次。快照保存在会话目录的 `input-snapshots/`，与会话 sidecar 一同保留。
+
+输入区新增 **Claude tools** 分类搜索菜单，可插入可编辑命令且保留草稿。`/tasks stop <taskId>` 仅控制选中运行实际观测到的原生任务；不承诺后台任务跨进程常驻。Effort、thinking 和 output style 的确认选择保存在会话/角色绑定，下一进程复用；原生 `/output-style` 同时写入项目 Claude 设置，菜单明确提示此范围。
+
+本轮没有复制 VS Code 的完整编辑器宿主、逐 hunk Diff 审批、原生语音或受账号门控的云服务。新增代码沿用本地/SSH 共用运行时，远程包同步更新；本轮实测在本机完成，不把本地结果当成逐集群验收。

@@ -1,5 +1,6 @@
 import { isAbsolute, relative, resolve } from 'node:path';
 import { NativeClient } from '../upstream.mjs';
+import { codexInputFromClaudeContent } from '../claude-input.mjs';
 
 const errorText = error => error instanceof Error ? error.message : String(error);
 const deferred = () => { let resolve; const promise = new Promise(accept => { resolve = accept; }); return { promise, resolve }; };
@@ -15,6 +16,7 @@ export class CodexRole {
   }
 
   start(options) {
+    const inputContent = options.inputContent === undefined ? undefined : structuredClone(options.inputContent);
     const stopped = deferred(), terminal = deferred(), exit = deferred();
     const emit = event => options.onEvent?.(event);
     const events = new CodexRoleEvents(options.runId, emit);
@@ -79,6 +81,8 @@ export class CodexRole {
       try {
         alive();
         if (typeof options.prompt !== 'string' || typeof options.cwd !== 'string' || !isAbsolute(options.cwd)) throw new TypeError('Native Codex requires a prompt and absolute working directory.');
+        const input = inputContent === undefined ? [{ type: 'text', text: options.prompt, text_elements: [] }]
+          : codexInputFromClaudeContent([...(options.prompt.trim() ? [{ type: 'text', text: options.prompt }] : []), ...inputContent]);
         if (options.model != null && (typeof options.model !== 'string' || !options.model || /[\0\r\n]/.test(options.model))) throw new TypeError('Invalid native Codex model identifier.');
         client = this.clientFactory({ command: this.command, args: [...(options.access === 'read' ? this.readArgs : this.args)], env: process.env, onNotification, onRequest: message => { void onRequest(message); }, onExit: (code, signal) => exit.resolve(new Error(`Native Codex exited (${signal ?? code}).`)) });
         await request('initialize', { clientInfo: { name: 'codex_role_runner', version: '1.0.0' }, capabilities: { experimentalApi: true } });
@@ -90,7 +94,7 @@ export class CodexRole {
         if (!sessionId) throw new Error('Native Codex did not return a resumable thread ID.');
         if (options.access === 'read' && (response.sandbox?.type !== 'readOnly' || response.sandbox.networkAccess === true)) throw new Error('Native Codex did not enforce the requested read-only sandbox.');
         if (typeof response.model === 'string' && response.model) actualModel = response.model;
-        const turn = await request('turn/start', { ...params.turn, threadId: sessionId, input: [{ type: 'text', text: options.prompt, text_elements: [] }] });
+        const turn = await request('turn/start', { ...params.turn, threadId: sessionId, input });
         turnId ??= turn.turn?.id;
         if (!turnId) throw new Error('Native Codex did not acknowledge a turn ID.');
         const result = turn.turn?.status !== 'inProgress' ? turn.turn : await wait(terminal.promise);
@@ -117,8 +121,9 @@ export class CodexRole {
     return { done, steer: async text => {
       alive();
       if (settled || finishing || turnEnded || !client || !sessionId || !turnId) throw new Error('Codex steering requires an active native turn.');
-      if (typeof text !== 'string' || !text.trim()) throw new Error('Steering requires a nonempty text prompt.');
-      return await request('turn/steer', { threadId: sessionId, expectedTurnId: turnId, input: [{ type: 'text', text, text_elements: [] }] });
+      if (typeof text === 'string' && !text.trim()) throw new Error('Steering requires a nonempty text prompt.');
+      const input = typeof text === 'string' ? [{ type: 'text', text, text_elements: [] }] : codexInputFromClaudeContent(text);
+      return await request('turn/steer', { threadId: sessionId, expectedTurnId: turnId, input });
     }, interrupt: async () => { abort(); if (client && sessionId && turnId && !finishing) void client.request('turn/interrupt', { threadId: sessionId, turnId }).catch(() => {}); return await done; } };
   }
 }

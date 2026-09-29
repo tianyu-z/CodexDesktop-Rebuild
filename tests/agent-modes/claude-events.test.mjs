@@ -38,6 +38,50 @@ test('terminal text can arrive without assistant blocks and unknown actual model
   assert.equal(result.actualModel, undefined);
 });
 
+test('a side result neither acknowledges main input nor hides its result-only reply', () => {
+  const { events, normalizer } = fixture();
+  normalizer.consume({ type: 'result', uuid: 'goal-side', subtype: 'success', is_error: false, local_command: 'goal', result: 'Goal cleared' }, { sideResult: true });
+  assert.equal(normalizer.inputAcknowledged, false);
+  assert.equal(normalizer.text, '');
+  normalizer.consume({ type: 'result', uuid: 'main-result', subtype: 'success', is_error: false, result: 'Main answer' });
+  assert.deepEqual(events.filter(event => event.type === 'message-completed').map(event => event.text), ['Goal cleared', 'Main answer']);
+  assert.equal(events.filter(event => event.type === 'input-acknowledged').length, 1);
+});
+
+for (const outputType of ['synthetic-assistant', 'local-command-output']) {
+  test(`a side result does not repeat its ${outputType} receipt`, () => {
+    const { events, normalizer } = fixture();
+    for (let i = 0; i < 2; i++) {
+      const content = 'Goal active: test';
+      if (outputType === 'synthetic-assistant') {
+        const local = assistant(`goal-${i}`, [text(content)]);
+        local.message.model = '<synthetic>';
+        normalizer.consume(local);
+      } else normalizer.consume({ type: 'system', subtype: 'local_command_output', uuid: `goal-${i}`, content });
+      normalizer.consume({ type: 'result', uuid: `side-${i}`, subtype: 'success', is_error: false, local_command: 'goal', result: content }, { sideResult: true });
+    }
+    assert.equal(normalizer.inputAcknowledged, false);
+    assert.deepEqual(events.filter(event => event.type === 'message-completed').map(event => event.text), ['Goal active: test', 'Goal active: test']);
+  });
+  for (const order of ['side-first', 'main-first']) {
+    test(`${outputType} with ${order} results preserves a result-only main reply`, () => {
+      const { events, normalizer } = fixture();
+      const content = 'Goal active: test';
+      if (outputType === 'synthetic-assistant') {
+        const local = assistant('goal-receipt', [text(content)]);
+        local.message.model = '<synthetic>';
+        normalizer.consume(local);
+      } else normalizer.consume({ type: 'system', subtype: 'local_command_output', uuid: 'goal-receipt', content });
+      const side = () => normalizer.consume({ type: 'result', uuid: 'goal-side', subtype: 'success', is_error: false, local_command: 'goal', result: content }, { sideResult: true });
+      if (order === 'side-first') side();
+      normalizer.consume({ type: 'result', uuid: 'main-result', subtype: 'success', is_error: false, result: 'Main answer' });
+      if (order === 'main-first') side();
+      normalizer.consume({ type: 'result', uuid: 'steered-result', subtype: 'success', is_error: false, result: 'Follow-up answer' });
+      assert.deepEqual(events.filter(event => event.type === 'message-completed').map(event => event.text), [content, 'Main answer', 'Follow-up answer']);
+    });
+  }
+}
+
 test('resumed main session still emits its native identity once for role ownership', () => {
   const { normalizer, events } = fixture();
   normalizer.nativeSessionId = session;

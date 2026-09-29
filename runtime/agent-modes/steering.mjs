@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { inputText } from './handoff.mjs';
+import { claudeInputText, claudeInputContent, captureClaudeInput } from './claude-input.mjs';
 import { presentItem } from './codex-events.mjs';
 
 /** Keep native steering and public history bound to the same managed turn. */
@@ -7,14 +7,22 @@ export async function steerManagedTurn(router, params) {
   const chat = router.store.require(params.threadId), active = chat.activeRun;
   if (!active) throw new Error('No active engine turn is running. Send the prompt as a new turn.');
   if (params.expectedTurnId !== active.turnId) throw new Error('Turn ownership mismatch.');
-  const text = inputText(params.input);
-  if (!text.trim()) throw new Error('Steering requires a nonempty text prompt.');
+  const publicInput = structuredClone(params.input), text = claudeInputText(publicInput);
+  const images = publicInput.some(item => ['image', 'localImage'].includes(item.type));
+  if (!text.trim() && !images) throw new Error('Steering requires text or an image.');
   const mixed = active.mode === 'both';
   const owner = mixed ? router.workflow.active.get(active.id) : router.runs.get(active.id);
   const handle = mixed ? owner?.handle : owner?.adapterRun;
   if (!owner || typeof handle?.steer !== 'function') throw new Error('The engine is still starting. Retry steering after initialization.');
-  const receipt = await handle.steer(text);
-  const item = { id: `steering-user:${randomUUID()}`, type: 'userMessage', content: structuredClone(params.input),
+  const hasReferences = publicInput.some(item => ['mention', 'skill'].includes(item.type));
+  const payload = mixed
+    ? images ? { text, inputCapture: await router.prepareInput(signal => captureClaudeInput(publicInput, { directory: router.store.directory, signal }), owner.controller.signal) }
+      : hasReferences ? `[Additional user request]\n${text}` : text
+    : images || hasReferences
+      ? await router.prepareInput(signal => claudeInputContent(publicInput, { signal, prefix: '[Additional user request]' }), owner.controller.signal) : text;
+  if (owner.controller.signal.aborted || router.store.require(chat.id).activeRun?.id !== active.id) throw new Error('The engine ended before it could accept steering.');
+  const receipt = await handle.steer(payload);
+  const item = { id: `steering-user:${randomUUID()}`, type: 'userMessage', content: publicInput,
     ...(params.clientUserMessageId ? { clientId: params.clientUserMessageId } : {}) };
   // Acceptance can race completion; retain the accepted message in its original
   // turn, never whichever turn happens to be active when the receipt arrives.

@@ -1,7 +1,8 @@
-import { inputText } from './handoff.mjs';
+import { claudeInputText, isClaudeCommandInput } from './claude-input.mjs';
 import { resolveClaudeCommand, formatClaudeTasks, assertClaudeCommandAccess } from './claude-commands.mjs';
 import { assertClaudePermissionMode } from './claude-permissions.mjs';
 import { assertClaudeModel } from './claude-models.mjs';
+import { normalizeClaudeSessionOptions, validateClaudeTaskArguments } from './claude-native-controls.mjs';
 import { roleBindingKey } from './orchestration/scheduler.mjs';
 import { randomUUID } from 'node:crypto';
 
@@ -22,7 +23,7 @@ export class ClaudeCommandRouter {
 
   context(id, params = {}) {
     const chat = this.store.require(id);
-    if (chat.mode === 'claude') return { cwd: chat.cwd, model: chat.models.claude, permissionMode: chat.claudePermissionMode, binding: chat.bindings.claude };
+    if (chat.mode === 'claude') return { cwd: chat.cwd, model: chat.models.claude, permissionMode: chat.claudePermissionMode, binding: chat.bindings.claude, claudeOptions: normalizeClaudeSessionOptions(chat.bindings.claude.claudeOptions) };
     if (chat.mode !== 'both') throw new Error('Choose Claude Code or a workflow containing Claude to use Claude commands.');
     const selection = this.router.workflow.selection(params, chat);
     const roles = selection.template.roles;
@@ -65,7 +66,7 @@ export class ClaudeCommandRouter {
       binding = chat.roleBindings[bindingKey] ?? { sessionId: run.nativeSessionId, consumedSeq: row.seq, engine: 'claude' };
       break;
     }
-    return { cwd, purpose, roleId: target, bindingKey, binding: binding ?? { engine: 'claude', consumedSeq: 0 }, model: role.model,
+    return { cwd, purpose, roleId: target, bindingKey, binding: binding ?? { engine: 'claude', consumedSeq: 0 }, model: role.model, claudeOptions: normalizeClaudeSessionOptions(binding?.claudeOptions),
       permissionMode: role.permissionMode ?? 'default', access, instructions, scope: { cwd, purpose, access, instructions }, selection };
   }
 
@@ -81,7 +82,8 @@ export class ClaudeCommandRouter {
   }
 
   async prepare(id, params) {
-    const text = inputText(params.input).trim();
+    if (!isClaudeCommandInput(params.input)) return null;
+    const text = claudeInputText(params.input).trim();
     if (!/^\/[^\s/\\]+(?:\s|$)/.test(text)) return null;
     const context = this.context(id, params);
     const catalog = await this.list({ threadId: id, target: context.roleId });
@@ -92,7 +94,10 @@ export class ClaudeCommandRouter {
       command.execution = 'local'; command.settingsPatch = { permissionMode: mode }; command.output = `Claude permissions: ${mode}.`;
     }
     if (['app', 'builtin'].includes(command.origin) && command.name === 'rename') { command.execution = 'local'; command.output = command.args ? `Chat renamed to ${command.args}.` : 'Usage: /rename <name>'; }
-    if (command.origin === 'app' && command.name === 'tasks') { command.output = this.tasks(id, context); command.execution = 'local'; }
+    if (command.origin === 'app' && command.name === 'tasks') {
+      if (validateClaudeTaskArguments(command.args)) throw new Error('Task stop requires an active native process. Use /tasks during the selected Claude run.');
+      command.output = this.tasks(id, context); command.execution = 'local';
+    }
     if (command.origin === 'app' && command.name === 'copy') {
       const number = command.args ? Number(command.args) : 1;
       if (!Number.isSafeInteger(number) || number < 1) throw new Error('Usage: /copy [N] — copy the Nth most recent Claude response.');
@@ -119,6 +124,8 @@ export class ClaudeCommandRouter {
   finishBinding(id, context, result, seq) {
     const chat = this.store.require(id), binding = this.binding(id, context);
     const patch = result.settingsPatch ?? context.command.settingsPatch;
+    const claudeOptions = result.status === 'completed' && patch?.claudeOptions !== undefined
+      ? normalizeClaudeSessionOptions({ ...normalizeClaudeSessionOptions(binding.claudeOptions), ...normalizeClaudeSessionOptions(patch.claudeOptions) }) : undefined;
     const sourceKey = context.bindingKey;
     let bindingKey = sourceKey, roleOverrides = chat.roleOverrides, models = chat.models, permissionMode = chat.claudePermissionMode;
     if (result.status === 'completed' && patch) {
@@ -148,6 +155,7 @@ export class ClaudeCommandRouter {
     if (result.status === 'completed' && context.command.origin === 'app' && context.command.name === 'resume' && result.nativeSessionId && reservation?.sessionId !== result.nativeSessionId) throw new Error('Claude session selection no longer owns its reservation.');
     if (bindingKey !== sourceKey && chat.roleBindings[bindingKey]?.engine && chat.roleBindings[bindingKey].engine !== 'claude') throw new Error('Role binding engine ownership mismatch.');
     const nextBinding = { ...binding, ...(restoreSession || sessionId ? { sessionId } : {}), consumedSeq,
+      ...(claudeOptions ? { claudeOptions } : {}),
       ...(context.scope ? { commandScope: context.scope } : {}) };
     this.store.batch(id, () => {
       if (bindingKey && bindingKey !== sourceKey) {

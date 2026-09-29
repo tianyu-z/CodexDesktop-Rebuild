@@ -10,6 +10,7 @@ const clone = value => structuredClone(value);
 const tick = () => new Promise(resolve => setImmediate(resolve));
 async function until(predicate) { for (let n = 0; n < 80; n++) { if (predicate()) return; await tick(); } assert.fail('condition did not settle'); }
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+const capturedImage = () => ({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC' } });
 function harness() {
   const calls = [];
   let active = 0, peak = 0;
@@ -36,12 +37,133 @@ const template = () => ({ schemaVersion: 1, id: 'custom', revision: 3, name: 'Cu
   output: { sources: ['left', 'right', 'finish'], final: 'finish', format: 'markdown' } });
 const options = extra => ({ runId: 'workflow', template: template(), models: { codex: 'codex-exact', claude: 'claude-deployment' },
   cwd: '/tmp/non-git', input: 'Original request', history: [{ seq: 1, engine: 'codex', text: 'Prior public answer' }], ...extra });
+
+test('Claude binding options are scoped and frozen for fresh invocations, retries and recovery', async () => {
+  const t = template(), claudeKey = roleBindingKey({ template: t, roleId: 'a', cwd: '/tmp/non-git' }), codexKey = roleBindingKey({ template: t, roleId: 'c', cwd: '/tmp/non-git' });
+  const bindings = { [claudeKey]: { engine: 'claude', claudeOptions: { effort: 'high', thinking: { type: 'disabled' } } }, [codexKey]: { engine: 'codex', claudeOptions: { effort: 'low' } } };
+  const runner = harness(), run = new WorkflowScheduler({ runner }).start(options({ template: t, bindings }));
+  bindings[claudeKey].claudeOptions.effort = 'low';
+  await until(() => runner.calls.length === 2);
+  assert.equal(runner.calls[0].claudeOptions, undefined);
+  assert.deepEqual(runner.calls[1].claudeOptions, { effort: 'high', thinking: { type: 'disabled' } });
+  assert.equal(runner.calls[1].nativeSessionId, undefined, 'fresh native processes still inherit this role binding options');
+  runner.calls[0].complete(); runner.calls[1].complete({ status: 'failed', settingsPatch: { claudeOptions: { effort: 'max' } } });
+  await until(() => run.snapshot().status === 'blocked');
+  assert.equal(run.snapshot().bindings[claudeKey].claudeOptions.effort, 'high');
+  const saved = run.snapshot(), failed = saved.runs.find(row => row.status === 'failed');
+  await run.interrupt();
+  const restartedRunner = harness(), restarted = new WorkflowScheduler({ runner: restartedRunner }).start(options({ previousSnapshot: saved, retryRunId: failed.id, bindings: { [claudeKey]: { engine: 'claude', claudeOptions: { effort: 'low' } } } }));
+  await until(() => restartedRunner.calls.length === 1);
+  assert.deepEqual(restartedRunner.calls[0].claudeOptions, { effort: 'high', thinking: { type: 'disabled' } });
+  await restarted.interrupt();
+});
+
+test('completed native session option changes merge only into their exact Claude role binding', async () => {
+  const t = template(), claudeKey = roleBindingKey({ template: t, roleId: 'a', cwd: '/tmp/non-git' });
+  const runner = harness(), run = new WorkflowScheduler({ runner }).start(options({ template: t, bindings: { [claudeKey]: { engine: 'claude', claudeOptions: { effort: 'high' } } } }));
+  await until(() => runner.calls.length === 2);
+  runner.calls[0].complete(); runner.calls[1].complete({ settingsPatch: { claudeOptions: { thinking: { type: 'disabled' } } } });
+  await until(() => runner.calls.length === 3);
+  assert.deepEqual(run.snapshot().bindings[claudeKey].claudeOptions, { effort: 'high', thinking: { type: 'disabled' } });
+  assert.deepEqual(runner.calls[2].claudeOptions, { effort: 'high', thinking: { type: 'disabled' } });
+  await finishRemaining(run, runner);
+});
 async function finishRemaining(run, runner) {
   for (let n = 0; n < 30 && !['completed', 'failed', 'interrupted'].includes(run.snapshot().status); n++) {
     runner.calls.forEach(call => call.complete()); await tick();
   }
   return await run.done;
 }
+
+test('request-consuming roles load immutable capture copies and retain only IDs across retries and restart', async () => {
+  const inputCapture = { version: 1, id: 'a'.repeat(64) }, loads = [];
+  const loadInputCapture = async capture => { loads.push(clone(capture)); return [{ type: 'text', text: 'Original request' }, capturedImage()]; };
+  const runner = harness(), run = new WorkflowScheduler({ runner, loadInputCapture }).start(options({ inputCapture }));
+  try {
+    await until(() => runner.calls.length === 2);
+    assert.deepEqual(runner.calls.map(call => call.inputContent), [[capturedImage()], [capturedImage()]]);
+    runner.calls[0].inputContent[0].source.data = 'mutated runner copy';
+    assert.deepEqual(runner.calls[1].inputContent, [capturedImage()]);
+    runner.calls[0].complete(); runner.calls[1].complete({ status: 'failed', error: 'Retry with the same pixels' });
+    await until(() => run.snapshot().status === 'blocked');
+    const previousSnapshot = run.snapshot(), failed = previousSnapshot.runs.find(row => row.status === 'failed');
+    assert.doesNotMatch(JSON.stringify(previousSnapshot), /iVBORw0KGgo/);
+    assert.deepEqual(previousSnapshot.config.inputCapture, inputCapture);
+    await run.interrupt();
+    const nextRunner = harness(), next = new WorkflowScheduler({ runner: nextRunner, loadInputCapture }).start(options({ previousSnapshot, retryRunId: failed.id, inputCapture: { version: 1, id: 'b'.repeat(64) } }));
+    try {
+      await until(() => nextRunner.calls.length === 1);
+      assert.deepEqual(nextRunner.calls[0].inputContent, [capturedImage()]);
+      assert.deepEqual(loads.at(-1), inputCapture);
+      nextRunner.calls[0].complete(); await until(() => nextRunner.calls.length === 2);
+      assert.equal(nextRunner.calls[1].inputContent, undefined, 'A synthesis without request input must not acquire undeclared original attachments');
+      assert.equal((await finishRemaining(next, nextRunner)).status, 'completed');
+    } finally { await next.interrupt(); }
+  } finally { await run.interrupt(); }
+});
+
+test('captured image steering reaches both harnesses and later roles without base64 in saved guidance', async () => {
+  const capture = { version: 1, id: 'c'.repeat(64) }, sends = [], runner = harness(), start = runner.start;
+  runner.start = function(options) { return { ...start.call(this, options), steer: async content => { sends.push({ roleId: options.roleId, content }); content[0].source.data = 'changed receiver'; } }; };
+  const run = new WorkflowScheduler({ runner, loadInputCapture: async () => [capturedImage()] }).start(options());
+  try {
+    await until(() => runner.calls.length === 2);
+    const receipt = await run.steer({ text: '', inputCapture: capture });
+    assert.equal(receipt.accepted.length, 2);
+    assert.equal(sends.length, 2);
+    assert.deepEqual(run.snapshot().guidance[0].inputCapture, capture);
+    assert.doesNotMatch(JSON.stringify(run.snapshot()), /iVBORw0KGgo/);
+    runner.calls[0].complete(); runner.calls[1].complete();
+    await until(() => runner.calls.length === 3);
+    assert.deepEqual(runner.calls[2].inputContent, [capturedImage()]);
+  } finally { await run.interrupt(); }
+});
+
+test('builtin Debby participants and host all receive the original captured images', async () => {
+  const runner = harness(), selected = BUILTIN_TEMPLATES.find(row => row.id === 'debby');
+  const run = new WorkflowScheduler({ runner, loadInputCapture: async () => [capturedImage()] }).start(options({ template: selected,
+    parameters: { rounds: 0, host_mode: 'final-only' }, input: '', inputCapture: { version: 1, id: 'd'.repeat(64) } }));
+  assert.equal((await finishRemaining(run, runner)).status, 'completed');
+  assert.deepEqual(runner.calls.map(call => call.roleId).sort(), ['host', 'participant_a', 'participant_b']);
+  assert.ok(runner.calls.every(call => JSON.stringify(call.inputContent) === JSON.stringify([capturedImage()])));
+});
+
+test('image guidance arriving before a native handle starts is retained for that role', async () => {
+  const pending = deferred(), runner = harness(), original = { version: 1, id: 'a'.repeat(64) }, followup = { version: 1, id: 'b'.repeat(64) };
+  const run = new WorkflowScheduler({ runner, loadInputCapture: async capture => {
+    if (capture.id === original.id) await pending.promise;
+    return [capturedImage()];
+  } }).start(options({ inputCapture: original }));
+  try {
+    await until(() => run.snapshot().runs.length === 2);
+    const receipt = await run.steer({ text: '', inputCapture: followup });
+    assert.equal(receipt.accepted.length, 0);
+    pending.resolve(); await until(() => runner.calls.length === 2);
+    assert.deepEqual(runner.calls.map(call => call.inputContent.length), [2, 2]);
+  } finally { pending.resolve(); await run.interrupt(); }
+});
+
+for (const phase of ['role startup', 'steering']) test(`Stop releases a stalled image capture reload during ${phase}`, async () => {
+  const pending = deferred(), entered = deferred(), runner = harness(), inputCapture = { version: 1, id: 'e'.repeat(64) };
+  const run = new WorkflowScheduler({ runner, loadInputCapture: async () => { entered.resolve(); return await pending.promise; } })
+    .start(options(phase === 'role startup' ? { inputCapture } : {}));
+  let steering, outcome, stopped = false;
+  try {
+    if (phase === 'steering') {
+      await until(() => runner.calls.length === 2);
+      steering = run.steer({ text: '', inputCapture }).then(value => { outcome = { value }; }, error => { outcome = { error }; });
+    }
+    await entered.promise;
+    const stopping = run.interrupt().then(() => { stopped = true; });
+    for (let i = 0; i < 4; i++) await tick();
+    assert.equal(stopped, true, 'Stop must finish while the capture reader is blocked');
+    if (steering) assert.match(outcome?.error?.message ?? 'steering still pending', /abort|interrupt/i);
+    await stopping;
+  } finally { pending.resolve([capturedImage()]); await run.interrupt(); await steering; }
+  await tick();
+  assert.equal(runner.calls.length, phase === 'role startup' ? 0 : 2);
+  assert.equal(run.snapshot().guidance.length, 0);
+});
 
 test('write workflows finish preparation before any planner or sibling native run', async () => {
   const t = clone(BUILTIN_TEMPLATES.find(row => row.id === 'polly'));

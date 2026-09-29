@@ -37,6 +37,9 @@ const APP_PATCHES = [
   ['existing conversation goal guard',
     'async function zAn({scope:e,appendTranscriptItem:t,conversationId:n,hostId:r,intl:i,objective:a,threadSettings:o}){try{',
     'async function zAn({scope:e,appendTranscriptItem:t,conversationId:n,hostId:r,intl:i,objective:a,threadSettings:o}){let __cdxGoalError=globalThis.__cdxEngineModes.nativeGoalError(e,n,r);if(__cdxGoalError){e.get(Dg).danger(__cdxGoalError);return!1}try{'],
+  ['Claude goal submit parser bypass',
+    'isGoalActionAvailable:bMc(u.value,i),isGoalModeActive:u.get(nPa)!=null,promptRaw:h',
+    'isGoalActionAvailable:bMc(u.value,i)&&!globalThis.__cdxEngineModes.shouldRouteClaudeGoal(u,FB(u),u.get(Rk,FB(u))),isGoalModeActive:u.get(nPa)!=null,promptRaw:h'],
   ['native Claude permission controls',
     'function TPc(e){let t=(0,kPc.c)(102),',
     'function TPc(e){let __cdxScope=us(LB);return(0,z2.jsx)(globalThis.__cdxEngineModes.PermissionControls,{React:APc,jsx:z2,scope:__cdxScope,threadId:e.conversationId,hostId:e.hostId,cwd:e.cwdOverride,getHost:(e,t)=>e.get(Rk,t),getManager:zg,nativePicker:(0,z2.jsx)(__cdxNativePermissions,e)})}function __cdxNativePermissions(e){let t=(0,kPc.c)(102),'],
@@ -166,7 +169,32 @@ function patchNativePicker(source) {
   return source;
 }
 
+function patchClaudeQuestions(source) {
+  const patches = [
+    ['live Claude multi-choice questions',
+      'questions:e.params.questions.map(e=>({id:e.id,header:e.header,question:e.question,isOther:e.isOther===!0,options:',
+      'questions:e.params.questions.map(e=>({id:e.id,header:e.header,question:e.question,isOther:e.isOther===!0,isMultiSelect:e.isMultiSelect===!0,options:'],
+    ['restored Claude multi-choice questions',
+      'i=t.questions.map(e=>({id:e.id,header:e.header,question:e.question,isOther:e.isOther===!0,options:',
+      'i=t.questions.map(e=>({id:e.id,header:e.header,question:e.question,isOther:e.isOther===!0,isMultiSelect:e.isMultiSelect===!0,options:'],
+    ['persisted Claude question shape',
+      'questions:n.questions.map(e=>({id:e.id,header:e.header,options:(e.options??[]).map(e=>({description:e.description,label:e.label})),question:e.question}))',
+      'questions:n.questions.map(e=>({id:e.id,header:e.header,isOther:e.isOther===!0,isMultiSelect:e.isMultiSelect===!0,options:(e.options??[]).map(e=>({description:e.description,label:e.label})),question:e.question}))'],
+    ['restored Claude reply shape',
+      'questions:n.questions.map(e=>({id:e.id,header:e.header,question:e.question,isOther:!1,options:',
+      'questions:n.questions.map(e=>({id:e.id,header:e.header,question:e.question,isOther:e.isOther===!0,isMultiSelect:e.isMultiSelect===!0,options:'],
+    ['Claude checkbox widget',
+      'question:e.question,isOther:s||e.isOther,options:e.options.map(zGc)',
+      'question:e.question,isOther:s||e.isOther,isMultiSelect:e.isMultiSelect===!0,options:e.options.map(zGc)'],
+    ['Claude multi-choice reply',
+      'function WGc(e,t){let n={},r=0,i=0;',
+      'function WGc(e,t){if(e.some(e=>e.isMultiSelect))return globalThis.__cdxEngineModes.serializeClaudeAnswers(e,t);let n={},r=0,i=0;'],
+  ];
+  for (const [name, before, after] of patches) source = replaceExactOnce(source, before, after, name);
+  return source;
+}
 function patchAppBundle(source) {
+  source = patchClaudeQuestions(source);
   source = patchNativePicker(source);
   for (const [name, previous] of PREVIEW_UPGRADES) {
     const count = occurrences(source, previous);
@@ -214,7 +242,7 @@ function main(args = process.argv.slice(2)) {
   }
   console.log('[done] agent-modes renderer');
 }
-module.exports = { replaceExactOnce, patchAppBundle, patchNativePicker, patchTurnBundle, patchAssets };
+module.exports = { replaceExactOnce, patchAppBundle, patchNativePicker, patchClaudeQuestions, patchTurnBundle, patchAssets };
 if (require.main === module) {
   try { main(); } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

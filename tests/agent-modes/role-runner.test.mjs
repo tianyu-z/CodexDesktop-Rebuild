@@ -22,6 +22,16 @@ test('invalid engine, access or run ID cannot launch a native harness', () => {
   for (const extra of [{ engine: 'other' }, { access: 'admin' }, { runId: '' }]) assert.throws(() => runner.start({ ...base, ...extra }), /Invalid/);
 });
 
+test('Claude role runner passes a detached validated session-options snapshot', async () => {
+  const claudeOptions = { effort: 'high', thinking: { type: 'disabled' } }, calls = [];
+  const runner = new RoleRunner({ claudeAdapter: { start(options) { calls.push(options); return { done: Promise.resolve({ status: 'completed' }) }; } } });
+  await runner.start({ runId: 'role', engine: 'claude', access: 'read', prompt: 'Review', cwd: '/repo', claudeOptions }).done;
+  claudeOptions.thinking.type = 'enabled';
+  assert.deepEqual(calls[0].claudeOptions, { effort: 'high', thinking: { type: 'disabled' } });
+  assert.throws(() => runner.start({ runId: 'role', engine: 'claude', access: 'read', prompt: 'Review', cwd: '/repo', claudeOptions: { env: { KEY: 'secret' } } }), /Unsupported/);
+  assert.equal(calls.length, 1);
+});
+
 test('remote Codex compatibility args apply only to read roles without relaxing native policies', async () => {
   const launches = [], requests = [], responses = [];
   const codexReadArgs = ['--enable', 'use_legacy_landlock', 'app-server'];
@@ -79,4 +89,14 @@ test('generated Claude role prompts cannot become slash commands while native at
     assert.equal(options.prompt, prompt);
     assert.notEqual(calls.at(-1).verbatimPrompts, true);
   }
+});
+
+test('Claude workflow roles receive explicit captured image blocks alongside their generated prompt', async () => {
+  const calls = [], image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC' } };
+  const runner = new RoleRunner({ claudeAdapter: { start(options) { calls.push(options); return { done: Promise.resolve({ status: 'completed' }) }; } } });
+  const options = { runId: 'role', engine: 'claude', access: 'read', cwd: '/repo', prompt: 'Review the original request', inputContent: [image] };
+  await runner.start(options).done;
+  assert.deepEqual(calls[0].content, [{ type: 'text', text: '[Workflow role input]\nReview the original request' }, image]);
+  calls[0].content[1].source.data = 'another runner mutation';
+  assert.notEqual(image.source.data, 'another runner mutation');
 });

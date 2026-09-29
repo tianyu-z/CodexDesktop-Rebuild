@@ -3,6 +3,7 @@ const identifier = (value) => typeof value === 'string' && value.length > 0;
 const indexValue = (value) => Number.isSafeInteger(value) && value >= 0;
 const terminalTask = status => ['completed', 'failed', 'stopped', 'killed', 'process-ended'].includes(status);
 const taskEvents = new Set(['task_started', 'task_updated', 'task_progress', 'task_notification', 'background_tasks_changed']);
+const messagesText = messages => messages.flatMap(message => [...message.blocks.values()].filter(block => block.type === 'text').map(block => block.text)).join('\n');
 const modelContent = (content) => record(content) && (
   (content.type === 'text' && identifier(content.text)) ||
   (content.type === 'tool_use' && identifier(content.id) && identifier(content.name) && record(content.input)) ||
@@ -23,9 +24,10 @@ export class ClaudeEventNormalizer {
     this.obsoleteSessions = new Set();
     this.resultTextLength = 0;
     this.nativeTaskState = new Map();
+    this.localOutputs = new Map();
   }
 
-  consume(envelope) {
+  consume(envelope, { sideResult = false } = {}) {
     if (!record(envelope)) return;
     if (identifier(envelope.uuid)) {
       if (this.seen.has(envelope.uuid)) return;
@@ -42,6 +44,7 @@ export class ClaudeEventNormalizer {
       this.messages.clear();
       this.active.clear();
       this.tools.clear();
+      this.localOutputs.clear();
       this.resultTextLength = 0;
       this.onEvent({ type: 'context-reset', sessionId: this.nativeSessionId, ...(identifier(envelope.trigger) ? { trigger: envelope.trigger } : {}), ...(identifier(envelope.user_message_uuid) ? { userMessageId: envelope.user_message_uuid } : {}) });
       this.onEvent({ type: 'session', sessionId: this.nativeSessionId });
@@ -59,18 +62,32 @@ export class ClaudeEventNormalizer {
     else if (envelope.type === 'assistant') {
       if (identifier(envelope.error)) this.error = `Claude assistant error: ${envelope.error}`;
       this.consumeAssistant(envelope.message, scope, envelope.error == null);
+      if (scope === null && identifier(envelope.message?.id) && envelope.message.model === '<synthetic>' && Array.isArray(envelope.message.content)) {
+        this.localOutputs.set(JSON.stringify([scope, envelope.message.id]), envelope.message.content.filter(content => content?.type === 'text').map(content => content.text).join('\n'));
+      }
     } else if (envelope.type === 'user') this.consumeToolResults(envelope.message);
     else if (envelope.type === 'system' && envelope.subtype === 'local_command_output' && typeof envelope.content === 'string') {
-      this.output(envelope.content, `local:${envelope.uuid ?? this.messages.size}`, scope);
+      const id = `local:${envelope.uuid ?? this.messages.size}`;
+      this.message(id, scope).localOutput = true;
+      this.output(envelope.content, id, scope);
+      if (scope === null) this.localOutputs.set(JSON.stringify([scope, id]), envelope.content);
     }
     else if (envelope.type === 'system' && envelope.subtype === 'status') {
       if (envelope.status === null || typeof envelope.status === 'string') this.onEvent({ type: 'status', status: envelope.status });
     } else if (envelope.type === 'result') {
-      if (this.text.length === this.resultTextLength && identifier(envelope.result)) this.output(envelope.result, `result:${envelope.uuid ?? this.messages.size}`);
-      this.finish();
+      const localOutput = [...this.localOutputs].find(([, text]) => text === envelope.result);
+      if (localOutput) this.localOutputs.delete(localOutput[0]);
+      if (sideResult) {
+        // A local command can finish between main-model deltas. Render its
+        // receipt once without completing or acknowledging the model turn.
+        if (!localOutput && identifier(envelope.result)) this.output(envelope.result, `result:${envelope.uuid ?? this.messages.size}`, 'control');
+      } else {
+        if (!localOutput && this.modelText.length === this.resultTextLength && identifier(envelope.result)) this.output(envelope.result, `result:${envelope.uuid ?? this.messages.size}`);
+        this.finish();
+      }
       const unavailable = envelope.num_turns === 0 && typeof envelope.result === 'string' && (/^\/\S+ (?:isn.t|is not) available in this environment\.?$/i.test(envelope.result.trim()) || /^Unknown (?:skill|command):/i.test(envelope.result.trim()));
       const successful = envelope.subtype === 'success' && envelope.is_error === false && !unavailable;
-      if (successful) this.acknowledgeInput(scope);
+      if (successful && !sideResult) this.acknowledgeInput(scope);
       const result = { nativeSessionId: this.nativeSessionId, status: successful ? 'completed' : 'failed', text: typeof envelope.result === 'string' ? envelope.result : this.text };
       if (this.actualModel) result.actualModel = this.actualModel;
       if (identifier(envelope.local_command)) result.localCommand = envelope.local_command;
@@ -86,7 +103,7 @@ export class ClaudeEventNormalizer {
         if (record(envelope.modelUsage)) result.usage.modelUsage = envelope.modelUsage;
         if (typeof envelope.total_cost_usd === 'number') result.usage.total_cost_usd = envelope.total_cost_usd;
       }
-      this.beginTurn();
+      if (!sideResult) this.beginTurn();
       return result;
     }
   }
@@ -99,7 +116,7 @@ export class ClaudeEventNormalizer {
   }
 
   beginTurn() {
-    this.resultTextLength = this.text.length;
+    this.resultTextLength = this.modelText.length;
   }
 
   get nativeTasks() { return structuredClone([...this.nativeTaskState.values()]); }
@@ -247,6 +264,7 @@ export class ClaudeEventNormalizer {
     if (!record(raw) || !Array.isArray(raw.content)) return;
     const message = this.message(raw.id, scope);
     if (!message) return;
+    if (raw.model === '<synthetic>') message.synthetic = true;
     // Synthetic local/auth errors are still rendered, but they do not prove the
     // prompt reached a model and must not advance the persisted handoff cursor.
     if (canAcknowledge && raw.role === 'assistant' && identifier(raw.model) && raw.model !== '<synthetic>' && raw.content.some(modelContent)) this.acknowledgeInput(scope);
@@ -291,6 +309,12 @@ export class ClaudeEventNormalizer {
   }
 
   get text() {
-    return [...this.messages.values()].filter(message => message.scope === null).flatMap(message => [...message.blocks.values()].filter(block => block.type === 'text').map(block => block.text)).join('\n');
+    return messagesText([...this.messages.values()].filter(message => message.scope === null));
+  }
+
+  get modelText() {
+    // Local receipts are visible but cannot prove that a model's final answer
+    // was already streamed, even if their result envelope has not arrived yet.
+    return messagesText([...this.messages.values()].filter(message => message.scope === null && !message.synthetic && !message.localOutput));
   }
 }
