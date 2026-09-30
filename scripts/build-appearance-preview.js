@@ -35,6 +35,7 @@ async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = pat
   };
   const before = inventory(extracted);
   patchSidebarAssets(path.join(extracted, 'webview', 'assets'));
+  require('./patch-permission-profiles').patchPermissionAssets(path.join(extracted, 'webview', 'assets'));
   const after = inventory(extracted);
   const allowed = new Set(['webview/index.html', 'webview/assets/app-initial-CX2pZp2Q.js', 'webview/assets/sidebar-navigation-ui.js', 'webview/assets/desktop-appearance.css']);
   const changed = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(file => before[file] !== after[file]);

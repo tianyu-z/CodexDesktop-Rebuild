@@ -32,6 +32,7 @@ async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = pat
   patchCatalogBuild(path.join(stagedAsar, '.vite', 'build'));
   patchRemoteBuild(path.join(stagedAsar, '.vite', 'build'));
   patchSidebarAssets(path.join(stagedAsar, 'webview', 'assets'));
+  require('./patch-permission-profiles').patchPermissionAssets(path.join(stagedAsar, 'webview', 'assets'));
   const bootstrap = path.join(stagedAsar, '.vite', 'build', 'early-bootstrap.js');
   fs.writeFileSync(bootstrap, patchBootstrap(fs.readFileSync(bootstrap, 'utf8')));
   fs.copyFileSync(path.join(ROOT, 'scripts', 'assets', 'agent-modes-bootstrap.cjs'), path.join(stagedAsar, '.vite', 'build', 'agent-modes-bootstrap.cjs'));

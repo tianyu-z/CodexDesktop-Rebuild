@@ -22,6 +22,7 @@ const PATCHES = [
   "patch-branch-edit.js",
   "patch-model-add.js",
   "patch-sidebar-navigation.js",
+  "patch-permission-profiles.js",
 ];
 
 function main() {
