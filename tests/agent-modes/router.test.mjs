@@ -19,6 +19,66 @@ function fixture(t) {
 }
 async function start(f,engineMode='codex'){return f.router.request('thread/start',{cwd:f.dir,engineMode,model:'codex-model',agentMode:'guardian-approvals'});}
 
+test('composer effort persists without a turn and reaches the next Claude run', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  f.router.adapter.listModels = async () => [{ value: 'opus', supportsEffort: true, supportedEffortLevels: ['low', 'high', 'max'] }];
+  f.store.setBinding('thread-1', 'claude', { claudeOptions: { thinking: { type: 'adaptive' } } });
+  const state = await f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'opus', claudeEffort: 'max' });
+  assert.deepEqual(state.claudeSessionOptions, { effort: 'max', thinking: { type: 'adaptive' } });
+  assert.equal(f.runs.length, 0);
+  await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] }); await tick();
+  assert.equal(f.runs[0].options.claudeOptions.effort, 'max');
+  await assert.rejects(f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', claudeEffort: 'low' }), /active run/);
+});
+
+test('draft effort and Auto reset survive creation without leaking into Codex', async t => {
+  const f = fixture(t);
+  f.router.adapter.listModels = async () => [{ value: 'opus', supportsEffort: true, supportedEffortLevels: ['high'] }];
+  await f.router.request('thread/start', { cwd: f.dir, engineMode: 'claude', engineModel: 'opus', claudeEffort: 'high' });
+  assert.equal(f.router.state('thread-1').claudeSessionOptions.effort, 'high');
+  assert.equal(Object.hasOwn(f.calls[0].params, 'claudeEffort'), false);
+  await f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', claudeEffort: null });
+  assert.equal(f.router.state('thread-1').claudeSessionOptions.effort, null);
+  await f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] }); await tick();
+  assert.equal(f.runs[0].options.claudeOptions.effort, null);
+});
+
+test('unsupported effort rejects atomically and model changes reset incompatible effort', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  f.router.adapter.listModels = async () => [{ value: 'opus', supportsEffort: true, supportedEffortLevels: ['max'] }, { value: 'haiku', supportsEffort: false }];
+  await f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'opus', claudeEffort: 'max' });
+  await assert.rejects(f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'haiku', claudeEffort: 'max' }), /support/);
+  assert.equal(f.router.state('thread-1').models.claude, 'opus');
+  assert.equal(f.router.state('thread-1').claudeSessionOptions.effort, 'max');
+  await f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'haiku' });
+  assert.equal(f.router.state('thread-1').claudeSessionOptions.effort, null);
+});
+
+test('prewarmed first turn applies captured Claude effort', async t => {
+  const f = fixture(t); await start(f);
+  f.router.adapter.listModels = async () => [{ value: 'opus', supportsEffort: true, supportedEffortLevels: ['high'] }];
+  await f.router.request('turn/start', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'opus', claudeEffort: 'high', input: [{ type: 'text', text: 'hello' }] }); await tick();
+  assert.equal(f.runs[0].options.claudeOptions.effort, 'high');
+});
+
+test('returning from Both reconciles the saved Only Claude effort with its current model', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  f.router.adapter.listModels = async () => [{ value: 'opus', supportsEffort: true, supportedEffortLevels: ['max'] }, { value: 'haiku', supportsEffort: false }];
+  await f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'opus', claudeEffort: 'max' });
+  f.store.setMode('thread-1', 'both', { models: { claude: 'haiku' } });
+  await f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'haiku' });
+  assert.equal(f.router.state('thread-1').claudeSessionOptions.effort, null);
+});
+
+test('a provider model without effort metadata rejects explicit effort and clears inherited effort', async t => {
+  const f = fixture(t); await start(f, 'claude');
+  f.router.adapter.listModels = async () => [{ value: 'opus', supportsEffort: true, supportedEffortLevels: ['max'] }, { value: 'provider-model' }];
+  await f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'opus', claudeEffort: 'max' });
+  await assert.rejects(f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'provider-model', claudeEffort: 'max' }), /support/);
+  await f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'provider-model' });
+  assert.equal(f.router.state('thread-1').claudeSessionOptions.effort, null);
+});
+
 for (const text of ['', '/clear with this image']) test(`Claude keeps image content through normal start and steering (${text || 'image only'})`, async t => {
   const f = fixture(t); await start(f, 'claude');
   const input = [...(text ? [{ type: 'text', text }] : []), composerImage()];

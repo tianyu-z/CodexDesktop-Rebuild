@@ -15,10 +15,11 @@ import { steerManagedTurn } from './steering.mjs';
 import { validateRoleOverrides } from './templates/schema.mjs';
 import { editManagedHistory, recoverHistoryEdit } from './history.mjs';
 import { restoreLegacyResumePermissions } from './legacy-permission-resume.mjs';
+import { prepareClaudeEffort } from './claude-effort-selection.mjs';
 
 const now = () => Math.floor(Date.now() / 1000);
 const messageOf = error => error instanceof Error ? error.message : String(error);
-const nativeParams = params => { const { engineMode, engineModel, engineModels, template, roleOverrides, claudePermissionMode, claudeActualPermissionMode, claudeCommandTarget, skipAutoTitleGeneration, ...rest } = params; return rest; };
+const nativeParams = params => { const { engineMode, engineModel, engineModels, template, roleOverrides, claudePermissionMode, claudeActualPermissionMode, claudeCommandTarget, claudeEffort, skipAutoTitleGeneration, ...rest } = params; return rest; };
 const deny = () => ({ decision: 'decline' });
 
 export class EngineRouter {
@@ -221,7 +222,7 @@ export class EngineRouter {
         modelListError = 'Could not load Claude models. Refresh models to retry.';
       }
       const bothAvailable = this.workflow.available && (this.remote || !params.hostId || params.hostId === 'local');
-      return { engines: ['codex', 'claude'], bothAvailable, ...(bothAvailable ? { templateSchemaVersion: 2, workflowVersion: 2 } : { bothUnavailableReason: 'Collaborative workflows require the native engine gateway on the selected host.' }), claudeModels, modelListError, modelCatalog, localOnly: !this.remote };
+      return { engines: ['codex', 'claude'], claudeEffortSelection: true, bothAvailable, ...(bothAvailable ? { templateSchemaVersion: 2, workflowVersion: 2 } : { bothUnavailableReason: 'Collaborative workflows require the native engine gateway on the selected host.' }), claudeModels, modelListError, modelCatalog, localOnly: !this.remote };
     }
     if (params.engineModel !== undefined && (params.engineMode === 'claude' || (params.engineMode == null && id && this.store.get(id)?.mode === 'claude'))) assertClaudeModel(params.engineModel);
     if (method === 'engine/turns/read') { if (!this.store.get(id)) await this.hydrate(id); return { turns: this.state(id).turnEngines }; }
@@ -232,12 +233,15 @@ export class EngineRouter {
       const commandTarget = this.claudeCommands.selection(params, this.store.get(id), selected);
       if (this.store.get(id)?.activeRun) throw new Error('Finish or interrupt the active run before switching engines.');
       await this.hydrate(id);
+      const effortOptions = await prepareClaudeEffort(this.adapter, params, this.store.get(id));
       this.store.setMode(id, params.engineMode, { ...(selected ? { models: selected.models, template: selected.selected, roleOverrides: selected.roleOverrides } : { model: params.engineModel }), claudePermissionMode: params.claudePermissionMode });
+      if (effortOptions) this.store.setBinding(id, 'claude', { claudeOptions: effortOptions });
       if (commandTarget !== undefined) { const chat = this.store.require(id); chat.claudeCommandTarget = commandTarget; this.store.save(chat); }
       return this.state(id);
     }
     if (method === 'thread/start') {
       assertMode(params.engineMode ?? 'codex');
+      const effortOptions = await prepareClaudeEffort(this.adapter, params);
       const selected = params.engineMode === 'both' ? this.workflow.selection(params, null, { nativeModel: true }) : null;
       const commandTarget = this.claudeCommands.selection(params, null, selected);
       const clean = nativeParams(params);
@@ -249,11 +253,14 @@ export class EngineRouter {
       if (params.engineModel && value.mode === 'claude') value.models.claude = params.engineModel;
       if (commandTarget !== undefined) value.claudeCommandTarget = commandTarget;
       this.store.save(value);
+      if (effortOptions) this.store.setBinding(value.id, 'claude', { claudeOptions: effortOptions });
       if (selected) this.store.setMode(value.id, 'both', { models: selected.models, template: selected.selected, roleOverrides: selected.roleOverrides });
       return { ...result, thread: this.thread(value.id), engineState: this.state(value.id) };
     }
     if (method === 'turn/start') {
       if (!this.store.get(id)) await this.hydrate(id);
+      if (params.claudeEffort !== undefined && this.store.get(id)?.activeRun) throw new Error('Finish or interrupt the active run before changing Claude effort.');
+      const effortOptions = await prepareClaudeEffort(this.adapter, params, this.store.get(id));
       let selected;
       if (params.engineMode) {
         assertMode(params.engineMode);
@@ -279,6 +286,7 @@ export class EngineRouter {
       }
       if ((params.engineModel && value.mode === 'claude') || params.claudePermissionMode !== undefined) this.store.setMode(id, value.mode, { ...(value.mode === 'claude' ? { model: params.engineModel } : {}), claudePermissionMode: params.claudePermissionMode });
       if (value.mode !== 'codex') {
+        if (effortOptions) this.store.setBinding(id, 'claude', { claudeOptions: effortOptions });
         const command = await this.claudeCommands.prepare(id, params);
         this.assertOpen();
         if (command) return this.startClaude(id, params, command);
