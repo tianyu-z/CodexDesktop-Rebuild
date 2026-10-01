@@ -89,3 +89,46 @@ The dedicated builder's manifest records the source/runtime digests so a later
 installation can reject a candidate if another task has updated the app.
 
 Official reference: [Codex sandboxing](https://developers.openai.com/codex/sandboxing).
+
+## Follow-up: legacy cold resume
+
+The `Review scaling ladder config` chat on `rno` exposed a second path. At
+2026-10-01T03:38:48Z an automatic goal continuation used
+`workspace-write / on-request`, followed by the same `bwrap` error. Earlier and
+later turns used Full access. The desktop had resumed the thread before it had
+any historical permission settings and omitted permission overrides.
+
+An isolated native app-server reproduction confirmed the missing compatibility
+step: a legacy turn with `sandbox_policy=danger-full-access` and no
+`active_permission_profile` resumes with `:workspace` after a process restart.
+The equivalent turn with the named `:danger-full-access` profile survives the
+same restart. Injected diagnostic history materialized the test thread without
+running model inference; each probe used its own temporary native home.
+
+`runtime/agent-modes/legacy-permission-resume.mjs` now supplies the corresponding
+named profile before cold resume, only when the latest legacy context and the
+native `state_5.sqlite` row both agree that the thread has Full access. This DB
+check matters because `thread/settings/update` persists a new restriction before
+the next `turn_context` is written. Loaded threads, explicit request policies,
+named/custom profiles, unsupported policies, and missing or ambiguous state
+retain native behavior. Tail reading is bounded to 32 MiB and requires complete
+JSONL records. The DB is read-only and its thread ID, rollout path, resolved
+policy, and approval mode must match.
+
+The migration uses `node:sqlite` when available and otherwise skips. The target
+`rno` host runs Node 22.17.1 and the bundled local runtime is Node 24.14.1; older
+Node 20 installations do not receive this compatibility migration. Granular
+approval-policy objects and native rollback/revert behavior are outside the
+verified migration cases.
+
+Validation on 2026-10-01: 93 targeted tests passed, plus real native process
+restarts verified both legacy Full access restoration and preservation of a
+newer `:workspace / on-request` choice. Independent review verified the latter
+case. The dedicated builder patches both the installed local runtime and its
+separate remote archive, verifies unrelated contents, and retains the previous
+frontend fix and installed Claude changes.
+
+The live VeOmni goal was left running. Its 05:57:18Z context still recorded
+`danger-full-access / never`, and commands continued exiting successfully through
+06:07:51Z. No permission toggles, new user prompt, or model inference were sent
+to that chat for these checks. Probe evidence is under `.artifacts/full-access/`.

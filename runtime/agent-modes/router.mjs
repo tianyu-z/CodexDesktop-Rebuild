@@ -14,6 +14,7 @@ import { liveClaudeControl } from './claude-live-controls.mjs';
 import { steerManagedTurn } from './steering.mjs';
 import { validateRoleOverrides } from './templates/schema.mjs';
 import { editManagedHistory, recoverHistoryEdit } from './history.mjs';
+import { restoreLegacyResumePermissions } from './legacy-permission-resume.mjs';
 
 const now = () => Math.floor(Date.now() / 1000);
 const messageOf = error => error instanceof Error ? error.message : String(error);
@@ -292,7 +293,8 @@ export class EngineRouter {
     const value = id && this.store.get(id);
     if ((value?.activeRun?.engine === 'claude' || value?.activeTurn?.mode === 'both') && ['thread/delete', 'thread/archive', 'thread/stop'].includes(method)) throw new Error('Finish or interrupt the active engine run before this action.');
     if (method === 'thread/read' || method === 'thread/resume') {
-      const clean = nativeParams(params);
+      const clean = method === 'thread/resume'
+        ? await restoreLegacyResumePermissions(this.native, nativeParams(params)) : nativeParams(params);
       if (value && method === 'thread/read') clean.includeTurns = false;
       if (value && method === 'thread/resume') clean.excludeTurns = true;
       if (value?.mode === 'claude' || value?.mode === 'both') delete clean.model;
