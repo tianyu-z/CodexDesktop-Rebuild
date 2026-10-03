@@ -158,7 +158,7 @@ test('app patch is idempotent and captures engine settings before preparation', 
   assert.match(patched, /useClaudeCommands\(\{React:F\$,scope:m,threadId:FB\(m\)/);
   assert.match(patched, /j=async\(n,r,i,a,s\)=>\{let __cdxEngineSelection=globalThis\.__cdxEngineModes.capture\(e,a\?\.hostId\?\?S\);let\{context:c/);
   assert.match(patched, /let W;return !0\|\|/);
-  assert.match(patched, /busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H/);
+  assert.match(patched, /busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeUI:/);
   assert.match(patched, /Object\.assign\(S,__cdxEngineSelection\)/);
   assert.match(patched, /Object\.assign\(D,__cdxEngineSelection\)/);
   assert.match(patched, /Object\.assign\(b,__cdxEngineSelection\)/);
@@ -178,7 +178,7 @@ test('app patch rejects every missing or duplicate upstream seam', () => {
 test('model discovery receives the composer project directory, including upgraded patches', () => {
   const patched = patchAppBundle(appFixture);
   assert.match(patched, /Selector,\{React:V2,jsx:H2,scope:u,threadId:f,hostId:a,cwd:i,/);
-  const previous = patched.replace(',bothNativeModelPicker:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:!1,permissionsCwdOverride:i,permissionsHostId:a})', '').replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:');
+  const previous = patched.replace('nativeUI:{Button:aZ,Label:Tic,Dropdown:HI,PowerMenu:noc,Menu:qI,Check:EI},', '').replace(',bothNativeModelPicker:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:!1,permissionsCwdOverride:i,permissionsHostId:a})', '').replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:');
   assert.equal(patchAppBundle(previous), patched);
 });
 
@@ -256,7 +256,7 @@ test('existing-chat retry wire reconstruction carries retained first-turn creati
 
 test('known development preview patches upgrade exactly once without re-extraction', () => {
   const current = patchAppBundle(appFixture);
-  const previous = current.replace(',bothNativeModelPicker:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:!1,permissionsCwdOverride:i,permissionsHostId:a})', '').replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:').replace('busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H', 'busyAtom:yk,nativeModelPicker:H').replace('turnRequestFields(e,t,o,r,A??E?.settings?.model)', 'requestFields(o)');
+  const previous = current.replace('nativeUI:{Button:aZ,Label:Tic,Dropdown:HI,PowerMenu:noc,Menu:qI,Check:EI},', '').replace(',bothNativeModelPicker:(0,H2.jsx)(fNc,{conversationId:f,hideLabel:!1,permissionsCwdOverride:i,permissionsHostId:a})', '').replace('hostId:a,cwd:i,getHost:', 'hostId:a,getHost:').replace('busyAtom:yk,runtimeStatusAtom:kk,requestsAtom:XDr,nativeModelPicker:H', 'busyAtom:yk,nativeModelPicker:H').replace('turnRequestFields(e,t,o,r,A??E?.settings?.model)', 'requestFields(o)');
   assert.equal(patchAppBundle(previous), current);
   const oldSelector = previous.split('\n').find(line => line.startsWith('HV.FooterInlineControls'));
   assert.throws(() => patchAppBundle(previous + '\n' + oldSelector), /expected one previous match/);
@@ -304,7 +304,7 @@ test('dual footer assembles a native picker independently of the width-gated sin
   const patched = patchAppBundle(appFixture), footer = patched.split('\n').find(line => line.startsWith('HV.FooterInlineControls,'));
   const factory = { jsx: (type, props) => ({ type, props }) };
   const context = { H2: factory, HV: { FooterInlineControls: 'footer' }, x: {}, V: null, H: false, r: null, U: null,
-    V2: {}, u: {}, f: 'thread', a: 'local', i: '/project', Rk: {}, zg: {}, ss: {}, yk: {}, kk: {}, XDr: {}, fNc: 'native-model-and-effort-picker', __cdxEngineModes: { Selector: 'engine-selector' } };
+    V2: {}, u: {}, f: 'thread', a: 'local', i: '/project', Rk: {}, zg: {}, ss: {}, yk: {}, kk: {}, XDr: {}, aZ: 'button', Tic: 'label', HI: 'dropdown', noc: 'power-menu', qI: {}, EI: 'check', fNc: 'native-model-and-effort-picker', __cdxEngineModes: { Selector: 'engine-selector' } };
   const tree = vm.runInNewContext(`(0,H2.jsx)(${footer})`, context);
   const selector = tree.props.children[1];
   assert.equal(selector.props.nativeModelPicker, false);

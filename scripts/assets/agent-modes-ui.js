@@ -95,7 +95,7 @@
         const response = await manager.sendRequest('engine/capabilities', { ...(threadId != null ? { threadId } : {}), ...(cwd != null ? { cwd } : {}), ...(force ? { refresh: true } : {}) });
         if (row.revision !== revision) return row.snapshot;
         const models = normalizeModels(response?.claudeModels), error = displayText(response?.modelListError) || null;
-        update(row, { claudeModels: error && models.length === 0 ? row.snapshot.claudeModels : models, modelListError: error, engines: Array.isArray(response?.engines) ? response.engines.filter(value => typeof value === 'string') : row.snapshot.engines, bothAvailable: response?.bothAvailable === true, bothUnavailableReason: displayText(response?.bothUnavailableReason), loadedAt: Date.now() });
+        update(row, { claudeModels: error && models.length === 0 ? row.snapshot.claudeModels : models, modelListError: error, engines: Array.isArray(response?.engines) ? response.engines.filter(value => typeof value === 'string') : row.snapshot.engines, claudeEffortSelection: response?.claudeEffortSelection === true, claudeWorkflowEffortSelection: response?.claudeWorkflowEffortSelection === true, bothAvailable: response?.bothAvailable === true, bothUnavailableReason: displayText(response?.bothUnavailableReason), loadedAt: Date.now() });
       } catch (error) {
         if (row.revision === revision) update(row, { modelListError: displayText(error?.message ?? String(error)) || 'Unable to discover Claude Code models', loadedAt: Date.now() });
       } finally {
@@ -171,6 +171,7 @@
     return `${model.description ? `${model.description}\n` : ''}Model ID: ${model.value}${model.resolvedModel && model.resolvedModel !== model.value ? `\nResolves to: ${model.resolvedModel}` : ''}`;
   }
   function validate(selection) {
+    if (selection.claudeEffort !== undefined && (!['claude', 'both'].includes(selection.engineMode) || ![null, 'low', 'medium', 'high', 'xhigh', 'max'].includes(selection.claudeEffort))) throw Error('Invalid Claude effort selection');
     if (!['codex', 'claude', 'both'].includes(selection.engineMode)) throw Error('Unknown chat engine mode');
     if (selection.claudePermissionMode !== undefined && !validPermission(selection.claudePermissionMode)) throw Error('Invalid Claude permission mode');
     if (selection.claudeCommandTarget !== undefined && selection.claudeCommandTarget !== null && !/^[a-z][a-z0-9_-]{0,63}$/.test(selection.claudeCommandTarget)) throw Error('Invalid Claude command target');
@@ -193,13 +194,41 @@
     const changed = selection.template && (selection.template.id !== state.template.id || selection.template.revision !== state.template.revision);
     return copy(selection.roleOverrides ?? (changed ? {} : state.roleOverrides));
   }
+  const effortSaveError = 'The host did not confirm this effort setting. Reconnect after its tasks finish to use an updated host, then try again.';
+  function confirmsEffort(selection, state) {
+    if (selection.claudeEffort === undefined) return true;
+    const field = selection.engineMode === 'both' ? 'claudeWorkflowOptions' : 'claudeSessionOptions';
+    return state?.engineMode === selection.engineMode && state?.[field]?.effort === selection.claudeEffort;
+  }
+  function draftEffortSelection(context, state, selection) {
+    const effort = state.claudeWorkflowOptions?.effort;
+    if (selection.engineMode !== 'both' || selection.claudeEffort !== undefined || effort == null) return selection;
+    const next = { ...state, models: { ...state.models, ...selection.engineModels }, template: selection.template ?? state.template, roleOverrides: selectionOverrides(state, selection) };
+    const templates = templateRecord(context.manager, context.hostId).snapshot;
+    const roles = snapshot => effectiveRoles(snapshot, templates).filter(role => role.engine === 'claude').map(role => Object.hasOwn(role, 'model') ? role.model ?? 'default' : snapshot.models.claude ?? 'default').sort();
+    const roleModels = overrides => Object.entries(overrides).map(([id, role]) => [id, role.engine, role.model]).sort(([a], [b]) => a.localeCompare(b));
+    const templateChanged = templateKey(next.template) !== templateKey(state.template);
+    const knownTemplate = templates.byRevision[templateKey(next.template)]?.roles;
+    const modelsChanged = knownTemplate ? JSON.stringify(roles(state)) !== JSON.stringify(roles(next))
+      : next.models.claude !== state.models.claude || JSON.stringify(roleModels(next.roleOverrides)) !== JSON.stringify(roleModels(state.roleOverrides));
+    if (state.engineMode === 'both' && !templateChanged && !modelsChanged) return selection;
+    const catalog = catalogRecord(context.manager, { hostId: context.hostId, cwd: context.cwd }).snapshot;
+    const nextModels = roles(next);
+    const compatible = knownTemplate && nextModels.length > 0 && nextModels.every(id => {
+      const model = catalog.claudeModels.find(model => model.value === id);
+      return model?.supportsEffort === true && model.supportedEffortLevels?.includes(effort);
+    });
+    return compatible ? selection : { ...selection, claudeEffort: null };
+  }
   function applyState(row, state) {
     const values = { loading: false, available: true, error: null };
     if (['codex', 'claude', 'both'].includes(state?.engineMode)) values.engineMode = state.engineMode;
     if (state?.models) values.models = { ...row.snapshot.models, ...state.models };
     for (const name of ['claudePermissionMode', 'claudeActualPermissionMode', 'claudeCommandTarget']) if (state?.[name] !== undefined) values[name] = state[name];
     if (state?.claudeClientActions) values.claudeClientActions = state.claudeClientActions;
+    if (state?.claudeWorkflowOptions !== undefined) values.claudeWorkflowOptions = copy(state.claudeWorkflowOptions);
     if (state?.claudeSessionOptions !== undefined) values.claudeSessionOptions = copy(state.claudeSessionOptions);
+    if (state?.claudeEffort !== undefined) values.claudeSessionOptions = { ...row.snapshot.claudeSessionOptions, effort: state.claudeEffort };
     if (state?.claudeRoleActualPermissionModes) values.claudeRoleActualPermissionModes = state.claudeRoleActualPermissionModes;
     for (const name of ['claudeActiveRuns', 'claudeCommandRunId']) if (state?.[name] !== undefined) values[name] = state[name];
     if (state?.template) values.template = copy(state.template);
@@ -210,6 +239,10 @@
     // A prewarmed shell still reports its old engine until the first turn reaches
     // the gateway. Reads may update busy/history, but cannot erase captured intent.
     if (row.creationIntent) {
+      if (row.creationIntent.claudeEffort !== undefined) {
+        const field = row.creationIntent.engineMode === 'both' ? 'claudeWorkflowOptions' : 'claudeSessionOptions';
+        values[field] = { ...row.snapshot[field], effort: row.creationIntent.claudeEffort };
+      }
       for (const name of ['claudePermissionMode', 'claudeCommandTarget']) if (row.creationIntent[name] !== undefined) values[name] = row.creationIntent[name];
       values.engineMode = row.creationIntent.engineMode;
       if (row.creationIntent.engineMode === 'claude') values.models = { ...row.snapshot.models, ...values.models, claude: row.creationIntent.engineModel };
@@ -221,9 +254,9 @@
   function requestFields(options) {
     if (options?.engineMode == null) return {};
     validate(options);
-    if (options.engineMode === 'both') return { engineMode: 'both', ...(options.claudePermissionMode !== undefined ? { claudePermissionMode: options.claudePermissionMode } : {}), engineModels: copy({ codex: null, claude: 'default', ...options.engineModels }), template: copy(options.template ?? defaultTemplate()), ...(options.roleOverrides !== undefined ? { roleOverrides: copy(options.roleOverrides) } : {}), ...(options.claudeCommandTarget !== undefined ? { claudeCommandTarget: options.claudeCommandTarget } : {}) };
+    if (options.engineMode === 'both') return { engineMode: 'both', ...(options.claudeEffort !== undefined ? { claudeEffort: options.claudeEffort } : {}), ...(options.claudePermissionMode !== undefined ? { claudePermissionMode: options.claudePermissionMode } : {}), engineModels: copy({ codex: null, claude: 'default', ...options.engineModels }), template: copy(options.template ?? defaultTemplate()), ...(options.roleOverrides !== undefined ? { roleOverrides: copy(options.roleOverrides) } : {}), ...(options.claudeCommandTarget !== undefined ? { claudeCommandTarget: options.claudeCommandTarget } : {}) };
     return options.engineMode === 'claude'
-      ? { engineMode: 'claude', engineModel: options.engineModel ?? 'default', ...(options.claudePermissionMode !== undefined ? { claudePermissionMode: options.claudePermissionMode } : {}) }
+      ? { engineMode: 'claude', engineModel: options.engineModel ?? 'default', ...(options.claudePermissionMode !== undefined ? { claudePermissionMode: options.claudePermissionMode } : {}), ...(options.claudeEffort !== undefined ? { claudeEffort: options.claudeEffort } : {}) }
       : { engineMode: 'codex' };
   }
   function turnRequestFields(manager, threadId, options, clientUserMessageId, nativeModel) {
@@ -249,13 +282,17 @@
     const row = record(scope, null, hostId);
     if (row.snapshot.pending || row.snapshot.busy || row.nativeControlsBlocked) throw Error('Wait for the current turn to finish');
     row.revision++;
+    if (selection.claudeEffort !== undefined) {
+      const field = selection.engineMode === 'both' ? 'claudeWorkflowOptions' : 'claudeSessionOptions';
+      update(row, { [field]: { ...row.snapshot[field], effort: selection.claudeEffort } });
+    }
     for (const name of ['claudePermissionMode', 'claudeCommandTarget']) if (selection[name] !== undefined) update(row, { [name]: selection[name] });
     update(row, { engineMode: selection.engineMode, models: { ...row.snapshot.models, ...copy(selection.engineModels ?? {}), ...(selection.engineMode === 'claude' && selection.engineModel != null ? { claude: selection.engineModel } : {}) }, template: copy(selection.template ?? row.snapshot.template), roleOverrides: selectionOverrides(row.snapshot, selection), error: null });
   }
   function capture(scope, hostId) {
     const state = record(scope, null, hostId).snapshot;
-    if (state.engineMode === 'both') return { ...requestFields({ engineMode: 'both', engineModels: state.models, template: state.template, roleOverrides: state.roleOverrides, claudePermissionMode: state.claudePermissionMode, claudeCommandTarget: state.claudeCommandTarget }), skipAutoTitleGeneration: true };
-    if (state.engineMode === 'claude') return { ...requestFields({ engineMode: 'claude', engineModel: state.models.claude ?? 'default', claudePermissionMode: state.claudePermissionMode }), skipAutoTitleGeneration: true };
+    if (state.engineMode === 'both') return { ...requestFields({ engineMode: 'both', engineModels: state.models, template: state.template, roleOverrides: state.roleOverrides, claudePermissionMode: state.claudePermissionMode, claudeCommandTarget: state.claudeCommandTarget, claudeEffort: state.claudeWorkflowOptions?.effort }), skipAutoTitleGeneration: true };
+    if (state.engineMode === 'claude') return { ...requestFields({ engineMode: 'claude', engineModel: state.models.claude ?? 'default', claudePermissionMode: state.claudePermissionMode, claudeEffort: state.claudeSessionOptions?.effort }), skipAutoTitleGeneration: true };
     return { engineMode: 'codex' };
   }
   function nativeGoalError(scope, threadId, hostId) {
@@ -294,7 +331,10 @@
     const row = record(null, threadId, hostId);
     // Reads are applied by their caller with a revision check. An old in-flight read
     // must never undo a newly acknowledged selection.
-    if (method === 'engine/mode/set') { row.creationIntent = null; row.revision++; applyState(row, response); }
+    if (method === 'engine/mode/set') {
+      if (!confirmsEffort(params, response)) { update(row, { error: effortSaveError }); return; }
+      row.creationIntent = null; row.revision++; applyState(row, response);
+    }
     const acknowledgedTurnId = method === 'turn/start' ? response?.turn?.id ?? response?.turn?.turnId : null;
     if (acknowledgedTurnId) update(row, { workflows: latestWorkflowFlags(row, row.snapshot.workflows, acknowledgedTurnId, ++row.workflowReadOrder) });
     const intent = row.creationIntent;
@@ -334,12 +374,13 @@
     const { scope, threadId, hostId, manager } = context;
     const row = record(scope, threadId, hostId);
     if (row.snapshot.pending || row.snapshot.busy || row.nativeControlsBlocked) throw Error('Wait for the current turn to finish');
-    if (threadId == null) { setDraftSelection(scope, selection, hostId); return; }
+    if (threadId == null) { setDraftSelection(scope, draftEffortSelection(context, row.snapshot, selection), hostId); return; }
     row.revision++;
     update(row, { pending: true, error: null });
     try {
       const selected = requestFields({ claudePermissionMode: row.snapshot.claudePermissionMode, claudeCommandTarget: row.snapshot.claudeCommandTarget, ...selection, engineModel: selection.engineModel ?? row.snapshot.models.claude, engineModels: { ...row.snapshot.models, ...selection.engineModels }, template: selection.template ?? row.snapshot.template, ...(selection.engineMode === 'both' ? { roleOverrides: selectionOverrides(row.snapshot, selection) } : {}) });
       const state = await manager.sendRequest('engine/mode/set', { threadId, ...selected });
+      if (!confirmsEffort(selection, state)) throw Error(effortSaveError);
       row.creationIntent = null;
       applyState(row, state);
     } catch (error) {
@@ -518,7 +559,7 @@
     if (['resume', 'clear', 'rename', 'rewind', 'copy', 'export', 'remote-control'].includes(command.name)) return 'Conversation';
     return 'Other native commands';
   }
-  function ClaudeCommandBrowser({ React, jsx, scope, threadId, hostId, catalog, model, sessionOptions = {} }) {
+  function ClaudeCommandBrowser({ React, jsx, scope, threadId, hostId, catalog, model, sessionOptions = {}, nativeUI, onRefresh }) {
     const [query, setQuery] = React.useState(''), [notice, setNotice] = React.useState('');
     const match = query.trim().toLocaleLowerCase();
     const groups = new Map();
@@ -533,9 +574,10 @@
     const optionPicker = (name, label, values) => jsx.jsx('select', { 'aria-label': `Insert Claude ${name} command`, title: `Choose a value to insert /${name}, then send it.`, value: '', style: selectStyle, onChange: event => { if (event.target.value) insert(name, event.target.value); }, children: [jsx.jsx('option', { value: '', children: `${label}…` }), ...values.map(value => jsx.jsx('option', { value, children: value }, value))] });
     const effort = model?.supportsEffort === true ? (model.supportedEffortLevels ?? []) : [];
     const saved = [Object.hasOwn(sessionOptions, 'effort') ? `Effort: ${sessionOptions.effort ?? 'auto'}` : '', sessionOptions.thinking ? `Thinking: ${sessionOptions.thinking.type}${sessionOptions.thinking.budgetTokens ? ` (${sessionOptions.thinking.budgetTokens})` : ''}` : '', sessionOptions.outputStyle ? `Style: ${sessionOptions.outputStyle}` : ''].filter(Boolean).join(' · ');
-    return jsx.jsxs('details', { 'data-cdx-claude-command-browser': true, style: { position: 'relative' }, children: [
-      jsx.jsx('summary', { style: { ...selectStyle, cursor: 'pointer' }, children: 'Claude tools' }),
-      jsx.jsxs('div', { role: 'region', 'aria-label': 'Claude tools and commands', style: { position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 50, width: 'min(380px, 85vw)', maxHeight: 'min(480px, 65vh)', overflow: 'auto', padding: 12, borderRadius: 12, border: '1px solid #8885', boxShadow: '0 8px 32px #0003', background: 'var(--color-token-bg-primary, Canvas)', color: 'var(--color-token-text-primary, CanvasText)' }, children: [
+    return jsx.jsxs('details', { 'data-cdx-claude-command-browser': true, style: { position: 'relative' }, onKeyDown: event => { if (event.key === 'Escape') { event.currentTarget.open = false; event.currentTarget.querySelector('summary')?.focus(); } }, children: [
+      jsx.jsx('summary', { className: nativeUI ? 'no-drag cursor-interaction rounded-lg hover:bg-surface-hover' : undefined, style: nativeUI ? { display: 'flex', alignItems: 'center', height: 28, padding: '0 8px', listStyle: 'none', fontSize: 12 } : { ...selectStyle, cursor: 'pointer' }, children: nativeUI ? jsx.jsx(nativeUI.Label, { categoryLabel: null, collapse: 'none', icon: null, indicator: 'chevron', selectedValue: 'Claude tools', foreground: 'tertiary' }) : 'Claude tools' }),
+      jsx.jsxs('div', { role: 'region', 'aria-label': 'Claude tools and commands', style: { position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 50, width: 'min(380px, 85vw)', maxHeight: 'min(480px, 65vh)', overflow: 'auto', padding: 12, borderRadius: 12, border: '1px solid #8885', boxShadow: '0 8px 32px #0003', background: 'var(--color-surface-elevated, Canvas)', color: 'var(--color-text, CanvasText)' }, children: [
+        onRefresh ? jsx.jsx('button', { type: 'button', disabled: catalog.loading, onClick: onRefresh, style: { ...selectStyle, float: 'right', marginBottom: 8 }, children: catalog.loading ? 'Refreshing…' : 'Refresh commands' }) : null,
         jsx.jsx('input', { type: 'search', 'aria-label': 'Search Claude commands', placeholder: 'Search commands, skills and tools', value: query, onChange: event => setQuery(event.target.value), style: { ...selectStyle, boxSizing: 'border-box', width: '100%', marginBottom: 8 } }),
         jsx.jsx('div', { style: { opacity: 0.7, marginBottom: 8 }, children: 'Choose a command to edit and send in this chat.' }),
         !match ? jsx.jsxs('div', { style: { marginBottom: 8 }, children: [
@@ -606,7 +648,7 @@
       row.revision++; applyState(row, state);
     } catch (error) { update(row, { error: error.message ?? String(error) }); }
   }
-  function CommandControls({ React, jsx, scope, threadId, hostId, cwd, manager }) {
+  function CommandControls({ React, jsx, scope, threadId, hostId, cwd, manager, nativeUI }) {
     const row = record(scope, threadId, hostId), state = useRecord(React, row);
     const templates = useRecord(React, templateRecord(manager, hostId));
     const roles = effectiveRoles(state, templates).filter(role => role.engine === 'claude');
@@ -622,15 +664,58 @@
     const modelId = state.engineMode === 'both' ? roles.find(role => role.id === selected)?.model ?? state.models.claude : state.models.claude;
     const model = modelCatalog.claudeModels.find(model => model.value === modelId);
     const activeTasks = (state.claudeActiveRuns ?? []).filter(run => run.roleId === selected);
-    return jsx.jsxs('span', { style: { display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 4, fontSize: 11 }, children: [
-      state.engineMode === 'both' ? jsx.jsxs('label', { children: ['Claude / commands → ', jsx.jsx('select', { 'aria-label': 'Claude command target', value: selected, disabled: state.pending, style: selectStyle, onChange: event => changeCommandTarget({ scope, threadId, hostId, manager }, event.target.value), children: roles.map(role => jsx.jsx('option', { value: role.id, children: roleLabel(role.id) }, role.id)) })] }) : jsx.jsx('span', { children: `Claude / commands${catalog.commands.length ? ` · ${catalog.commands.length}` : ''}` }),
+    const content = jsx.jsxs('span', { style: { display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 4, fontSize: 11 }, children: [
+      state.engineMode === 'both' ? jsx.jsxs('label', { children: ['Claude / commands → ', jsx.jsx('select', { 'aria-label': 'Claude command target', value: selected, disabled: state.pending, style: selectStyle, onChange: event => changeCommandTarget({ scope, threadId, hostId, manager }, event.target.value), children: roles.map(role => jsx.jsx('option', { value: role.id, children: roleLabel(role.id) }, role.id)) })] }) : nativeUI ? null : jsx.jsx('span', { children: `Claude / commands${catalog.commands.length ? ` · ${catalog.commands.length}` : ''}` }),
       activeTasks.length > 1 ? jsx.jsx('select', { 'aria-label': 'Claude command task', value: state.claudeCommandRunId ?? '', style: selectStyle, onChange: event => changeCommandTarget({ scope, threadId, hostId, manager }, selected, event.target.value), children: [jsx.jsx('option', { value: '', children: 'Choose active task' }), ...activeTasks.map(run => jsx.jsx('option', { value: run.id, children: `${run.stepId} · ${run.id}`, title: run.id }, run.id))] }) : null,
-      jsx.jsx('button', { type: 'button', 'aria-label': 'Refresh Claude commands', title: 'Read commands and skills from Claude Code in this workspace', disabled: catalog.loading || !manager, style: { ...selectStyle, border: 'none' }, onClick: () => refreshClaudeCommands(manager, { ...context, force: true }), children: catalog.loading ? '…' : '↻' }),
-      jsx.jsx(ClaudeCommandBrowser, { React, jsx, scope, threadId, hostId, catalog, model, sessionOptions: state.claudeSessionOptions }),
+      !nativeUI ? jsx.jsx('button', { type: 'button', 'aria-label': 'Refresh Claude commands', title: 'Read commands and skills from Claude Code in this workspace', disabled: catalog.loading || !manager, style: { ...selectStyle, border: 'none' }, onClick: () => refreshClaudeCommands(manager, { ...context, force: true }), children: catalog.loading ? '…' : '↻' }) : null,
+      jsx.jsx(ClaudeCommandBrowser, { React, jsx, scope, threadId, hostId, catalog, model, sessionOptions: state.claudeSessionOptions, nativeUI, onRefresh: nativeUI ? () => refreshClaudeCommands(manager, { ...context, force: true }) : undefined }),
       catalog.error ? jsx.jsx('span', { role: 'status', title: catalog.error, children: `Commands: ${catalog.error}` }) : null,
       state.claudeClientDelivery ? jsx.jsxs('span', { role: 'status', children: [state.claudeClientDelivery.error ?? state.claudeClientDelivery.message,
         state.claudeClientDelivery.error && state.claudeClientDelivery.action ? jsx.jsx('button', { type: 'button', style: selectStyle, onClick: () => retryClaudeClientAction({ scope, threadId, hostId }), children: state.claudeClientDelivery.action.type === 'copy' ? 'Copy' : 'Download' }) : null] }) : null,
     ] });
+    return content;
+  }
+  // The injected interface references the same components used by Codex's
+  // model picker. It owns focus, portals, keyboard navigation and theme styles.
+  function composerButton(jsx, nativeUI, label, props = {}) {
+    return jsx.jsx(nativeUI.Button, { type: 'button', size: 'composer', color: 'ghost', className: 'min-w-0', ...props,
+      children: jsx.jsx(nativeUI.Label, { categoryLabel: null, collapse: 'none', icon: null, indicator: 'chevron', selectedValue: label, selectedValueClassName: 'max-w-56', foreground: 'tertiary' }) });
+  }
+  function ComposerSelect({ React, jsx, nativeUI, ...props }) {
+    if (!nativeUI) return jsx.jsx('select', props);
+    const options = (Array.isArray(props.children) ? props.children : [props.children]).filter(Boolean);
+    const selected = options.find(option => option.props.value === props.value);
+    return jsx.jsx(nativeUI.Dropdown, { align: 'start', contentWidth: 'menu', disabled: props.disabled,
+      onOpenChange: open => { if (open) props.onFocus?.(); },
+      triggerButton: composerButton(jsx, nativeUI, selected?.props.children ?? props.value, { disabled: props.disabled, title: props.title, 'aria-label': props['aria-label'], 'data-testid': props['data-testid'] }),
+      children: options.map(option => jsx.jsx(nativeUI.Menu.Item, { disabled: props.disabled || option.props.disabled, RightIcon: option.props.value === props.value ? nativeUI.Check : undefined,
+        title: option.props.title, onSelect: () => { if (!props.disabled && !option.props.disabled) props.onChange?.({ target: { value: option.props.value } }); }, children: option.props.children }, option.props.value)) });
+  }
+  const effortLabel = value => ({ auto: 'Auto', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High', max: 'Max' })[value] ?? value;
+  function ClaudeModelPicker({ React, jsx, nativeUI, models, effort, onEffort, onRefresh, refreshing, effortAvailable = true, ...props }) {
+    const [open, setOpen] = React.useState(false), [view, setView] = React.useState('advanced');
+    if (!nativeUI) return jsx.jsx('select', props);
+    const selected = models.find(model => model.value === props.value) ?? { value: props.value };
+    const levels = selected.supportsEffort === true ? selected.supportedEffortLevels ?? [] : [];
+    const canSetEffort = levels.length > 0;
+    const current = effort ?? 'auto';
+    const name = modelLabel(selected), label = `${name}${canSetEffort ? ` · ${effortLabel(current)}` : ''}`;
+    const chooseEffort = value => { if (!props.disabled && effortAvailable) onEffort?.(value === 'auto' ? null : value); };
+    const powerSelections = canSetEffort ? ['auto', ...levels].map((reasoningEffort, powerSettingIndex) => ({ id: `${props.value}:${reasoningEffort}`, model: props.value, modelLabel: name, reasoningEffort, powerSettingIndex, sliderLabel: `${name} · ${effortLabel(reasoningEffort)}` })) : [];
+    const advancedConfig = {
+      model: { label: 'Model', title: 'Model', value: name, ariaLabel: `Model ${name}`, contentClassName: 'w-[280px]', disabled: props.disabled,
+        options: models.map(model => ({ id: model.value, label: modelLabel(model), selected: model.value === props.value,
+          onSelect: () => { if (!props.disabled) props.onChange({ target: { value: model.value } }); } })) },
+      effort: canSetEffort ? { label: 'Effort', title: 'Effort', value: effortLabel(current), ariaLabel: `Effort ${effortLabel(current)}`, contentClassName: 'min-w-[180px]', disabled: props.disabled || !effortAvailable,
+        options: ['auto', ...levels].map(value => ({ id: value, label: effortLabel(value), selected: value === current, onSelect: () => chooseEffort(value) })) } : null,
+      extras: jsx.jsxs(jsx.Fragment ?? 'div', { children: [!effortAvailable ? jsx.jsx('div', { role: 'status', style: { padding: '6px 8px', fontSize: 12 }, children: 'This host is still running an older version. Reconnect after its tasks finish to enable effort controls.' }) : null, onRefresh ? jsx.jsx(nativeUI.Menu.Item, { disabled: refreshing, onSelect: event => { event.preventDefault(); onRefresh(); }, children: refreshing ? 'Refreshing models…' : 'Refresh models' }) : null] }),
+    };
+    return jsx.jsx(nativeUI.Dropdown, { align: 'start', contentClassName: 'w-56', open, onOpenChange: value => { setOpen(value); if (value) props.onFocus?.(); }, disabled: props.disabled,
+      triggerButton: composerButton(jsx, nativeUI, label, { disabled: props.disabled, title: label, 'aria-label': `Claude model and effort: ${label}`, 'data-testid': 'claude-model-selector', 'data-selected-reasoning-effort': current, 'aria-expanded': open }),
+      children: jsx.jsx(nativeUI.PowerMenu, { active: open && !props.disabled, menuView: canSetEffort && effortAvailable ? view : 'advanced', advancedConfig, powerSelections,
+        selectedPowerSelection: powerSelections.find(row => row.reasoningEffort === current), showViewControls: canSetEffort && effortAvailable,
+        onSelectPower: selection => chooseEffort(selection.reasoningEffort), onToggleMenuView: () => setView(view === 'advanced' ? 'simple' : 'advanced'),
+        onSelectComplete: () => setOpen(false), selectedServiceTier: null, serviceTierOptions: [], serviceTierOptionsLoading: false, shouldReduceMotion: false }) });
   }
   function Selector(props) {
     const { React, jsx, scope, threadId, nativeModelPicker, bothNativeModelPicker } = props;
@@ -661,28 +746,37 @@
     const mode = state.engineMode;
     // Native app-wide commands outlive individual button events. Their guard
     // reads this chat's current state, including the composer's native busy atoms.
-    row.nativeControlsBlocked = mode === 'both' && disabled;
-    const change = selection => { changeSelection({ scope, threadId, hostId, manager }, selection).catch(() => {}); };
-    const modePicker = jsx.jsxs('select', {
+    row.nativeControlsBlocked = disabled;
+    const change = selection => { changeSelection({ scope, threadId, hostId, cwd, manager }, selection).catch(() => {}); };
+    const inheritedEffort = (modelId, targetMode = mode) => {
+      const next = catalog.claudeModels.find(model => model.value === modelId), effort = (targetMode === 'both' ? state.claudeWorkflowOptions : state.claudeSessionOptions)?.effort;
+      return effort != null && (next?.supportsEffort !== true || !next.supportedEffortLevels?.includes(effort)) ? { claudeEffort: null } : {};
+    };
+    const modePicker = jsx.jsxs(ComposerSelect, { React, jsx, nativeUI: props.nativeUI,
       'aria-label': 'Chat engine', 'data-testid': 'chat-engine-selector', value: mode, disabled, title: reason, style: selectStyle,
-      onChange: event => change({ engineMode: event.target.value }),
+      onChange: event => change({ engineMode: event.target.value, ...(['claude', 'both'].includes(event.target.value) ? inheritedEffort(state.models.claude, event.target.value) : {}) }),
       onFocus: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       onPointerDown: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       children: [jsx.jsx('option', { value: 'codex', children: 'Only Codex' }), jsx.jsx('option', { value: 'claude', disabled: !claudeAvailable, children: 'Only Claude Code' }), jsx.jsx('option', { value: 'both', disabled: !bothAvailable, title: catalog.bothUnavailableReason || 'Configure independent participants and host roles', children: 'Multi-agent (Codex / Claude)' })],
     });
-    const claudePicker = mode === 'claude' || mode === 'both' ? jsx.jsx('select', {
+    const claudePicker = mode === 'claude' || mode === 'both' ? jsx.jsx(ClaudeModelPicker, { React, jsx, nativeUI: props.nativeUI,
+      models: modelOptions(catalog, state.models.claude ?? 'default'), effort: (mode === 'both' ? state.claudeWorkflowOptions : state.claudeSessionOptions)?.effort, effortAvailable: (mode === 'both' ? catalog.claudeWorkflowEffortSelection : catalog.claudeEffortSelection) === true,
+      onEffort: claudeEffort => change({ engineMode: mode, claudeEffort }),
+      onRefresh: () => refreshCapabilities(manager, { hostId, threadId, cwd, force: true }), refreshing: catalog.loading,
       'aria-label': 'Claude Code model', 'data-testid': 'claude-model-selector', value: state.models.claude ?? 'default', disabled: disabled || !claudeAvailable, title: 'Claude Code uses its own project/user permissions and per-tool approvals. The Codex permission selector applies only to Codex.', style: { ...selectStyle, maxWidth: 220 },
-      onChange: event => change(mode === 'both' ? { engineMode: 'both', engineModels: { claude: event.target.value } } : { engineMode: 'claude', engineModel: event.target.value }),
+      onChange: event => {
+        change(mode === 'both' ? { engineMode: 'both', engineModels: { claude: event.target.value }, ...inheritedEffort(event.target.value) } : { engineMode: 'claude', engineModel: event.target.value, ...inheritedEffort(event.target.value) });
+      },
       onFocus: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       onPointerDown: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       children: modelOptions(catalog, state.models.claude ?? 'default').map(model => jsx.jsx('option', { value: model.value, title: modelTitle(model), children: modelLabel(model) }, model.value)),
     }) : nativeModelPicker;
     const dualNativePicker = bothNativeModelPicker?.type ? jsx.jsx(bothNativeModelPicker.type, { ...bothNativeModelPicker.props, cdxEngineSelectionContext: { scope, threadId, hostId } }) : bothNativeModelPicker ?? nativeModelPicker;
     const modelPicker = mode === 'both' ? jsx.jsxs('span', { style: { display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0 }, children: [jsx.jsxs('fieldset', { 'aria-label': 'Codex model controls', disabled, style: { border: 0, margin: 0, padding: 0, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 4, ...(disabled ? { pointerEvents: 'none', opacity: 0.6 } : {}) }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Codex model' }), dualNativePicker] }), jsx.jsxs('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 }, children: [jsx.jsx('span', { style: { fontSize: 11 }, children: 'Claude model' }), claudePicker] })] }) : claudePicker;
-    const refreshModels = (mode === 'claude' || mode === 'both' || catalog.modelListError) ? jsx.jsx('button', { type: 'button', 'aria-label': 'Refresh Claude models', title: 'Refresh models', disabled: !manager || catalog.loading, style: { ...selectStyle, border: 'none', padding: '2px 4px' }, onClick: () => refreshCapabilities(manager, { hostId, threadId, cwd, force: true }), children: '↻' }) : null;
+    const refreshModels = !props.nativeUI && (mode === 'claude' || mode === 'both' || catalog.modelListError) ? jsx.jsx('button', { type: 'button', 'aria-label': 'Refresh Claude models', title: 'Refresh models', disabled: !manager || catalog.loading, style: { ...selectStyle, border: 'none', padding: '2px 4px' }, onClick: () => refreshCapabilities(manager, { hostId, threadId, cwd, force: true }), children: '↻' }) : null;
     const errorStyle = { fontSize: 11, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
     const modelError = catalog.modelListError ? jsx.jsx('span', { role: 'status', title: catalog.modelListError, style: errorStyle, children: `Model discovery: ${catalog.modelListError}` }) : null;
-    return jsx.jsxs('span', { className: 'flex min-w-0 items-center gap-1', style: { display: 'inline-flex', flexWrap: 'wrap', minWidth: 0, gap: 4 }, 'data-cdx-engine-controls': true, children: [modePicker, modelPicker, refreshModels, mode === 'both' ? jsx.jsx(TemplateControls, { React, jsx, manager, hostId, selection: state.template, disabled, onChange: template => change({ engineMode: 'both', template }) }, hostId) : null, mode === 'both' ? jsx.jsx(RoleControls, { React, jsx, manager, hostId, threadId, cwd, selection: state.template, roleOverrides: state.roleOverrides, models: state.models, disabled, onChange: roleOverrides => change({ engineMode: 'both', roleOverrides }) }, `${hostId}:${threadId ?? ''}:${templateKey(state.template)}`) : null, modelError, state.error ? jsx.jsx('span', { role: 'alert', title: state.error, style: errorStyle, children: state.error }) : null, jsx.jsx(CommandControls, { React, jsx, scope, threadId, hostId, cwd, manager })] });
+    return jsx.jsxs('span', { className: 'flex min-w-0 items-center gap-1', style: { display: 'inline-flex', flexWrap: 'wrap', minWidth: 0, gap: 4 }, 'data-cdx-engine-controls': true, children: [modePicker, modelPicker, refreshModels, mode === 'both' ? jsx.jsx(TemplateControls, { React, jsx, manager, hostId, selection: state.template, disabled, onChange: template => change({ engineMode: 'both', template }) }, hostId) : null, mode === 'both' ? jsx.jsx(RoleControls, { React, jsx, manager, hostId, threadId, cwd, selection: state.template, roleOverrides: state.roleOverrides, models: state.models, disabled, onChange: roleOverrides => change({ engineMode: 'both', roleOverrides }) }, `${hostId}:${threadId ?? ''}:${templateKey(state.template)}`) : null, modelError, state.error ? jsx.jsx('span', { role: 'alert', title: state.error, style: errorStyle, children: state.error }) : null, jsx.jsx(CommandControls, { React, jsx, scope, threadId, hostId, cwd, manager, nativeUI: props.nativeUI })] });
   }
   function templateRecord(manager, hostId = managerHost(manager)) {
     if (!manager || !['object', 'function'].includes(typeof manager)) return disconnectedTemplates;
@@ -967,6 +1061,7 @@
     ] });
   }
   globalThis.__cdxEngineModes = {
+    ComposerSelect, ClaudeModelPicker,
     Selector, SourceBadge, TemplateControls, TemplateManager, RoleControls, refreshTemplates, refreshRuns, capture, requestFields, turnRequestFields, registerManager, noteStarted, observe,
     PermissionControls, useClaudeCommands, refreshClaudeCommands, nativeGoalError, shouldRouteClaudeGoal, canManageFollowUps, serializeClaudeAnswers, insertClaudeCommand, ClaudeCommandBrowser,
     deliverClaudeClientActions, retryClaudeClientAction,

@@ -68,7 +68,7 @@ class WorkflowExecution {
     if (previous && previous.id !== supplied.runId) throw new Error('Workflow recovery ID does not match the saved snapshot.');
     // Snapshot all caller-owned execution data before scheduling even one microtask.
     const data = previous?.config ?? { runId: supplied.runId, template: supplied.template, roleOverrides: supplied.roleOverrides ?? {}, parameters: supplied.parameters ?? {}, models: supplied.models ?? {},
-      nativeOptions: supplied.nativeOptions ?? {}, cwd: supplied.cwd, input: supplied.input ?? '', history: supplied.history ?? [],
+      nativeOptions: supplied.nativeOptions ?? {}, claudeWorkflowOptions: supplied.claudeWorkflowOptions ?? {}, cwd: supplied.cwd, input: supplied.input ?? '', history: supplied.history ?? [],
       ...(supplied.inputCapture ? { inputCapture: supplied.inputCapture } : {}), ...(supplied.throughSeq !== undefined ? { throughSeq: supplied.throughSeq } : {}) };
     const { template, roleOverrides } = resolveRoleConfig(data.template, data.roleOverrides ?? {}, data.models);
     const parameters = resolveParameters(template, data.parameters);
@@ -392,7 +392,10 @@ class WorkflowExecution {
     if (this.jobs.has(key)) return clone(await this.jobs.get(key));
     const slots = this.options.nativeOptions;
     const nativeOptions = Object.hasOwn(slots, 'codex') || Object.hasOwn(slots, 'claude') ? slots[role.engine] ?? {} : slots;
-    const claudeOptions = role.engine === 'claude' ? normalizeClaudeSessionOptions(this.binding({ roleId: input.roleId, cwd, purpose: input.purpose ?? 'default', requestedModel: role.model }).value?.claudeOptions) : undefined;
+    const claudeOptions = role.engine === 'claude' ? normalizeClaudeSessionOptions({
+      ...this.binding({ roleId: input.roleId, cwd, purpose: input.purpose ?? 'default', requestedModel: role.model }).value?.claudeOptions,
+      ...(Object.hasOwn(this.options.claudeWorkflowOptions ?? {}, 'effort') ? { effort: this.options.claudeWorkflowOptions.effort } : {}),
+    }) : undefined;
     const proposed = frozen({ roleId: input.roleId, stepId: input.stepId, round, engine: role.engine,
       prompt: input.prompt, cwd, access, instructions: input.instructions ?? role.prompt, requestedModel: role.model, nativeOptions,
       ...(this.options.inputCapture && (Object.hasOwn(input.inputValues ?? {}, 'request') || Object.hasOwn(input.inputValues?.workflowContext ?? {}, 'request')) ? { inputCapture: this.options.inputCapture } : {}),

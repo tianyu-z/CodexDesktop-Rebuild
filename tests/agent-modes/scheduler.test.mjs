@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { WorkflowScheduler, roleBindingKey as bindingKey } from '../../runtime/agent-modes/orchestration/scheduler.mjs';
+import { RoleRunner } from '../../runtime/agent-modes/orchestration/role-runner.mjs';
+import { ClaudeAdapter } from '../../runtime/agent-modes/claude-adapter.mjs';
 import { renderInputs } from '../../runtime/agent-modes/orchestration/inputs.mjs';
 import { BUILTIN_TEMPLATES, BUILTIN_TEMPLATE_REVISIONS } from '../../runtime/agent-modes/templates/builtins.mjs';
 
@@ -56,6 +58,90 @@ test('Claude binding options are scoped and frozen for fresh invocations, retrie
   await until(() => restartedRunner.calls.length === 1);
   assert.deepEqual(restartedRunner.calls[0].claudeOptions, { effort: 'high', thinking: { type: 'disabled' } });
   await restarted.interrupt();
+});
+
+for (const effort of ['high', null]) test(`shared Claude workflow effort ${effort ?? 'Auto'} overrides every role while preserving other session options`, async () => {
+  const t = template(); t.roles.b = role('claude');
+  t.steps.splice(2, 0, { id: 'other', type: 'run', role: 'b', inputs: ['request'] });
+  t.steps.at(-1).dependsOn.push('other');
+  const key = roleId => roleBindingKey({ template: t, roleId, cwd: '/tmp/non-git' });
+  const bindings = {
+    [key('a')]: { engine: 'claude', claudeOptions: { effort: 'max', thinking: { type: 'adaptive' }, outputStyle: 'concise' } },
+    [key('b')]: { engine: 'claude', claudeOptions: { effort: 'low', thinking: { type: 'disabled' } } },
+  };
+  const shared = { effort }, runner = harness();
+  const run = new WorkflowScheduler({ runner }).start(options({ template: t, bindings, claudeWorkflowOptions: shared, nativeOptions: { effort: 'medium' } }));
+  try {
+    shared.effort = 'low';
+    await until(() => runner.calls.length === 2);
+    assert.deepEqual(run.snapshot().config.claudeWorkflowOptions, { effort });
+    assert.equal(runner.calls.find(call => call.engine === 'codex').nativeOptions.effort, 'medium');
+    assert.equal(runner.calls.find(call => call.engine === 'codex').claudeOptions, undefined);
+    assert.deepEqual(runner.calls.find(call => call.roleId === 'a').claudeOptions, { effort, thinking: { type: 'adaptive' }, outputStyle: 'concise' });
+    await finishRemaining(run, runner);
+    assert.deepEqual(runner.calls.find(call => call.roleId === 'b').claudeOptions, { effort, thinking: { type: 'disabled' } });
+    assert.ok(runner.calls.filter(call => call.engine === 'claude').every(call => call.claudeOptions.effort === effort));
+    assert.equal(run.snapshot().bindings[key('a')].claudeOptions.effort, 'max', 'shared overrides do not overwrite legacy role bindings');
+  } finally { await run.interrupt(); }
+});
+
+test('shared Claude workflow effort survives retries, recovery and roles first invoked after recovery', async () => {
+  const t = template(), key = roleBindingKey({ template: t, roleId: 'a', cwd: '/tmp/non-git' });
+  const runner = harness(), run = new WorkflowScheduler({ runner }).start(options({ template: t, claudeWorkflowOptions: { effort: 'high' }, bindings: { [key]: { engine: 'claude', claudeOptions: { effort: 'max', thinking: { type: 'disabled' } } } } }));
+  let saved, failed;
+  try {
+    await until(() => runner.calls.length === 2);
+    assert.equal(runner.calls[1].claudeOptions.effort, 'high');
+    runner.calls[0].complete(); runner.calls[1].complete({ status: 'failed' });
+    await until(() => run.snapshot().status === 'blocked');
+    failed = run.snapshot().runs.find(row => row.status === 'failed');
+    assert.equal(run.retry(failed.id), true);
+    await until(() => runner.calls.length === 3);
+    assert.equal(runner.calls[2].claudeOptions.effort, 'high');
+    runner.calls[2].complete({ status: 'failed' });
+    await until(() => run.snapshot().runs.filter(row => row.status === 'failed').length === 2);
+    saved = run.snapshot(); failed = saved.runs.at(-1);
+  } finally { await run.interrupt(); }
+  const recoveredRunner = harness(), recovered = new WorkflowScheduler({ runner: recoveredRunner }).start(options({ previousSnapshot: saved, retryRunId: failed.id, claudeWorkflowOptions: { effort: null }, bindings: { [key]: { engine: 'claude', claudeOptions: { effort: 'low', thinking: { type: 'adaptive' } } } } }));
+  try {
+    await until(() => recoveredRunner.calls.length === 1);
+    assert.deepEqual(recoveredRunner.calls[0].claudeOptions, { effort: 'high', thinking: { type: 'disabled' } });
+    recoveredRunner.calls[0].complete(); await until(() => recoveredRunner.calls.length === 2);
+    assert.equal(recoveredRunner.calls[1].claudeOptions.effort, 'high');
+    assert.equal(recovered.snapshot().config.claudeWorkflowOptions.effort, 'high');
+    await finishRemaining(recovered, recoveredRunner);
+  } finally { await recovered.interrupt(); }
+});
+
+for (const effort of ['high', null]) test(`shared Claude workflow effort ${effort ?? 'Auto'} reaches every native query through the real role runner`, async () => {
+  const t = template(); t.roles.c = role('claude');
+  const queries = [], key = roleBindingKey({ template: t, roleId: 'a', cwd: '/tmp/non-git' });
+  const adapter = new ClaudeAdapter({ environment: () => ({}), queryImpl: request => {
+    const record = { options: request.options, order: [] }; queries.push(record);
+    const stream = (async function* () {
+      await request.prompt.next(); record.order.push('input');
+      yield { type: 'result', subtype: 'success', is_error: false, result: 'Done', uuid: `result-${queries.length}`, num_turns: 1, usage: {}, modelUsage: {} };
+    })();
+    return Object.assign(stream, {
+      initializationResult: async () => { record.order.push('initialize'); return {}; },
+      applyFlagSettings: async settings => { record.order.push('reset'); assert.deepEqual(settings, { effortLevel: null }); },
+      close() {},
+    });
+  } });
+  const run = new WorkflowScheduler({ runner: new RoleRunner({ claudeAdapter: adapter }) }).start(options({ template: t, claudeWorkflowOptions: { effort }, nativeOptions: { effort: 'low' },
+    bindings: { [key]: { engine: 'claude', claudeOptions: { effort: 'max', thinking: { type: 'adaptive' }, outputStyle: 'Concise' } } } }));
+  try {
+    await until(() => ['completed', 'failed', 'blocked'].includes(run.snapshot().status));
+    assert.equal(run.snapshot().status, 'completed');
+    assert.equal(queries.length, 3);
+    for (const query of queries) {
+      assert.equal(query.options.effort, effort ?? undefined);
+      assert.deepEqual(query.order, effort === null ? ['initialize', 'reset', 'input'] : ['input']);
+    }
+    const styled = queries.filter(query => query.options.settings.outputStyle === 'Concise');
+    assert.equal(styled.length, 2);
+    assert.ok(styled.every(query => query.options.thinking.type === 'adaptive'));
+  } finally { await run.interrupt(); await adapter.close(); }
 });
 
 test('completed native session option changes merge only into their exact Claude role binding', async () => {

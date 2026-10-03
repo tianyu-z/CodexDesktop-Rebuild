@@ -100,6 +100,7 @@ export class WorkflowRouter {
     if (history[0] && (omitted || history[0].text.length > 60000)) history[0].text = `[Earlier public history: ${historyPath}]\n${history[0].text.slice(-60000)}`;
     const config = { mode: 'both', models: selected.models, roleOverrides: selected.roleOverrides, template: selected.template, parameters: selected.parameters,
       claudePermissionMode: params.claudePermissionMode === undefined ? chat.claudePermissionMode : params.claudePermissionMode,
+      claudeWorkflowOptions: clone(chat.claudeWorkflowOptions ?? {}),
       nativeOptions, cwd: chat.cwd, input, history, throughSeq: chat.nextSeq - 1 };
     this.store.beginWorkflow(id, { id: idRun, turn, config });
     this.launch(id, idRun, turn, config);

@@ -38,6 +38,22 @@ test('standard Anthropic models accept custom deployment IDs without Claude name
   assert.deepEqual(result.models.map(row => row.value), ['claude-new-family-100', 'custom/deployment-v42']);
 });
 
+test('provider capability metadata is preserved only when explicitly advertised and sanitized', async () => {
+  const result = await discoverProviderModels({ env: foundry, fetchImpl: async () => page([
+    { id: 'claude-explicit', supportsEffort: true, supportedEffortLevels: ['low', 'high', 'high', null, 'unsafe level'], supportsAdaptiveThinking: false, apiKey: 'must-not-escape' },
+    { id: 'claude-generic', capabilities: { inference: true, chat_completion: true } },
+    { id: 'claude-disabled', supportsEffort: false, supportedEffortLevels: [] },
+  ]) });
+  assert.equal(result.models[0].supportsEffort, true);
+  assert.deepEqual(result.models[0].supportedEffortLevels, ['low', 'high']);
+  assert.equal(result.models[0].supportsAdaptiveThinking, false);
+  assert.equal(result.models[0].apiKey, undefined);
+  assert.equal(result.models[1].supportsEffort, undefined);
+  assert.equal(result.models[1].supportedEffortLevels, undefined);
+  assert.equal(result.models[2].supportsEffort, false);
+  assert.deepEqual(result.models[2].supportedEffortLevels, []);
+});
+
 test('Foundry excludes explicitly non-chat models and accepts custom IDs with a Claude family', async () => {
   const result = await discoverProviderModels({ env: foundry, fetchImpl: async () => page([
     { id: 'claude-chat' },

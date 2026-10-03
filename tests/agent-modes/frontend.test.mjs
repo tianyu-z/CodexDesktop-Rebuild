@@ -11,6 +11,34 @@ function load({ now } = {}) {
 const draft = () => ({ node: {}, value: { kind: 'new' } });
 const plain = x => JSON.parse(JSON.stringify(x));
 
+test('Claude effort follows draft capture, prewarm and retry without crossing hosts or engines', () => {
+  const api = load(), scope = draft(), manager = { getHostId: () => 'local' };
+  api.setDraftSelection(scope, { engineMode: 'claude', engineModel: 'opus', claudeEffort: 'max' });
+  const fields = api.capture(scope, 'local');
+  assert.equal(fields.claudeEffort, 'max');
+  assert.equal(api.capture(scope, 'remote').claudeEffort, undefined);
+  api.noteStarted(manager, 'prewarm', fields);
+  assert.equal(api.turnRequestFields(manager, 'prewarm', {}, 'message').claudeEffort, 'max');
+  api.setDraftSelection(scope, { engineMode: 'codex' });
+  assert.equal(api.capture(scope, 'local').claudeEffort, undefined);
+  api.setDraftSelection(scope, { engineMode: 'claude', claudeEffort: null });
+  assert.equal(api.capture(scope, 'local').claudeEffort, null);
+});
+
+test('effort save failure preserves the acknowledged setting', async () => {
+  const api = load(), scope = draft(); let fail = false;
+  const manager = { getHostId: () => 'local', sendRequest: async (_method, params) => {
+    if (fail) throw Error('Cannot save');
+    assert.equal(params.claudeEffort, 'high');
+    return { engineMode: 'claude', claudeSessionOptions: { effort: params.claudeEffort } };
+  } };
+  const context = { scope, threadId: 'a', hostId: 'local', manager };
+  await api.changeSelection(context, { engineMode: 'claude', claudeEffort: 'high' });
+  fail = true;
+  await assert.rejects(api.changeSelection(context, { engineMode: 'claude', claudeEffort: 'max' }));
+  assert.equal(api.getSnapshot(scope, 'a', 'local').claudeSessionOptions.effort, 'high');
+});
+
 test('draft engine and Claude model stay scoped; Codex carries no Claude model override', () => {
   const api = load(), a = draft(), b = draft();
   api.setDraftSelection(a, { engineMode: 'claude', engineModel: 'opus' });
@@ -96,6 +124,20 @@ function componentHarness(api, { mode = 'codex', busy = false, hostId = 'local',
   const nativeModelPicker = { native: true };
   return { tree: api.Selector({ React, jsx, scope, threadId, hostId, cwd, getHost: () => hostId, getManager: () => manager, useAtom: atom => atom === 'runtime' ? { type: busy ? 'active' : 'idle' } : atom === 'requests' ? [] : false, busyAtom: 'inProgress', runtimeStatusAtom: 'runtime', requestsAtom: 'requests', nativeModelPicker }), nativeModelPicker };
 }
+
+test('draft model and engine menus clear unsupported inherited effort before first submission', async () => {
+  const api = load(), scope = draft();
+  const manager = { getHostId: () => 'local', sendRequest: async () => ({ engines: ['codex', 'claude'], claudeModels: [{ value: 'opus', supportsEffort: true, supportedEffortLevels: ['max'] }, { value: 'provider-only' }] }) };
+  await api.refreshCapabilities(manager, { hostId: 'local' });
+  const render = () => componentHarness(api, { scope, manager, threadId: null, seed: false }).tree;
+  api.setDraftSelection(scope, { engineMode: 'claude', engineModel: 'opus', claudeEffort: 'max' });
+  render().props.children[1].props.onChange({ target: { value: 'provider-only' } });
+  assert.equal(api.capture(scope, 'local').claudeEffort, null);
+  api.setDraftSelection(scope, { engineMode: 'claude', engineModel: 'opus', claudeEffort: 'max' });
+  api.setDraftSelection(scope, { engineMode: 'both', engineModels: { claude: 'provider-only' } });
+  render().props.children[0].props.onChange({ target: { value: 'claude' } });
+  assert.equal(api.capture(scope, 'local').claudeEffort, null);
+});
 
 test('selector preserves native Codex picker and presents reserved Both as disabled', () => {
   const api = load(), { tree, nativeModelPicker } = componentHarness(api);
