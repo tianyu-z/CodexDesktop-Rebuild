@@ -35,6 +35,7 @@ async function build({ sourceApp = '/Applications/chatgpt-dev.app', output = pat
   const bootstrap = path.join(stagedAsar, '.vite', 'build', 'early-bootstrap.js');
   fs.writeFileSync(bootstrap, patchBootstrap(fs.readFileSync(bootstrap, 'utf8')));
   fs.copyFileSync(path.join(ROOT, 'scripts', 'assets', 'agent-modes-bootstrap.cjs'), path.join(stagedAsar, '.vite', 'build', 'agent-modes-bootstrap.cjs'));
+  require('./patch-computer-use-runtime.js').patchComputerUseBuild(stagedAsar);
   const buildInfo = { feature: 'conversation-engine-modes', sourceVersion: version, appName, createdAt: new Date().toISOString() };
   if (!fs.existsSync(output)) execFileSync('/bin/cp', ['-cR', sourceApp, output]);
   else {
