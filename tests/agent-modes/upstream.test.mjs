@@ -106,6 +106,9 @@ test('a terminal turn resolves only its unanswered native approvals', { timeout:
       if (message.method === 'fixture/complete') {
         send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'old-turn', status: 'interrupted' } } });
         send({ id: message.id, result: {} });
+      } else if (message.method === 'fixture/malformed') {
+        send({ method: 'turn/completed', params: { turn: { status: 'interrupted' } } });
+        send({ id: message.id, result: {} });
       } else if (message.method === 'fixture/late-resolution') {
         send({ method: 'serverRequest/resolved', params: { threadId: 'thread-1', requestId: 11 } });
         send({ id: message.id, result: {} });
@@ -113,12 +116,17 @@ test('a terminal turn resolves only its unanswered native approvals', { timeout:
     });
     send({ id: 11, method: 'item/commandExecution/requestApproval', params: { threadId: 'thread-1', turnId: 'old-turn' } });
     send({ id: 12, method: 'item/commandExecution/requestApproval', params: { threadId: 'thread-1', turnId: 'new-turn' } });
+    send({ id: 13, method: 'item/commandExecution/requestApproval', params: {} });
+    send({ id: 14, method: 'item/commandExecution/requestApproval', params: { threadId: 'thread-2', turnId: 'old-turn' } });
   `;
   const client = new NativeClient({ command: process.execPath, args: ['-e', script], env: process.env,
-    onRequest: message => { requests.push(message); if (requests.length === 2) resolveRequests(); },
+    onRequest: message => { requests.push(message); if (requests.length === 4) resolveRequests(); },
     onNotification: message => { notifications.push(message); if (message.method === 'turn/completed') resolveCompleted(); } });
   t.after(() => client.close());
   await received;
+  await client.request('fixture/malformed', {});
+  assert.equal(notifications.filter(message => message.method === 'serverRequest/resolved').length, 0);
+  assert.equal(client.serverRequests.size, 4);
   await client.request('fixture/complete', {});
   await completed;
   const old = requests.find(request => request.params.turnId === 'old-turn');
@@ -128,6 +136,8 @@ test('a terminal turn resolves only its unanswered native approvals', { timeout:
   ]);
   assert.equal(client.respond({ id: old.id, result: { decision: 'accept' } }), false);
   assert.equal(client.respond({ id: live.id, result: { decision: 'decline' } }), true);
+  assert.equal(client.respond({ id: requests.find(request => request.params.threadId == null).id, result: { decision: 'decline' } }), true);
+  assert.equal(client.respond({ id: requests.find(request => request.params.threadId === 'thread-2').id, result: { decision: 'decline' } }), true);
   await client.request('fixture/late-resolution', {});
   assert.equal(notifications.filter(message => message.method === 'serverRequest/resolved').length, 1);
 });

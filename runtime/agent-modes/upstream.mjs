@@ -51,7 +51,9 @@ export class NativeClient {
           this.serverRequestIds.delete(nativeId); this.serverRequests.delete(requestId);
           message = { ...message, params: { ...message.params, requestId } };
         }
-        if (message.method === 'turn/completed' && ['completed', 'failed', 'interrupted'].includes(message.params?.turn?.status)) {
+        if (message.method === 'turn/completed' && ['completed', 'failed', 'interrupted'].includes(message.params?.turn?.status)
+            && typeof message.params.threadId === 'string' && message.params.threadId.trim()
+            && typeof message.params.turn.id === 'string' && message.params.turn.id.trim()) {
           const { threadId, turn } = message.params;
           for (const [requestId, request] of this.serverRequests) {
             if (request.threadId !== threadId || request.turnId !== turn.id) continue;
