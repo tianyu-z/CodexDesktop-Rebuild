@@ -139,17 +139,95 @@ new desktop PID 27547 was verified at `2026-10-07T18:29:28.064357+00:00`.
 The official local desktop PID 99053 and native PID 99152 were preserved.
 The restarted development UI was subsequently verified as running.
 
-**Local activation is complete; remote activation is blocked by SSH key
-signing, not by missing user authorization.** Before and after the local
-restart, rno login failed with `Permission denied (publickey)` and Secretive
-`agent refused operation` / `communication with agent failed`. The same
-failure was visible in the development UI before restart. The user was asked
-to complete local Secretive/Touch ID authentication. No remote gateway stop
-was attempted, and current remote runtime/permissions could not be freshly
-verified. Once authentication is restored, continue with read-only inspection,
-stop only the old scoped development gateway if still necessary, activate the
-new runtime, and verify the shared daemon plus the affected chat's actual
-permission state. Existing authorization covers that migration.
+The first local restart could not complete the remote migration: Secretive
+returned `agent refused operation` / `communication with agent failed`, ending
+in `Permission denied (publickey)`. On the user's subsequent retry, an existing
+SSH master was usable and remote migration proceeded.
+
+At `2026-10-07T20:46Z`, scoped gateway `chatgpt-dev-4027ac0d116d` was switched to
+runtime `610a9fa145d4c627dc4df78cdf00cbcadfa516f3eb2be0189b31811f86dceae6`.
+Old gateway/native PIDs 4110941/4111030 exited. New gateway PID 3403812 uses
+bridge PID 3404245 and official proxy PID 3404306. The bridge attaches to
+`.codex/app-server-control/app-server-control.sock`. Official daemon PID 20516
+retained its original starttime 8081145. Unrelated gateway scopes were not
+stopped. Desktop PID 27547 was quit normally and the release launched as
+PID 44586. The official local desktop/native PIDs 99053/99152 remained alive.
+
+A bare `thread/resume` through the actual new gateway returned
+**workspaceWrite / on-request**, with the affected chat active and the original
+`09cb2759-0e22-4530-b319-34632f525e5b` approval still pending. The check expecting
+Full access correctly failed; persisted disabled/never values did not reflect
+the existing official owner's in-memory state. This strengthens the two-owner
+diagnosis and means migration alone cannot complete an already pending native
+request. No model turn or permission override was sent by the probe.
+
+## Additional legacy picker correction
+
+Live UI verification exposed another independent mismatch. The successful
+resume log at `2026-10-07T20:52:28.465Z` records `:workspace / on-request`, yet
+the legacy permission picker still displayed Full access. Its `KG` hook chose
+the host's stored mode ahead of the restored chat's `threadMode`, and prepared
+an implicit override for the next turn. Commit `3b0d9e9` changes that precedence:
+existing chats use their own permitted mode, including explicit next-turn
+settings; new chats retain host defaults. Loaded policy requirements and
+model-required Guardian mode retain priority. Registered custom profile
+identity is preserved.
+
+Captured production-hook tests failed in three cases before the correction:
+restricted chat versus Full access host default, Full access chat versus
+restricted host default, and custom profile. Review caught an allowed-policy
+fallback regression; its new test failed before adding the policy guard.
+Final root and original-workspace runs both passed **23/23**. Independent
+review approved the guarded implementation. Evidence:
+`.artifacts/permission-picker-regressions.log` and
+`.artifacts/source-picker-merge/tests.log`.
+
+The frontend-only update is signed and installed. New ASAR SHA-256:
+`ae2667da4c61c1973a777ab59b3b224a8aacaf1af07e6d3d071364961c54a7eb`.
+All 8,618 unrelated ASAR files were verified unchanged; the entire runtime
+inventory, including remote archive 610a9fa, stayed identical. Its prior bundle
+is parked at `/Applications/.chatgpt-dev-before-permission-picker.app`, with an
+independent backup in `.artifacts/rollback-permission-picker-20261007/`.
+
+**Remote shared-owner activation is verified. The additional picker patch is
+installed but its UI activation remains pending manual Mac unlock.** At
+`2026-10-07T21:15:28Z`, Computer Use returned `The Mac is locked and automatic
+unlock could not unlock it`; the attempted GUI quit did not run. PID 44586
+therefore still holds the earlier frontend. The user was asked to unlock the
+Mac. Existing authorization covers the subsequent normal restart and checks.
+
+## Connection investigation during activation
+
+SSH authentication and ongoing SSH transport latency are distinct failures.
+The app reconnected to rno, then repeatedly encountered
+`REMOTE_HEARTBEAT_TIMEOUT` / `desktop-inbound`; one separate startup stalled
+at `auto-mux: Trying existing master` before session acknowledgement. There is
+no evidence that the incidental remote `.gitconfig` lock warning caused this:
+another heartbeat failure lacked that warning.
+
+A read-only 75-message echo test through the exact login wrapper and existing
+SSH master, with the remote shell replaced by `/bin/cat`, reproduced severe
+latency outside the application/gateway: session acknowledgement 26.051s,
+marker 37.433s, RTT p50 17.801s, p95 25.504s, max 27.868s. All 75 replies
+arrived; local send scheduling and write callbacks remained responsive. Early
+samples were 0.187–0.814s, then rose after the app connection reopened. Both the
+official app and dev app were verified sharing SSH master PID 42003. The route
+to rno used utun4; four ICMP probes had 0% loss and 491–677ms RTT. Shared SSH
+traffic, remote scheduling, and tunnel/TCP congestion still need a controlled
+comparison; a single specific bottleneck has not been proven.
+
+The heartbeat timer starts when a ping is queued, not when it is delivered,
+so its direction label alone does not identify which side stalled. No timeout
+was inflated and no SSH config was changed without evidence. A separate fresh
+connection was attempted once and rejected by Secretive; the later Mac-lock
+finding is consistent with authentication being unavailable while locked.
+Next verification: compare echo delay with dev closed, then reopen the patched
+frontend and inspect the affected chat's permission label and connection.
+
+Evidence: `.artifacts/rno-ssh-latency-2026-10-07T21-10-43-427Z.json`,
+`.artifacts/rno-permission-live-after-activation.json`,
+`.artifacts/rno-permission-owner-live-resume.json`, and
+`.artifacts/permission-picker-release/build-manifest.json`.
 
 No approvals were auto-answered, no permission selector was changed, and the
 old nonterminal approval was not fabricated as completed.
