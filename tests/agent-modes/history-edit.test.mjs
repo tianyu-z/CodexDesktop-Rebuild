@@ -14,11 +14,11 @@ const turn = (id, text) => ({ id, status: 'completed', items: [
   { id: `${id}:user`, type: 'userMessage', content: [{ type: 'text', text }] },
   { id: `${id}:answer`, type: 'agentMessage', text: `Answer: ${text}` },
 ] });
-function fixture(t, engines = ['claude', 'claude', 'claude']) {
+function fixture(t, engines = ['claude', 'claude', 'claude'], { historyMode = 'paginated' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'history-edit-'));
   const store = new ConversationStore(dir), calls = [], events = [], runs = [], nativeThreads = new Map();
   const rows = engines.map((engine, i) => ({ engine, turn: turn(`turn-${i}`, `MARKER-${i}`) }));
-  const source = { id: 'source', cwd: dir, historyMode: 'paginated', turns: rows.filter(row => row.engine === 'codex').map(row => row.turn), status: { type: 'idle' }, createdAt: 1, updatedAt: 1 };
+  const source = { id: 'source', cwd: dir, historyMode, turns: rows.filter(row => row.engine === 'codex').map(row => row.turn), status: { type: 'idle' }, createdAt: 1, updatedAt: 1 };
   nativeThreads.set(source.id, structuredClone(source));
   store.ensureThread({ ...source, turns: [] }, { mode: engines.at(-1), claudePermissionMode: 'plan' });
   for (const row of rows) store.putTurn(source.id, row.turn, { engine: row.engine });
@@ -41,6 +41,7 @@ function fixture(t, engines = ['claude', 'claude', 'claude']) {
       return { thread: { ...structuredClone(fork), turns: [] }, model: 'codex-test', cwd: dir };
     }
     if (method === 'thread/revert' || method === 'thread/rollback') {
+      if (method === 'thread/rollback' && thread.historyMode === 'paginated') throw Object.assign(new Error('paginated threads do not support thread/rollback'), { code: -32600 });
       const end = method === 'thread/revert' ? thread.turns.findIndex(row => row.id === params.beforeTurnId) : thread.turns.length - params.numTurns;
       assert.ok(end >= 0, 'Native history boundary must belong to Codex');
       thread.turns = thread.turns.slice(0, end);
@@ -58,6 +59,69 @@ function fixture(t, engines = ['claude', 'claude', 'claude']) {
   t.after(async () => { await router.close(); rmSync(dir, { recursive: true, force: true }); });
   return { store, router, native, nativeThreads, calls, events, runs, dir };
 }
+
+test('pure Codex paginated rollback removes the native suffix with revert', async t => {
+  const f = fixture(t, ['codex', 'codex', 'codex']);
+  const edited = await f.router.request('thread/rollback', { threadId: 'source', numTurns: 1 });
+  assert.deepEqual(edited.thread.turns.map(row => row.id), ['turn-0', 'turn-1']);
+  assert.equal(edited.thread.historyMode, 'legacy');
+  assert.deepEqual(f.calls.filter(call => ['thread/revert', 'thread/rollback'].includes(call.method)), [
+    { method: 'thread/revert', params: { threadId: 'source', beforeTurnId: 'turn-2' } },
+  ]);
+  assert.deepEqual(f.nativeThreads.get('source').turns.map(row => row.id), ['turn-0', 'turn-1']);
+  const read = await f.router.request('thread/read', { threadId: 'source', includeTurns: true });
+  const page = await f.router.request('thread/turns/list', { threadId: 'source', sortDirection: 'asc', itemsView: 'full' });
+  assert.deepEqual(read.thread.turns.map(row => row.id), ['turn-0', 'turn-1']);
+  assert.deepEqual(page.data.map(row => row.id), ['turn-0', 'turn-1']);
+  await f.router.request('turn/start', { threadId: 'source', input: [{ type: 'text', text: 'EDITED' }] });
+  const input = f.calls.find(call => call.method === 'turn/start').params.input.map(item => item.text).join('\n');
+  assert.match(input, /EDITED/);
+  assert.doesNotMatch(input, /MARKER-2/);
+  assert.deepEqual(f.store.get('source').turns.map(row => row.turn.id), ['turn-0', 'turn-1', 'new-codex']);
+  // A late completion and stale native page must not revive the removed turn.
+  f.router.nativeNotification({ method: 'turn/completed', params: { threadId: 'source', turn: turn('turn-2', 'MARKER-2') } });
+  f.nativeThreads.get('source').turns.push(turn('turn-2', 'MARKER-2'));
+  const reread = await f.router.request('thread/read', { threadId: 'source', includeTurns: true });
+  const repage = await f.router.request('thread/turns/list', { threadId: 'source', sortDirection: 'asc', itemsView: 'full' });
+  assert.deepEqual(reread.thread.turns.map(row => row.id), ['turn-0', 'turn-1', 'new-codex']);
+  assert.deepEqual(repage.data.map(row => row.id), ['turn-0', 'turn-1', 'new-codex']);
+});
+
+test('pure Codex paginated rollback can remove the first turn', async t => {
+  const f = fixture(t, ['codex', 'codex', 'codex']);
+  const edited = await f.router.request('thread/rollback', { threadId: 'source', numTurns: 3 });
+  assert.deepEqual(edited.thread.turns, []);
+  assert.deepEqual(f.nativeThreads.get('source').turns, []);
+  assert.deepEqual(f.calls.filter(call => ['thread/revert', 'thread/rollback'].includes(call.method)), [
+    { method: 'thread/revert', params: { threadId: 'source', beforeTurnId: 'turn-0' } },
+  ]);
+  const read = await f.router.request('thread/read', { threadId: 'source', includeTurns: true });
+  const page = await f.router.request('thread/turns/list', { threadId: 'source', sortDirection: 'asc', itemsView: 'full' });
+  assert.deepEqual(read.thread.turns, []);
+  assert.deepEqual(page.data, []);
+});
+
+test('pure Codex paginated rollback rejects invalid counts and active turns before mutation', async t => {
+  const f = fixture(t, ['codex', 'codex', 'codex']);
+  for (const numTurns of [0, -1, 1.5, 4, '1']) {
+    await assert.rejects(f.router.request('thread/rollback', { threadId: 'source', numTurns }), /turn count/i);
+  }
+  f.store.beginRun('source', { id: 'active', engine: 'codex', turnId: 'turn-2' });
+  await assert.rejects(f.router.request('thread/rollback', { threadId: 'source', numTurns: 1 }), /active|progress/i);
+  assert.deepEqual(f.calls.filter(call => ['thread/revert', 'thread/rollback'].includes(call.method)), []);
+  assert.deepEqual(f.nativeThreads.get('source').turns.map(row => row.id), ['turn-0', 'turn-1', 'turn-2']);
+  f.store.finishRun('source', 'active');
+});
+
+test('pure Codex legacy rollback retains native rollback behavior', async t => {
+  const f = fixture(t, ['codex', 'codex', 'codex'], { historyMode: 'legacy' });
+  const edited = await f.router.request('thread/rollback', { threadId: 'source', numTurns: 1 });
+  assert.deepEqual(edited.thread.turns.map(row => row.id), ['turn-0', 'turn-1']);
+  assert.deepEqual(f.calls.filter(call => ['thread/revert', 'thread/rollback'].includes(call.method)), [
+    { method: 'thread/rollback', params: { threadId: 'source', numTurns: 1 } },
+  ]);
+  assert.deepEqual(f.nativeThreads.get('source').turns.map(row => row.id), ['turn-0', 'turn-1']);
+});
 
 test('editing Claude history snapshots the old version and resumes only the retained prefix', async t => {
   const f = fixture(t);
