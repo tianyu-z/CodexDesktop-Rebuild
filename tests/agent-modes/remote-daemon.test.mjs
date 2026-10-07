@@ -7,7 +7,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import WebSocket from '../../runtime/agent-modes/node_modules/ws/wrapper.mjs';
+import WebSocket, { WebSocketServer } from '../../runtime/agent-modes/node_modules/ws/wrapper.mjs';
 import { startRemoteServer } from '../../runtime/agent-modes/remote/server.mjs';
 const daemon = fileURLToPath(new URL('../../runtime/agent-modes/remote/daemon.mjs', import.meta.url));
 
@@ -110,7 +110,27 @@ test('concurrent remote ensure and direct serve keep one reachable owner and sup
   const root = mkdtempSync(join(tmpdir(), 'cdx-daemon-test-')), command = join(root, 'codex');
   const nativeCalls = join(root, 'native-calls.jsonl');
   writeFileSync(nativeCalls, '');
-  writeFileSync(command, '#!' + process.execPath + '\nconst fs=require("node:fs"),args=process.argv.slice(2),log=' + JSON.stringify(nativeCalls) + ';fs.appendFileSync(log,JSON.stringify(args)+"\\n");if(args.includes("sandbox")){if(!args.includes("use_legacy_landlock")){if(fs.readFileSync(log,"utf8").trim().split("\\n").length===1)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,12500);console.error("bwrap: Failed to make / slave: Permission denied");process.exit(1)}process.exit(0)}\nif(args.includes("daemon")){console.log(JSON.stringify({status:"alreadyRunning",socketPath:"/tmp/fixture-official.sock"}));process.exit(0)}\nif(args.includes("proxy")){const {createServer}=require("node:http"),{Duplex}=require("node:stream"),{WebSocketServer}=require(' + JSON.stringify(fileURLToPath(new URL('../../runtime/agent-modes/node_modules/ws/index.js', import.meta.url))) + ');const server=createServer(),sockets=new WebSocketServer({noServer:true});server.on("upgrade",(req,socket,head)=>sockets.handleUpgrade(req,socket,head,ws=>sockets.emit("connection",ws)));sockets.on("connection",ws=>ws.on("message",bytes=>{const m=JSON.parse(bytes);if(m.id!=null)ws.send(JSON.stringify({id:m.id,result:{}}))}));server.emit("connection",Duplex.from({readable:process.stdin,writable:process.stdout}));return}\nprocess.exit(3);\n', { mode: 0o700 });
+  const sharedSocket = join(root, 'official.sock');
+  const sharedHttp = createServer(), shared = new WebSocketServer({ server: sharedHttp });
+  let connections = 0;
+  shared.on('connection', ws => {
+    connections++;
+    ws.on('message', bytes => { const m = JSON.parse(bytes); if (m.id != null) ws.send(JSON.stringify({ id: m.id, result: {} })); });
+  });
+  await new Promise(resolve => sharedHttp.listen(sharedSocket, resolve));
+  writeFileSync(command, `#!${process.execPath}
+const fs = require('node:fs'), args = process.argv.slice(2), log = ${JSON.stringify(nativeCalls)};
+fs.appendFileSync(log, JSON.stringify(args) + '\\n');
+if (args.includes('sandbox')) {
+  if (!args.includes('use_legacy_landlock')) {
+    if (fs.readFileSync(log, 'utf8').trim().split('\\n').length === 1) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 12500);
+    console.error('bwrap: Failed to make / slave: Permission denied'); process.exit(1);
+  }
+  process.exit(0);
+}
+if (args.includes('daemon')) { console.log(JSON.stringify({ status: 'alreadyRunning', socketPath: ${JSON.stringify(sharedSocket)} })); process.exit(0); }
+process.exit(3);
+`, { mode: 0o700 });
   const env = { ...process.env, CDX_ENGINE_STORE: join(root, 'store'), CDX_REMOTE_SCOPE: 'fixture', CDX_REAL_CODEX: command, CDX_CLAUDE_PATH: command };
   const children = [];
   const run = (action, overrides = {}) => {
@@ -126,7 +146,14 @@ test('concurrent remote ensure and direct serve keep one reachable owner and sup
       await new Promise(resolve => setTimeout(resolve, 20));
     }
   };
-  t.after(async () => { for (const child of children) if (child.exitCode === null) child.kill(); await stopOwner(); rmSync(root, { recursive: true, force: true }); });
+  t.after(async () => {
+    for (const child of children) if (child.exitCode === null) child.kill();
+    await stopOwner();
+    for (const ws of shared.clients) ws.terminate();
+    await new Promise(resolve => shared.close(resolve));
+    await new Promise(resolve => sharedHttp.close(resolve));
+    rmSync(root, { recursive: true, force: true });
+  });
   const readCalls = () => readFileSync(nativeCalls, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
   const starting = Promise.all(Array.from({ length: 5 }, () => run('ensure').done));
   const probeDeadline = Date.now() + 10000;
@@ -141,11 +168,12 @@ test('concurrent remote ensure and direct serve keep one reachable owner and sup
   assert.equal(contended.code, 0, contended.stderr);
   const pid = Number(readFileSync(join(root, 'store', '.gateway.lock'), 'utf8'));
   const nativeDeadline = Date.now() + 10000;
-  while (!readCalls().some(args => args.includes('proxy')) && Date.now() < nativeDeadline) await new Promise(resolve => setTimeout(resolve, 20));
+  while (!connections && Date.now() < nativeDeadline) await new Promise(resolve => setTimeout(resolve, 20));
   const calls = readCalls();
   assert.equal(calls.filter(args => args.includes('sandbox')).length, 2, 'Only the winning owner probes default and Landlock once');
   assert.ok(calls.some(args => JSON.stringify(args) === JSON.stringify(['-c', 'features.code_mode_host=true', 'app-server', 'daemon', 'start'])), 'Main native sessions attach to the official daemon');
-  assert.ok(calls.some(args => JSON.stringify(args) === JSON.stringify(['app-server', 'proxy', '--sock', '/tmp/fixture-official.sock'])), 'The gateway opens only a proxy to the shared daemon');
+  assert.equal(connections, 1, 'The winning gateway attaches directly to the existing shared socket');
+  assert.equal(calls.filter(args => args.includes('proxy')).length, 0, 'Attachment does not launch another CLI');
   assert.equal(calls.filter(args => args.includes('app-server') && !args.includes('daemon') && !args.includes('proxy')).length, 0, 'No private main native owner starts');
   const duplicate = await run('serve').done;
   assert.equal(duplicate.code, 0, duplicate.stderr);
@@ -159,4 +187,5 @@ test('concurrent remote ensure and direct serve keep one reachable owner and sup
   assert.equal(upgraded.code, 0, upgraded.stderr);
   assert.equal(JSON.parse(upgraded.stdout).version, 'upgraded');
   assert.equal((await run('stop').done).code, 0);
+  assert.equal(sharedHttp.listening, true, 'Stopping the gateway preserves the shared daemon');
 });

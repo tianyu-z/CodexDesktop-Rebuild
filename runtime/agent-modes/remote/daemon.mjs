@@ -141,7 +141,7 @@ async function main() {
   const sharedSocket = await ensureSharedNativeDaemon({ command, timeoutMs: Math.max(1000, deadline - performance.now()) });
   server = await startRemoteServer({ socketPath, version, closeLock: () => acquireStartupLock(join(socketDirectory, 'startup.lock')),
     runtimeFactory: ({ emit, onExit }) => createEngineRuntime({ command, args: ['-c', 'features.code_mode_host=true', 'app-server'], codexReadRoleArgs: [...sandboxArgs, 'app-server'],
-      nativeCommand: process.execPath, nativeArgs: [fileURLToPath(new URL('./shared-native.mjs', import.meta.url)), command, sharedSocket],
+      nativeCommand: process.execPath, nativeArgs: [fileURLToPath(new URL('./shared-native.mjs', import.meta.url)), sharedSocket],
       directory, emit, onExit, remote: true, claudePath: process.env.CDX_CLAUDE_PATH, environment: remoteClaudeEnvironment }) });
   } finally { await release(); }
   let closing;

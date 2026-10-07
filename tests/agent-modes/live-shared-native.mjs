@@ -1,8 +1,9 @@
 // CDX_LIVE_SHARED_NATIVE=1 node tests/agent-modes/live-shared-native.mjs rno
 // Uses a fresh temporary CODEX_HOME and creates no model turns.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,8 +23,22 @@ const { home, socket, cliVersion, appServerVersion } = JSON.parse(begin.stdout.t
 if (!/^\/tmp\/cd-[a-zA-Z0-9_-]+$/.test(home) || socket !== home + '/app-server-control/app-server-control.sock') throw Error('Unsafe temp daemon path.');
 assert.equal(cliVersion, '0.142.5'); assert.equal(appServerVersion, '0.142.5');
 const local = mkdtempSync(join(tmpdir(), 'cdx-bridge-probe-'));
-const wrapper = join(local, 'proxy');
-writeFileSync(wrapper, `#!/bin/sh\nexec ssh -T -o BatchMode=yes -o ConnectTimeout=8 ${host} 'CODEX_HOME=${home} ${cli} app-server proxy --sock ${socket}'\n`, { mode: 0o700 });
+const localSocket = join(local, 'native.sock');
+// Expose the isolated daemon's Unix socket locally without another Codex CLI.
+// This relay is test-only; production runs the bridge next to the native socket.
+const relayCode = `import socket,sys,threading\ns=socket.socket(socket.AF_UNIX);s.connect(${JSON.stringify(socket)})\ndef send():\n try:\n  while True:\n   b=sys.stdin.buffer.read1(65536)\n   if not b:break\n   s.sendall(b)\n finally:\n  try:s.shutdown(socket.SHUT_WR)\n  except OSError:pass\nthreading.Thread(target=send,daemon=True).start()\nwhile True:\n b=s.recv(65536)\n if not b:break\n sys.stdout.buffer.write(b);sys.stdout.buffer.flush()\ns.close()\n`;
+const quote = value => "'" + value.replace(/'/g, "'\\''") + "'";
+const relays = new Set();
+const relay = createServer(stream => {
+  const child = spawn('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', host, 'python3 -u -c ' + quote(relayCode)],
+    { stdio: ['pipe', 'pipe', 'inherit'] });
+  const entry = { child, stream }; relays.add(entry);
+  stream.pipe(child.stdin); child.stdout.pipe(stream);
+  stream.on('error', () => {}); child.stdin.on('error', () => stream.destroy());
+  child.on('error', () => stream.destroy());
+  child.on('close', () => { relays.delete(entry); stream.destroy(); });
+  stream.on('close', () => child.kill());
+});
 const clients = [];
 async function rpc(client, method, params) {
   console.log(JSON.stringify({ stage: 'request', method }));
@@ -32,13 +47,14 @@ async function rpc(client, method, params) {
   return result;
 }
 async function connect() {
-  const client = new NativeClient({ command: process.execPath, args: [bridge, wrapper, socket], env: process.env,
+  const client = new NativeClient({ command: process.execPath, args: [bridge, localSocket], env: process.env,
     onNotification: () => {}, onRequest: () => {}, requestTimeoutMs: 10000 });
   clients.push(client);
   await rpc(client, 'initialize', { clientInfo: { name: 'shared-bridge-isolated-probe', version: '1' }, capabilities: { experimentalApi: true } });
   return client;
 }
 try {
+  await new Promise((resolve, reject) => { relay.once('error', reject); relay.listen(localSocket, resolve); });
   const first = await connect();
   const created = await rpc(first, 'thread/start', { cwd: '/tmp', approvalPolicy: 'never', sandbox: 'danger-full-access' });
   // Persist the empty thread's rollout without starting an inference turn.
@@ -60,6 +76,8 @@ try {
     restrictedBareResume: true, readAfterFirstProxyClose: true, threadId: created.thread.id }));
 } finally {
   for (const client of clients) await client.close().catch(() => {});
+  for (const { child, stream } of relays) { stream.destroy(); child.kill(); }
+  await new Promise(resolve => relay.close(resolve));
   const cleanup = ssh(`import os,subprocess,shutil,sys\nhome=sys.argv[1];cli='${cli}'\nassert home.startswith('/tmp/cd-')\nenv=os.environ.copy();env['CODEX_HOME']=home\np=subprocess.run([cli,'app-server','daemon','stop'],env=env,capture_output=True,text=True,timeout=15)\nassert p.returncode==0,p.stderr\nprint(p.stdout.strip())\nshutil.rmtree(home)\n`, [home]);
   rmSync(local, { recursive: true, force: true });
   assert.equal(cleanup.status, 0, cleanup.stderr || cleanup.stdout);

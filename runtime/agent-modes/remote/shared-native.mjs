@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { Duplex } from 'node:stream';
+import { createConnection } from 'node:net';
 import { isAbsolute } from 'node:path';
 import { WebSocket } from 'ws';
 import { DESKTOP_REQUEST_BYTES, OWNER_RESPONSE_BYTES, OUTPUT_QUEUE_BYTES, HARD_OUTPUT_QUEUE_BYTES } from './limits.mjs';
@@ -47,20 +47,20 @@ export function ensureSharedNativeDaemon({ command, env = process.env, timeoutMs
   });
 }
 
-/** Adapt the gateway's JSON-line native client to the official daemon's stdio WebSocket proxy. */
-export function startSharedNativeBridge({ command, socketPath, env = process.env, input = process.stdin, output = process.stdout,
+/** Adapt the gateway's JSON-line client to the existing daemon's Unix WebSocket. */
+export function startSharedNativeBridge({ socketPath, input = process.stdin, output = process.stdout,
   timeoutMs = 5000, onError = error => console.error(error.message) }) {
-  if (!command || !socketPath) throw Error('Shared native daemon command and socket are required.');
-  const child = spawn(command, ['app-server', 'proxy', '--sock', socketPath], { env, stdio: ['pipe', 'pipe', 'pipe'] });
-  child.stderr.pipe(process.stderr, { end: false });
-  const transport = Duplex.from({ readable: child.stdout, writable: child.stdin });
-  Object.assign(transport, { setTimeout: () => transport, setNoDelay: () => transport, setKeepAlive: () => transport });
+  if (typeof socketPath !== 'string' || !isAbsolute(socketPath)) throw Error('An absolute shared native daemon socket is required.');
+  // A second CLI launch performs unrelated startup/temporary-directory work.
+  // On a shared home this can exceed the handshake deadline while the existing
+  // daemon is healthy. Its control socket already speaks the WebSocket protocol.
+  const transport = createConnection({ path: socketPath });
   const ws = new WebSocket('ws://codex-app-server/rpc', { createConnection: () => transport,
     handshakeTimeout: timeoutMs, maxPayload: OWNER_RESPONSE_BYTES, perMessageDeflate: false });
   let closed = false, ready = false, buffer = Buffer.alloc(0);
   let openingTimer;
-  const outboundBacklog = () => Math.max(ws.bufferedAmount, transport.writableLength ?? 0, child.stdin.writableLength ?? 0);
-  const fail = error => { if (closed) return; closed = true; clearTimeout(openingTimer); onError(error); ws.terminate(); child.kill(); transport.destroy(); input.destroy(); output.end(); };
+  const outboundBacklog = () => Math.max(ws.bufferedAmount, transport.writableLength ?? 0);
+  const fail = error => { if (closed) return; closed = true; clearTimeout(openingTimer); onError(error); ws.terminate(); transport.destroy(); input.destroy(); output.end(); };
   openingTimer = setTimeout(() => fail(Error('Shared native daemon handshake timed out.')), timeoutMs);
   const flush = () => {
     while (ready && buffer.length) {
@@ -80,9 +80,8 @@ export function startSharedNativeBridge({ command, socketPath, env = process.env
     else if (buffer.length > HARD_OUTPUT_QUEUE_BYTES) fail(Error('Shared native request queue is backlogged.'));
   };
   input.on('data', bytes => { buffer = Buffer.concat([buffer, bytes]); flush(); });
-  input.on('end', () => { closed = true; clearTimeout(openingTimer); ws.close(); child.kill(); });
-  input.on('error', fail); output.on('error', fail); child.on('error', fail);
-  child.on('exit', (code, signal) => { if (!closed) fail(Error(`Shared native proxy exited (${signal ?? code}).`)); });
+  input.on('end', () => { closed = true; clearTimeout(openingTimer); ws.terminate(); transport.destroy(); });
+  input.on('error', fail); output.on('error', fail);
   ws.on('error', fail); ws.on('close', () => { if (!closed) fail(Error('Shared native daemon connection closed.')); });
   ws.on('open', () => { clearTimeout(openingTimer); ready = true; flush(); });
   ws.on('message', bytes => {
@@ -97,11 +96,11 @@ export function startSharedNativeBridge({ command, socketPath, env = process.env
       output.once('drain', () => ws._socket?.resume());
     }
   });
-  return { close: () => { if (!closed) { closed = true; clearTimeout(openingTimer); ws.terminate(); child.kill(); transport.destroy(); } } };
+  return { close: () => { if (!closed) { closed = true; clearTimeout(openingTimer); ws.terminate(); transport.destroy(); } } };
 }
 
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
-  startSharedNativeBridge({ command: process.argv[2], socketPath: process.argv[3], onError: error => {
+  startSharedNativeBridge({ socketPath: process.argv[2], onError: error => {
     console.error(error.message); process.exitCode = 1;
   } });
 }

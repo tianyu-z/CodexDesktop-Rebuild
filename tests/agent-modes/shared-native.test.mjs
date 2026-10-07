@@ -5,11 +5,13 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
+import { createServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
+import { WebSocketServer } from '../../runtime/agent-modes/node_modules/ws/wrapper.mjs';
 import { NativeClient } from '../../runtime/agent-modes/upstream.mjs';
 import { startSharedNativeBridge } from '../../runtime/agent-modes/remote/shared-native.mjs';
 
 const bridge = resolve('runtime/agent-modes/remote/shared-native.mjs');
-const wsPath = resolve('runtime/agent-modes/node_modules/ws');
 
 test('shared daemon startup reuses the official owner and fails closed on timeout', { timeout: 5000 }, async t => {
   const dir = mkdtempSync(join(tmpdir(), 'cdx-shared-start-')), cli = join(dir, 'codex'), log = join(dir, 'calls');
@@ -54,45 +56,41 @@ descendant.unref(); setInterval(() => {}, 1000);
   assert.match(run.stdout, /timed out/i);
 });
 
-function fixture(t) {
+async function fixture(t, { slowProxy = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'cdx-shared-native-'));
-  const cli = join(dir, 'codex');
-  writeFileSync(cli, `#!${process.execPath}\n` + String.raw`
-const { createServer } = require('node:http');
-const { Duplex } = require('node:stream');
-const { WebSocketServer } = require(${JSON.stringify(wsPath)});
-if (process.argv[2] !== 'app-server' || process.argv[3] !== 'proxy' || process.argv[4] !== '--sock') process.exit(2);
-const transport = Duplex.from({ readable: process.stdin, writable: process.stdout });
-const server = createServer(); const sockets = new WebSocketServer({ noServer: true });
-server.on('upgrade', (req, socket, head) => sockets.handleUpgrade(req, socket, head, ws => sockets.emit('connection', ws)));
-sockets.on('connection', ws => {
-  if (process.env.CDX_TEST_SLOW_PROXY) { ws._socket.pause(); setTimeout(() => ws._socket.resume(), 300); }
-  ws.on('message', (bytes, binary) => {
-    if (binary) { ws.close(1003, 'Native RPC requires text frames'); return; }
-    const message = JSON.parse(bytes);
-    if (message.method === 'initialize') {
-      ws.send(JSON.stringify({ id: message.id, result: { userAgent: 'fixture' } }));
-      ws.send(JSON.stringify({ method: 'fixture/ready' }));
-    } else if (message.method === 'fixture/approval') {
-      ws.send(JSON.stringify({ id: 17, method: 'item/commandExecution/requestApproval', params: { threadId: 'thread', turnId: 'turn' } }));
-      ws.send(JSON.stringify({ id: message.id, result: { sent: true } }));
-    } else if (message.method === 'fixture/large-response') {
-      ws.send(JSON.stringify({ id: message.id, result: { text: 'x'.repeat(65 * 1024 * 1024) } }));
-    } else if (message.id === 17) {
-      ws.send(JSON.stringify({ method: 'fixture/decision', params: message.result }));
-    } else if (message.id != null) ws.send(JSON.stringify({ id: message.id, result: { method: message.method } }));
+  const socketPath = join(dir, 'native.sock');
+  const server = createServer(), sockets = new WebSocketServer({ server });
+  sockets.on('connection', ws => {
+    if (slowProxy) { ws._socket.pause(); setTimeout(() => ws._socket.resume(), 300); }
+    ws.on('message', (bytes, binary) => {
+      if (binary) { ws.close(1003, 'Native RPC requires text frames'); return; }
+      const message = JSON.parse(bytes);
+      if (message.method === 'initialize') {
+        ws.send(JSON.stringify({ id: message.id, result: { userAgent: 'fixture' } }));
+        ws.send(JSON.stringify({ method: 'fixture/ready' }));
+      } else if (message.method === 'fixture/approval') {
+        ws.send(JSON.stringify({ id: 17, method: 'item/commandExecution/requestApproval', params: { threadId: 'thread', turnId: 'turn' } }));
+        ws.send(JSON.stringify({ id: message.id, result: { sent: true } }));
+      } else if (message.method === 'fixture/large-response') {
+        ws.send(JSON.stringify({ id: message.id, result: { text: 'x'.repeat(65 * 1024 * 1024) } }));
+      } else if (message.id === 17) {
+        ws.send(JSON.stringify({ method: 'fixture/decision', params: message.result }));
+      } else if (message.id != null) ws.send(JSON.stringify({ id: message.id, result: { method: message.method } }));
+    });
   });
-});
-
-server.emit('connection', transport);
-`, { mode: 0o700 });
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  return { cli };
+  await new Promise(resolve => server.listen(socketPath, resolve));
+  t.after(async () => {
+    for (const ws of sockets.clients) ws.terminate();
+    await new Promise(resolve => sockets.close(resolve));
+    await new Promise(resolve => server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return { socketPath };
 }
 
 test('shared native bridge carries requests, notifications, and pending approvals', { timeout: 5000 }, async t => {
-  const { cli } = fixture(t), notifications = [], approvals = [];
-  const client = new NativeClient({ command: process.execPath, args: [bridge, cli, '/tmp/fixture.sock'], env: process.env,
+  const { socketPath } = await fixture(t), notifications = [], approvals = [];
+  const client = new NativeClient({ command: process.execPath, args: [bridge, socketPath], env: process.env,
     onNotification: message => notifications.push(message), onRequest: message => approvals.push(message) });
   t.after(() => client.close());
   assert.deepEqual(await client.request('initialize', {}), { userAgent: 'fixture' });
@@ -106,9 +104,9 @@ test('shared native bridge carries requests, notifications, and pending approval
 });
 
 test('shared native bridge drains queued JSON lines after a slow proxy resumes', { timeout: 20000 }, async t => {
-  const { cli } = fixture(t);
-  const client = new NativeClient({ command: process.execPath, args: [bridge, cli, '/tmp/fixture.sock'],
-    env: { ...process.env, CDX_TEST_SLOW_PROXY: '1' }, onNotification: () => {}, onRequest: () => {}, requestTimeoutMs: 15000 });
+  const { socketPath } = await fixture(t, { slowProxy: true });
+  const client = new NativeClient({ command: process.execPath, args: [bridge, socketPath],
+    env: process.env, onNotification: () => {}, onRequest: () => {}, requestTimeoutMs: 15000 });
   t.after(() => client.close());
   await client.request('initialize', {});
   const messages = Array.from({ length: 4 }, (_, index) => client.request(`fixture/${index}`, { payload: 'x'.repeat(9 * 1024 * 1024) }));
@@ -116,32 +114,37 @@ test('shared native bridge drains queued JSON lines after a slow proxy resumes',
 });
 
 test('shared native bridge preserves a response above the desktop frame limit', { timeout: 20000 }, async t => {
-  const { cli } = fixture(t);
-  const client = new NativeClient({ command: process.execPath, args: [bridge, cli, '/tmp/fixture.sock'], env: process.env,
+  const { socketPath } = await fixture(t);
+  const client = new NativeClient({ command: process.execPath, args: [bridge, socketPath], env: process.env,
     onNotification: () => {}, onRequest: () => {}, requestTimeoutMs: 15000 });
   t.after(() => client.close());
   await client.request('initialize', {});
   assert.equal((await client.request('fixture/large-response', {})).text.length, 65 * 1024 * 1024);
 });
 
-test('shared native bridge closes a proxy that never completes its handshake', { timeout: 3000 }, async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'cdx-stalled-proxy-')), cli = join(dir, 'codex');
-  writeFileSync(cli, `#!${process.execPath}\nprocess.stdin.resume();\n`, { mode: 0o700 });
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+test('shared native bridge closes a socket that never completes its handshake', { timeout: 3000 }, async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'cdx-stalled-socket-')), socketPath = join(dir, 'native.sock');
+  const peers = new Set();
+  const server = createNetServer(socket => { peers.add(socket); socket.on('close', () => peers.delete(socket)); socket.resume(); });
+  await new Promise(resolve => server.listen(socketPath, resolve));
+  t.after(async () => {
+    for (const socket of peers) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  });
   const input = new PassThrough(), output = new PassThrough();
   const failed = new Promise(resolve => {
-    const bridge = startSharedNativeBridge({ command: cli, socketPath: '/tmp/fixture.sock', input, output,
-      timeoutMs: 75, onError: resolve });
+    const bridge = startSharedNativeBridge({ socketPath, input, output, timeoutMs: 75, onError: resolve });
     t.after(() => bridge.close());
   });
   assert.match((await failed).message, /handshake.*timed out/i);
 });
 
 test('shared native bridge rejects a request above its native input limit', { timeout: 10000 }, async t => {
-  const { cli } = fixture(t);
+  const { socketPath } = await fixture(t);
   const stderr = new PassThrough(); let diagnostics = '';
   stderr.on('data', bytes => diagnostics += bytes);
-  const client = new NativeClient({ command: process.execPath, args: [bridge, cli, '/tmp/fixture.sock'], env: process.env,
+  const client = new NativeClient({ command: process.execPath, args: [bridge, socketPath], env: process.env,
     stderr, onNotification: () => {}, onRequest: () => {}, requestTimeoutMs: 8000 });
   t.after(() => client.close());
   await client.request('initialize', {});
