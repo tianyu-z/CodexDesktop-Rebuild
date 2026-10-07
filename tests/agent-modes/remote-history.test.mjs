@@ -190,6 +190,27 @@ test('item pages cap at 100 and return each item once', { timeout: 10000 }, asyn
   assert.equal(f.calls.filter(call => call.method === 'thread/items/list').length, 0);
 });
 
+test('unscoped item pages delegate an active Codex turn with no persisted items', { timeout: 10000 }, async t => {
+  const value = snapshot(['completed', '']);
+  value.turns[1].turn.status = 'inProgress';
+  value.turns[1].turn.items = [];
+  value.activeTurn = { engine: 'codex', turnId: 't1' };
+  const f = await fixture(t, (method, params) => method === 'initialize' ? {} : method === 'thread/read'
+    ? { thread: { id: params.threadId } } : method === 'thread/items/list'
+      ? { data: [{ turnId: 't1', item: { id: 'live', text: 'streaming content' } }], nextCursor: null, backwardsCursor: null }
+      : { data: [], nextCursor: null, backwardsCursor: null });
+  await f.write(value);
+  const c = await f.connect(); await c.send(1, 'initialize'); await c.send(2, 'thread/read', { threadId: 'chat' });
+  assert.equal((await c.send(3, 'thread/turns/list', { threadId: 'chat', itemsView: 'notLoaded' })).result.data.length, 2);
+  assert.equal(f.calls.filter(call => call.method === 'thread/turns/list').length, 0, 'metadata-only turns remain cached');
+  assert.equal((await c.send(4, 'thread/items/list', { threadId: 'chat', turnId: 't0' })).result.data[0].item.text, 'completed');
+  assert.equal(f.calls.filter(call => call.method === 'thread/items/list').length, 0, 'completed scoped items remain cached');
+  assert.equal((await c.send(5, 'thread/items/list', { threadId: 'chat' })).result.data[0].item.text, 'streaming content');
+  const cursor = Buffer.from(JSON.stringify({ kind: 'items', threadId: 'chat', turnId: null, anchor: 't0/i0', inclusive: false })).toString('base64url');
+  assert.equal((await c.send(6, 'thread/items/list', { threadId: 'chat', cursor })).result.data[0].item.id, 'live');
+  assert.equal(f.calls.filter(call => call.method === 'thread/items/list').length, 2);
+});
+
 test('aborted snapshot read stops before opening the file', { timeout: 10000 }, async t => {
   const f = await fixture(t, method => method === 'initialize' ? {} : {});
   await f.write(snapshot(['disk']));

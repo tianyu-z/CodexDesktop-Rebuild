@@ -76,6 +76,10 @@ export function historyPage(snapshot, method, params) {
   if (snapshot.pendingHistoryEdit) return;
   const turns = method === 'thread/turns/list';
   const kind = turns ? 'turns' : 'items';
+  const active = row => row.engine !== 'claude' && (row.turn.status === 'inProgress' || snapshot.activeTurn?.engine === 'codex' && snapshot.activeTurn.turnId === row.turn.id);
+  // Unscoped item cursors can pass the final persisted item while a live Codex
+  // turn has streamed more items than the legacy snapshot contains.
+  if (!turns && !params.turnId && (snapshot.activeTurn?.engine === 'codex' || snapshot.turns.some(active))) return;
   const capped = { ...params, limit: Math.min(turns ? 20 : 100, Math.max(1, Number.isSafeInteger(params.limit) ? params.limit : turns ? 20 : 100)) };
   const rows = turns ? snapshot.turns.map(row => ({ key: row.turn.id, value: row.turn, engine: row.engine }))
     : snapshot.turns.filter(row => !params.turnId || row.turn.id === params.turnId)
@@ -88,7 +92,6 @@ export function historyPage(snapshot, method, params) {
     measure: row => Buffer.byteLength(JSON.stringify(row.value)) + Buffer.byteLength(row.turnId) + 128,
   });
   if (turns && params.itemsView === 'notLoaded') return result;
-  const active = row => row.engine !== 'claude' && (row.turn.status === 'inProgress' || snapshot.activeTurn?.engine === 'codex' && snapshot.activeTurn.turnId === row.turn.id);
   const selected = new Set(result.data.map(row => turns ? row.id : row.turnId));
   if (snapshot.turns.some(row => selected.has(row.turn.id) && active(row))) return;
   if (!turns && params.turnId && snapshot.turns.some(row => row.turn.id === params.turnId && active(row))) return;
