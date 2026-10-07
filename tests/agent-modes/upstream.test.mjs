@@ -91,3 +91,43 @@ for (const resolveBeforeReply of [true, false]) {
     assert.equal(client.respond({ id: requested.id, result: { decision: 'accept' } }), false);
   });
 }
+
+test('a terminal turn resolves only its unanswered native approvals', { timeout: 5000 }, async t => {
+  const requests = [], notifications = [];
+  let resolveRequests;
+  const received = new Promise(resolve => { resolveRequests = resolve; });
+  let resolveCompleted;
+  const completed = new Promise(resolve => { resolveCompleted = resolve; });
+  const script = `
+    const send = value => console.log(JSON.stringify(value));
+    const input = require('node:readline').createInterface({ input: process.stdin });
+    input.on('line', line => {
+      const message = JSON.parse(line);
+      if (message.method === 'fixture/complete') {
+        send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'old-turn', status: 'interrupted' } } });
+        send({ id: message.id, result: {} });
+      } else if (message.method === 'fixture/late-resolution') {
+        send({ method: 'serverRequest/resolved', params: { threadId: 'thread-1', requestId: 11 } });
+        send({ id: message.id, result: {} });
+      }
+    });
+    send({ id: 11, method: 'item/commandExecution/requestApproval', params: { threadId: 'thread-1', turnId: 'old-turn' } });
+    send({ id: 12, method: 'item/commandExecution/requestApproval', params: { threadId: 'thread-1', turnId: 'new-turn' } });
+  `;
+  const client = new NativeClient({ command: process.execPath, args: ['-e', script], env: process.env,
+    onRequest: message => { requests.push(message); if (requests.length === 2) resolveRequests(); },
+    onNotification: message => { notifications.push(message); if (message.method === 'turn/completed') resolveCompleted(); } });
+  t.after(() => client.close());
+  await received;
+  await client.request('fixture/complete', {});
+  await completed;
+  const old = requests.find(request => request.params.turnId === 'old-turn');
+  const live = requests.find(request => request.params.turnId === 'new-turn');
+  assert.deepEqual(notifications.filter(message => message.method === 'serverRequest/resolved'), [
+    { method: 'serverRequest/resolved', params: { threadId: 'thread-1', requestId: old.id } },
+  ]);
+  assert.equal(client.respond({ id: old.id, result: { decision: 'accept' } }), false);
+  assert.equal(client.respond({ id: live.id, result: { decision: 'decline' } }), true);
+  await client.request('fixture/late-resolution', {});
+  assert.equal(notifications.filter(message => message.method === 'serverRequest/resolved').length, 1);
+});

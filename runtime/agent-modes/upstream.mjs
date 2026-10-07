@@ -34,7 +34,7 @@ export class NativeClient {
       catch { this.fail(new Error('Native Codex emitted invalid JSON.')); return; }
       if (message.method && message.id !== undefined) {
         const id = `native-request:${randomUUID()}`;
-        this.serverRequests.set(id, message.id);
+        this.serverRequests.set(id, { nativeId: message.id, threadId: message.params?.threadId, turnId: message.params?.turnId });
         this.serverRequestIds.set(message.id, id);
         onRequest({ ...message, id });
       } else if (message.id !== undefined) {
@@ -47,9 +47,16 @@ export class NativeClient {
         if (message.method === 'serverRequest/resolved') {
           const nativeId = message.params?.requestId;
           const requestId = this.serverRequestIds.get(nativeId);
-          if (requestId !== undefined) {
-            this.serverRequestIds.delete(nativeId); this.serverRequests.delete(requestId);
-            message = { ...message, params: { ...message.params, requestId } };
+          if (requestId === undefined) return;
+          this.serverRequestIds.delete(nativeId); this.serverRequests.delete(requestId);
+          message = { ...message, params: { ...message.params, requestId } };
+        }
+        if (message.method === 'turn/completed' && ['completed', 'failed', 'interrupted'].includes(message.params?.turn?.status)) {
+          const { threadId, turn } = message.params;
+          for (const [requestId, request] of this.serverRequests) {
+            if (request.threadId !== threadId || request.turnId !== turn.id) continue;
+            this.serverRequests.delete(requestId); this.serverRequestIds.delete(request.nativeId);
+            onNotification({ method: 'serverRequest/resolved', params: { threadId, requestId } });
           }
         }
         onNotification(message);
@@ -74,8 +81,8 @@ export class NativeClient {
   }
   respond(message) {
     if (!this.serverRequests.has(message.id)) return false;
-    const id = this.serverRequests.get(message.id); this.serverRequests.delete(message.id);
-    this.send({ ...message, id }); return true;
+    const request = this.serverRequests.get(message.id); this.serverRequests.delete(message.id);
+    this.send({ ...message, id: request.nativeId }); return true;
   }
   notify(message) { this.send(message); }
   fail(error) {
