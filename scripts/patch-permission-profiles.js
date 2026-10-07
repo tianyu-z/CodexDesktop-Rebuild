@@ -29,6 +29,9 @@ const patches = [
   ['resume profile source',
     'K=_?.currentPermissions?.activePermissionProfile;P?.activePermissionProfile===void 0?N?.permissions!=null&&(K={id:N.permissions,extends:null}):K=P.activePermissionProfile;',
     'K=__cdxPermissionProfile(P,N,_?.currentPermissions);'],
+  ['resume response profile source',
+    'function Pft(e,t){let n=t?.activePermissionProfile;return t!=null&&e.activePermissionProfile==null&&n?.id===`:danger-full-access`?t:{activePermissionProfile:e.activePermissionProfile??(n!=null&&!n.id.startsWith(`:`)?n:null),runtimeWorkspaceRoots:e.runtimeWorkspaceRoots,approvalPolicy:e.approvalPolicy,approvalsReviewer:e.approvalsReviewer,sandboxPolicy:e.sandbox}}',
+    'function Pft(e,t){let n=t?.activePermissionProfile;return{activePermissionProfile:e.activePermissionProfile??(n?.id===`:danger-full-access`&&e.sandbox?.type===`dangerFullAccess`&&e.approvalPolicy===`never`?n:n!=null&&!n.id.startsWith(`:`)?n:null),runtimeWorkspaceRoots:e.runtimeWorkspaceRoots,approvalPolicy:e.approvalPolicy,approvalsReviewer:e.approvalsReviewer,sandboxPolicy:e.sandbox}}'],
 ];
 
 function patchPermissionProfiles(source) {

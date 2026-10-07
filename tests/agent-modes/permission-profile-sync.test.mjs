@@ -29,7 +29,7 @@ function loadNative() {
     ept: () => false, ah: (a, b) => [...new Set([...a, ...b])], tpt: (_, roots) => roots,
     cpn: async value => value, RRn: 'explicitRequestOnly', ZLn: 'summaries', Om: 1000,
   });
-  vm.runInContext(patchPermissionProfiles(fixture('turn') + fixture('resume')), context);
+  vm.runInContext(patchPermissionProfiles(fixture('turn') + fixture('resume') + fixture('response')), context);
   return context;
 }
 
@@ -57,6 +57,27 @@ test('resume keeps a legacy Full access sandbox together with its lack of a prof
   const result = native.resumePermissions(undefined, undefined, full, { currentPermissions: workspace }, workspace, 'user', [], []);
   assert.equal(result.activePermissionProfile, null);
   assert.deepEqual(plain(result.sandboxPolicy), full.sandboxPolicy);
+});
+
+test('native restrictive resume response replaces a stale Full access label and policy', () => {
+  const native = loadNative();
+  const derived = { ...full, activePermissionProfile: { id: ':danger-full-access', extends: null }, runtimeWorkspaceRoots: ['/project'] };
+  const response = { activePermissionProfile: null, approvalPolicy: 'on-request', approvalsReviewer: 'user',
+    sandbox: workspace.sandboxPolicy, runtimeWorkspaceRoots: ['/project'] };
+  const projected = plain(native.Pft(response, derived));
+  assert.equal(projected.activePermissionProfile, null);
+  assert.equal(projected.approvalPolicy, 'on-request');
+  assert.deepEqual(projected.sandboxPolicy, workspace.sandboxPolicy);
+});
+
+test('native legacy Full access response retains its known profile label', () => {
+  const native = loadNative();
+  const derived = { ...full, activePermissionProfile: { id: ':danger-full-access', extends: null }, runtimeWorkspaceRoots: ['/old'] };
+  const response = { activePermissionProfile: null, approvalPolicy: 'never', approvalsReviewer: 'user',
+    sandbox: full.sandboxPolicy, runtimeWorkspaceRoots: ['/new'] };
+  const projected = plain(native.Pft(response, derived));
+  assert.deepEqual(projected.activePermissionProfile, derived.activePermissionProfile);
+  assert.deepEqual(projected.runtimeWorkspaceRoots, ['/new']);
 });
 
 test('legacy workspace sandbox never borrows an older Full access profile', async () => {
@@ -110,7 +131,7 @@ test('custom profile identity and approval-only updates preserve the selected sn
 });
 
 test('native patch is idempotent and rejects changed or ambiguous upstream code', () => {
-  const source = fixture('turn') + fixture('resume');
+  const source = fixture('turn') + fixture('resume') + fixture('response');
   const patched = patchPermissionProfiles(source);
   assert.equal(patchPermissionProfiles(patched), patched);
   assert.throws(() => patchPermissionProfiles(source.replace('R=Xzn(', 'R=newResolver(')), /turn sandbox profile source/);

@@ -1,0 +1,2 @@
+// Native resume response permission projection (bindings match upstream).
+function Pft(e,t){let n=t?.activePermissionProfile;return t!=null&&e.activePermissionProfile==null&&n?.id===`:danger-full-access`?t:{activePermissionProfile:e.activePermissionProfile??(n!=null&&!n.id.startsWith(`:`)?n:null),runtimeWorkspaceRoots:e.runtimeWorkspaceRoots,approvalPolicy:e.approvalPolicy,approvalsReviewer:e.approvalsReviewer,sandboxPolicy:e.sandbox}}
