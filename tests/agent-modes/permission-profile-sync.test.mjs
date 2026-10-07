@@ -29,7 +29,7 @@ function loadNative() {
     ept: () => false, ah: (a, b) => [...new Set([...a, ...b])], tpt: (_, roots) => roots,
     cpn: async value => value, RRn: 'explicitRequestOnly', ZLn: 'summaries', Om: 1000,
   });
-  vm.runInContext(patchPermissionProfiles(fixture('turn') + fixture('resume') + fixture('response')), context);
+  vm.runInContext(patchPermissionProfiles(fixture('turn') + fixture('resume') + fixture('response') + fixture('picker')), context);
   return context;
 }
 
@@ -131,7 +131,7 @@ test('custom profile identity and approval-only updates preserve the selected sn
 });
 
 test('native patch is idempotent and rejects changed or ambiguous upstream code', () => {
-  const source = fixture('turn') + fixture('resume') + fixture('response');
+  const source = fixture('turn') + fixture('resume') + fixture('response') + fixture('picker');
   const patched = patchPermissionProfiles(source);
   assert.equal(patchPermissionProfiles(patched), patched);
   assert.throws(() => patchPermissionProfiles(source.replace('R=Xzn(', 'R=newResolver(')), /turn sandbox profile source/);
