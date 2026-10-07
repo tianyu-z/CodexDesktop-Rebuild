@@ -95,6 +95,26 @@ function detachedSnapshot(source, thread, rows) {
   return next;
 }
 
+function remapAgentCaches(row, oldTurnId) {
+  const oldScope = `turn:${oldTurnId}`, newScope = `turn:${row.turn.id}`;
+  if (oldScope === newScope) return;
+  const history = row.agentHistory?.[oldScope];
+  if (history) {
+    row.agentHistory[newScope] = history;
+    delete row.agentHistory[oldScope];
+    if (history.turnStates?.[oldTurnId]) {
+      history.turnStates[row.turn.id] = history.turnStates[oldTurnId];
+      delete history.turnStates[oldTurnId];
+    }
+  }
+  if (row.agentThreads) row.agentThreads = Object.fromEntries(Object.entries(row.agentThreads).map(([key, snapshot]) => {
+    let parts;
+    try { parts = JSON.parse(key); } catch { return [key, snapshot]; }
+    return Array.isArray(parts) && parts.length === 3 && parts[0] === oldScope && parts[1] === 'codex'
+      ? [JSON.stringify([newScope, parts[1], parts[2]]), snapshot] : [key, snapshot];
+  }));
+}
+
 function persist(router, snapshot) {
   router.store.replaceIdleHistory(snapshot);
   writeFileSync(router.store.path(snapshot.id).replace(/\.json$/, '.history.txt'), publicHistory(snapshot), { mode: 0o600 });
@@ -186,6 +206,7 @@ export async function editManagedHistory(router, method, params) {
       const user = copy.turn.items.find(item => item.type === 'userMessage');
       if (user && copy.originalInput) { user.content = clone(copy.originalInput); copy.firstUserItemId = user.id; }
       for (const run of copy.runs ?? []) if (run.nativeTurnId === row.turn.id) run.nativeTurnId = copy.turn.id;
+      remapAgentCaches(copy, row.turn.id);
       return copy;
     });
     const snapshot = detachedSnapshot(source, nativeFork.thread, mapped);

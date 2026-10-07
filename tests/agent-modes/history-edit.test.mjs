@@ -323,6 +323,50 @@ test('a detached fork cannot refresh source subagents after they produce new out
   assert.equal(detached.turns[1].agentHistory['turn:turn-1'].path, undefined);
 });
 
+test('a fork remaps cached nested agents with a completed Codex turn before an active turn', async t => {
+  const f = fixture(t, ['codex', 'claude']);
+  const completed = turn('turn-0', 'SPAWN-BEFORE-ACTIVE');
+  completed.items.push({ id: 'spawn', type: 'subAgentActivity', kind: 'started', agentThreadId: 'source-child' });
+  f.store.putTurn('source', completed, { engine: 'codex' });
+  f.nativeThreads.get('source').turns[0] = structuredClone(completed);
+  const row = f.store.require('source').turns[0];
+  const childKey = JSON.stringify(['turn:turn-0', 'codex', 'source-child']);
+  const grandchildKey = JSON.stringify(['turn:turn-0', 'codex', 'source-grandchild']);
+  row.agentHistory = { 'turn:turn-0': { readAt: Date.now() - 3000, path: '/original.jsonl', turnStates: { 'turn-0': { status: 'completed' } }, dispatches: {
+    spawn: { tool: 'spawnAgent', prompt: 'Inspect first', arguments: { task_name: 'first' } },
+  } } };
+  row.agentThreads = {
+    [childKey]: { readAt: Date.now() - 3000, turns: [{ id: 'child-turn', status: 'completed', result: 'CHILD-CAPTURED', items: [
+      { id: 'nested-spawn', type: 'collabAgentToolCall', tool: 'spawnAgent', status: 'completed', senderThreadId: 'source-child',
+        receiverThreadIds: ['source-grandchild'], prompt: 'Inspect nested', agentsStates: { 'source-grandchild': { status: 'completed' } } },
+    ] }] },
+    [grandchildKey]: { readAt: Date.now() - 3000, turns: [{ id: 'grandchild-turn', status: 'completed', result: 'GRANDCHILD-CAPTURED', items: [] }] },
+  };
+  f.store.save(f.store.require('source'));
+  f.store.putTurn('source', { ...turn('turn-1', 'ACTIVE-CLAUDE'), status: 'inProgress' }, { engine: 'claude' });
+  f.store.beginRun('source', { id: 'active-claude', engine: 'claude', turnId: 'turn-1' });
+
+  const fork = await f.router.request('thread/fork', { threadId: 'source' });
+  const mappedId = fork.thread.turns[0].id;
+  const mappedChildKey = JSON.stringify([`turn:${mappedId}`, 'codex', 'source-child']);
+  const mappedGrandchildKey = JSON.stringify([`turn:${mappedId}`, 'codex', 'source-grandchild']);
+  const branch = f.store.get(fork.thread.id);
+  assert.ok(branch.turns[0].agentHistory[`turn:${mappedId}`]);
+  assert.equal(branch.turns[0].agentHistory[`turn:${mappedId}`].turnStates[mappedId].status, 'completed');
+  assert.ok(branch.turns[0].agentThreads[mappedChildKey]);
+  assert.ok(branch.turns[0].agentThreads[mappedGrandchildKey]);
+  assert.equal(branch.turns[0].agentThreads[childKey], undefined);
+  const graph = await f.router.request('engine/agents/read', { threadId: fork.thread.id, turnId: mappedId });
+  const children = graph.nodes.filter(node => node.kind === 'subagent' && node.engine === 'codex');
+  assert.deepEqual(children.map(node => node.result), ['CHILD-CAPTURED', 'GRANDCHILD-CAPTURED']);
+  assert.equal(children[1].parentId, children[0].id);
+  assert.equal(children[0].dispatches[0].arguments.task_name, 'first');
+  assert.ok(children.every(node => node.sessionId === undefined));
+  assert.equal(f.calls.filter(call => ['source-child', 'source-grandchild'].includes(call.params?.threadId)).length, 0);
+  assert.ok(f.store.get('source').turns[0].agentThreads[childKey]);
+  f.store.finishRun('source', 'active-claude');
+});
+
 test('a Codex turn that starts during source hydration can still be forked', async t => {
   const f = fixture(t, ['claude', 'codex']);
   const originalRequest = f.native.request;
