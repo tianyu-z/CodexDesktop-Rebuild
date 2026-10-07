@@ -164,12 +164,23 @@ export class ConversationStore {
     value.thread = { ...value.thread, ...clone(metadata), preview: metadata.preview || value.thread.preview, updatedAt: Math.max(metadata.updatedAt ?? 0, value.thread.updatedAt ?? 0), recencyAt: Math.max(metadata.recencyAt ?? 0, value.thread.recencyAt ?? 0) };
     value.cwd = thread.cwd ?? value.cwd;
     if (value.mode !== 'both' && !value.explicitModels?.codex && thread.model && !thread.model.startsWith('claude-code/')) value.models.codex = thread.model;
+    // Native history may retain orphaned in-progress turns. Only the latest
+    // in-progress turn of a currently active native thread can own this store.
+    const current = thread.status?.type === 'active' ? turns.findLast(turn => turn.status === 'inProgress') : null;
     for (const turn of turns) {
       if (value.discardedNativeTurnIds?.includes(turn.id)) continue;
       const existing = value.turns.find(row => row.turn.id === turn.id);
-      if (existing && existing.turn.status !== 'inProgress' && turn.status === 'inProgress') continue;
+      if (existing && existing.turn.status !== 'inProgress' && turn.status === 'inProgress'
+          && !(turn.id === current?.id && existing.turn.status === 'interrupted')) continue;
       this.putTurn(thread.id, turn, { engine: 'codex', save: false });
     }
+    if ((!value.activeRun || value.activeRun.id === 'native:unknown') && thread.status?.type === 'active') {
+      if (current && !value.discardedNativeTurnIds?.includes(current.id)
+          && value.turns.some(row => row.engine === 'codex' && row.turn.id === current.id && row.turn.status === 'inProgress')) {
+        value.activeRun = { id: current.id, turnId: current.id, engine: 'codex' };
+      } else if (!value.activeRun) value.activeRun = { id: 'native:unknown', turnId: null, engine: 'codex' };
+    }
+    if (value.activeRun?.id === 'native:unknown' && thread.status?.type === 'idle') value.activeRun = null;
     this.save(value);
     return clone(value);
   }

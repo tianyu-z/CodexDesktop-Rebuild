@@ -19,6 +19,96 @@ function fixture(t) {
 }
 async function start(f,engineMode='codex'){return f.router.request('thread/start',{cwd:f.dir,engineMode,model:'codex-model',agentMode:'guardian-approvals'});}
 
+test('shared native resume restores a live Codex turn after gateway store recovery', async t => {
+  const f = fixture(t); await start(f);
+  const turn = { id: 'live-native', status: 'inProgress', items: [] };
+  f.store.putTurn('thread-1', turn, { engine: 'codex' });
+  f.store.beginRun('thread-1', { id: turn.id, turnId: turn.id, engine: 'codex' });
+  f.router.store = new ConversationStore(f.dir);
+  assert.equal(f.router.store.get('thread-1').activeRun, null);
+  assert.equal(f.router.store.get('thread-1').turns[0].turn.status, 'interrupted');
+  f.thread.status = { type: 'active', activeFlags: [] }; f.thread.turns = [turn];
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+  assert.equal(f.router.store.hasActiveRun(), true);
+  assert.equal(f.router.store.get('thread-1').turns[0].turn.status, 'inProgress');
+  await assert.rejects(f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude' }), /active run/);
+  f.router.nativeNotification({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { ...turn, status: 'completed' } } });
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+});
+
+test('shared native snapshot activates only the current turn, never an idle orphan', async t => {
+  const f = fixture(t); await start(f);
+  const orphan = { id: 'orphan', status: 'inProgress', items: [] };
+  f.thread.turns = [orphan];
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+  const current = { id: 'official-current', status: 'inProgress', items: [] };
+  f.thread.status = { type: 'active', activeFlags: [] }; f.thread.turns = [orphan, current];
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.store.get('thread-1').activeRun.turnId, current.id);
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+});
+
+test('remote managed turn submission checks a surviving native turn before starting Claude', async t => {
+  const f = fixture(t); f.router.remote = true; await start(f, 'claude');
+  const turn = { id: 'official-live', status: 'inProgress', items: [] };
+  f.thread.status = { type: 'active', activeFlags: [] }; f.thread.turns = [turn];
+  await assert.rejects(f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'new work' }] }), /active/i);
+  assert.equal(f.runs.length, 0);
+  assert.equal(f.router.store.get('thread-1').activeRun.turnId, turn.id);
+});
+
+test('active native status without paged turns stays conservatively busy until idle notification', async t => {
+  const f = fixture(t); await start(f);
+  f.thread.status = { type: 'active', activeFlags: [] }; f.thread.turns = [];
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+  await assert.rejects(f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude' }), /active run/);
+  f.router.nativeNotification({ method: 'thread/status/changed', params: { threadId: 'thread-1', status: { type: 'idle' } } });
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+});
+
+test('authoritative idle hydration releases an unknown native active guard', async t => {
+  const f = fixture(t); await start(f);
+  f.thread.status = { type: 'active', activeFlags: [] }; f.thread.turns = [];
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+  f.thread.status = { type: 'idle' };
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+});
+
+test('delayed active native snapshot cannot resurrect a turn completed by a newer notification', async t => {
+  const f = fixture(t); await start(f);
+  const turn = { id: 'live-race', status: 'inProgress', items: [] };
+  f.router.nativeNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn } });
+  const snapshot = { ...f.thread, status: { type: 'active', activeFlags: [] }, turns: [turn] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === 'thread/read'
+    ? new Promise(resolve => { release = () => resolve({ thread: structuredClone(snapshot) }); }) : original(method, params);
+  const hydration = f.router.hydrate('thread-1'); await tick(); assert.ok(release);
+  f.router.nativeNotification({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { ...turn, status: 'completed' } } });
+  release(); await hydration;
+  assert.equal(f.router.store.get('thread-1').activeRun, null);
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+  assert.equal(f.router.store.get('thread-1').turns[0].turn.status, 'completed');
+});
+
+test('delayed active metadata cannot override a newer idle status notification', async t => {
+  const f = fixture(t); await start(f);
+  const snapshot = { ...f.thread, status: { type: 'active', activeFlags: [] }, turns: [] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === 'thread/read'
+    ? new Promise(resolve => { release = () => resolve({ thread: structuredClone(snapshot) }); }) : original(method, params);
+  const hydration = f.router.hydrate('thread-1'); await tick(); assert.ok(release);
+  f.router.nativeNotification({ method: 'thread/status/changed', params: { threadId: 'thread-1', status: { type: 'idle' } } });
+  release(); await hydration;
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+});
+
 test('composer effort persists without a turn and reaches the next Claude run', async t => {
   const f = fixture(t); await start(f, 'claude');
   f.router.adapter.listModels = async () => [{ value: 'opus', supportsEffort: true, supportedEffortLevels: ['low', 'high', 'max'] }];

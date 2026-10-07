@@ -110,7 +110,7 @@ test('concurrent remote ensure and direct serve keep one reachable owner and sup
   const root = mkdtempSync(join(tmpdir(), 'cdx-daemon-test-')), command = join(root, 'codex');
   const nativeCalls = join(root, 'native-calls.jsonl');
   writeFileSync(nativeCalls, '');
-  writeFileSync(command, '#!' + process.execPath + '\nconst fs=require("node:fs"),args=process.argv.slice(2),log=' + JSON.stringify(nativeCalls) + ';fs.appendFileSync(log,JSON.stringify(args)+"\\n");if(args.includes("sandbox")){if(!args.includes("use_legacy_landlock")){if(fs.readFileSync(log,"utf8").trim().split("\\n").length===1)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,12500);console.error("bwrap: Failed to make / slave: Permission denied");process.exit(1)}process.exit(0)}\nrequire("node:readline").createInterface({input:process.stdin}).on("line",s=>{const m=JSON.parse(s);if(m.id!=null)console.log(JSON.stringify({id:m.id,result:{}}))});\n', { mode: 0o700 });
+  writeFileSync(command, '#!' + process.execPath + '\nconst fs=require("node:fs"),args=process.argv.slice(2),log=' + JSON.stringify(nativeCalls) + ';fs.appendFileSync(log,JSON.stringify(args)+"\\n");if(args.includes("sandbox")){if(!args.includes("use_legacy_landlock")){if(fs.readFileSync(log,"utf8").trim().split("\\n").length===1)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,12500);console.error("bwrap: Failed to make / slave: Permission denied");process.exit(1)}process.exit(0)}\nif(args.includes("daemon")){console.log(JSON.stringify({status:"alreadyRunning",socketPath:"/tmp/fixture-official.sock"}));process.exit(0)}\nif(args.includes("proxy")){const {createServer}=require("node:http"),{Duplex}=require("node:stream"),{WebSocketServer}=require(' + JSON.stringify(fileURLToPath(new URL('../../runtime/agent-modes/node_modules/ws/index.js', import.meta.url))) + ');const server=createServer(),sockets=new WebSocketServer({noServer:true});server.on("upgrade",(req,socket,head)=>sockets.handleUpgrade(req,socket,head,ws=>sockets.emit("connection",ws)));sockets.on("connection",ws=>ws.on("message",bytes=>{const m=JSON.parse(bytes);if(m.id!=null)ws.send(JSON.stringify({id:m.id,result:{}}))}));server.emit("connection",Duplex.from({readable:process.stdin,writable:process.stdout}));return}\nprocess.exit(3);\n', { mode: 0o700 });
   const env = { ...process.env, CDX_ENGINE_STORE: join(root, 'store'), CDX_REMOTE_SCOPE: 'fixture', CDX_REAL_CODEX: command, CDX_CLAUDE_PATH: command };
   const children = [];
   const run = (action, overrides = {}) => {
@@ -141,10 +141,12 @@ test('concurrent remote ensure and direct serve keep one reachable owner and sup
   assert.equal(contended.code, 0, contended.stderr);
   const pid = Number(readFileSync(join(root, 'store', '.gateway.lock'), 'utf8'));
   const nativeDeadline = Date.now() + 10000;
-  while (!readCalls().some(args => args.includes('app-server')) && Date.now() < nativeDeadline) await new Promise(resolve => setTimeout(resolve, 20));
+  while (!readCalls().some(args => args.includes('proxy')) && Date.now() < nativeDeadline) await new Promise(resolve => setTimeout(resolve, 20));
   const calls = readCalls();
   assert.equal(calls.filter(args => args.includes('sandbox')).length, 2, 'Only the winning owner probes default and Landlock once');
-  assert.deepEqual(calls.filter(args => args.includes('app-server')), [['-c', 'features.code_mode_host=true', 'app-server']], 'Main native sessions keep the user-selected sandbox backend');
+  assert.ok(calls.some(args => JSON.stringify(args) === JSON.stringify(['-c', 'features.code_mode_host=true', 'app-server', 'daemon', 'start'])), 'Main native sessions attach to the official daemon');
+  assert.ok(calls.some(args => JSON.stringify(args) === JSON.stringify(['app-server', 'proxy', '--sock', '/tmp/fixture-official.sock'])), 'The gateway opens only a proxy to the shared daemon');
+  assert.equal(calls.filter(args => args.includes('app-server') && !args.includes('daemon') && !args.includes('proxy')).length, 0, 'No private main native owner starts');
   const duplicate = await run('serve').done;
   assert.equal(duplicate.code, 0, duplicate.stderr);
   const alive = await run('ensure').done; assert.equal(alive.code, 0, alive.stderr);

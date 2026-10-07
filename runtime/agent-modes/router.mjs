@@ -34,7 +34,7 @@ export class EngineRouter {
   constructor({ store, native, adapter, emit, templates, workflowFactory }) {
     Object.assign(this, { store, native, adapter, emit });
     this.runs = new Map(); this.approvals = new Map(); this.locks = new Map(); this.closed = false;
-    this.nativeTurnRevisions = new Map(); this.nativeUnpersistedTurnRevisions = new Map(); this.nativeNameRevisions = new Map(); this.pagedHistoryHydrated = new Set();
+    this.nativeTurnRevisions = new Map(); this.nativeUnpersistedTurnRevisions = new Map(); this.nativeNameRevisions = new Map(); this.nativeLifecycle = new Map(); this.pagedHistoryHydrated = new Set();
     this.workflow = new WorkflowRouter(this, { templates, workflowFactory });
     this.claudeCommands = new ClaudeCommandRouter(this);
   }
@@ -148,6 +148,7 @@ export class EngineRouter {
     const revisions = new Map(this.nativeTurnRevisions.get(id));
     const unpersistedRevisions = new Map(this.nativeUnpersistedTurnRevisions.get(id));
     const nameRevision = this.nativeNameRevisions.get(id) ?? 0;
+    const lifecycleRevision = this.nativeLifecycle.get(id)?.revision ?? 0;
     const thread = await this.readNativeThread(id);
     recoverHistoryEdit(this, id, thread);
     // Notifications can arrive during any page of this snapshot. Keep the newer
@@ -156,6 +157,8 @@ export class EngineRouter {
       .filter(turn => (revisions.get(turn.id) ?? 0) === (this.nativeTurnRevisions.get(id)?.get(turn.id) ?? 0))
       .map(turn => this.cleanNativeTurn(id, turn));
     if (nameRevision !== (this.nativeNameRevisions.get(id) ?? 0)) thread.name = this.store.get(id)?.thread.name;
+    const latestLifecycle = this.nativeLifecycle.get(id);
+    if ((latestLifecycle?.revision ?? 0) !== lifecycleRevision) thread.status = structuredClone(latestLifecycle.status);
     this.store.ensureThread(thread);
     const dirty = this.nativeUnpersistedTurnRevisions.get(id);
     for (const turn of thread.turns) if (dirty?.has(turn.id) && dirty.get(turn.id) === unpersistedRevisions.get(turn.id)) dirty.delete(turn.id);
@@ -317,6 +320,7 @@ export class EngineRouter {
     }
     if (method === 'turn/start') {
       if (!this.store.get(id)) await this.hydrate(id);
+      else if (this.remote && this.store.get(id).mode !== 'codex') await this.hydrate(id);
       if (params.claudeEffort !== undefined && this.store.get(id)?.activeRun) throw new Error('Finish or interrupt the active run before changing Claude effort.');
       if (params.engineMode) assertMode(params.engineMode);
       const current = this.store.get(id), mode = params.engineMode ?? current.mode;
@@ -624,14 +628,28 @@ export class EngineRouter {
     const value = this.store.require(id);
     const nativeTurnId = params.turn?.id ?? params.turnId;
     if (nativeTurnId && value.discardedNativeTurnIds?.includes(nativeTurnId)) return;
-    if (method === 'thread/deleted') { this.store.remove(id); this.pagedHistoryHydrated.delete(id); this.nativeUnpersistedTurnRevisions.delete(id); }
+    if (method === 'thread/deleted') { this.store.remove(id); this.pagedHistoryHydrated.delete(id); this.nativeUnpersistedTurnRevisions.delete(id); this.nativeLifecycle.delete(id); }
     if (method === 'thread/name/updated') { this.nativeNameRevisions.set(id, (this.nativeNameRevisions.get(id) ?? 0) + 1); const current = this.store.require(id); current.thread.name = params.threadName; this.store.save(current); }
     // The native container is idle during a Claude run; don't let an unrelated
     // metadata refresh overwrite its status in the frontend.
     if ((value.activeRun?.engine === 'claude' || value.activeTurn?.mode === 'both') && method === 'thread/status/changed') return;
+    const lifecycle = status => {
+      const previous = this.nativeLifecycle.get(id);
+      this.nativeLifecycle.set(id, { revision: (previous?.revision ?? 0) + 1, status });
+    };
+    if (method === 'thread/status/changed' && ['active', 'idle'].includes(params.status?.type)) {
+      lifecycle(params.status);
+      value.thread.status = structuredClone(params.status);
+      if (params.status.type === 'idle' && value.activeRun?.engine === 'codex') value.activeRun = null;
+      else if (params.status.type === 'active' && !value.activeRun) value.activeRun = { id: 'native:unknown', turnId: null, engine: 'codex' };
+      this.store.save(value);
+    }
     if (params.turn && (method === 'turn/started' || method === 'turn/completed')) {
       bumpRevision(this.nativeTurnRevisions, id, params.turn.id);
-      if (method === 'turn/started' && !value.activeRun) this.store.beginRun(id, { id: params.turn.id, turnId: params.turn.id, engine: 'codex' });
+      lifecycle(method === 'turn/started' ? { type: 'active', activeFlags: [] } : { type: 'idle' });
+      if (method === 'turn/started' && (!value.activeRun || value.activeRun.id === 'native:unknown')) {
+        value.activeRun = { id: params.turn.id, turnId: params.turn.id, engine: 'codex' }; this.store.save(value);
+      }
       const row = this.rememberNativeTurn(id, params.turn);
       if (method === 'turn/completed') {
         const dirty = this.nativeUnpersistedTurnRevisions.get(id);
