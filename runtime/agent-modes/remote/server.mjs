@@ -2,9 +2,10 @@ import { createServer } from 'node:http';
 import { chmod, mkdir, lstat, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
+import { DESKTOP_REQUEST_BYTES, DESKTOP_RESPONSE_BYTES, OUTPUT_QUEUE_BYTES, HARD_OUTPUT_QUEUE_BYTES, sizeError, pressureError } from './limits.mjs';
 
 /** One durable engine owner, independent of the transient desktop connection. */
-export async function startRemoteServer({ socketPath, runtimeFactory, version = 'development', maxPayload = 16 * 1024 * 1024, maxInFlight = 64, closeLock }) {
+export async function startRemoteServer({ socketPath, runtimeFactory, version = 'development', maxPayload = DESKTOP_REQUEST_BYTES, maxInFlight = 64, closeLock }) {
   const busy = () => (runtime.isBusy?.() ?? false) || inFlight > 0 || controls > 0 || pending.size > 0 || !!initialization && !initialization.ready;
   const http = createServer((request, response) => {
     response.setHeader('Content-Type', 'application/json');
@@ -20,11 +21,24 @@ export async function startRemoteServer({ socketPath, runtimeFactory, version = 
   const sockets = new WebSocketServer({ noServer: true, maxPayload, perMessageDeflate: false });
   const pending = new Map(), tasks = new Set();
   let controller, initialization, initialized = false, closing, inFlight = 0, controls = 0, shutdownRequested = false;
-  const send = (ws, message) => {
+  const send = (ws, message, rpc = false) => {
     if (ws?.readyState !== WebSocket.OPEN) return;
-    // History is persisted by the router; slow clients reconnect and read it.
-    if (ws.bufferedAmount > maxPayload * 2) { ws.terminate(); return; }
-    ws.send(JSON.stringify(message));
+    const bytes = JSON.stringify(message), size = Buffer.byteLength(bytes);
+    if (rpc) {
+      let rejection;
+      if (size > DESKTOP_RESPONSE_BYTES) rejection = sizeError(size, DESKTOP_RESPONSE_BYTES);
+      else if (ws.bufferedAmount > OUTPUT_QUEUE_BYTES || ws.bufferedAmount + size > HARD_OUTPUT_QUEUE_BYTES) rejection = pressureError();
+      if (rejection) {
+        const small = JSON.stringify({ id: message.id, error: rejection });
+        if (ws.bufferedAmount + Buffer.byteLength(small) > HARD_OUTPUT_QUEUE_BYTES) ws.terminate();
+        else ws.send(small);
+        return;
+      }
+    } else if (ws.bufferedAmount + size > HARD_OUTPUT_QUEUE_BYTES) {
+      // Notifications and pending approvals retain finite slow-peer protection.
+      ws.terminate(); return;
+    }
+    ws.send(bytes);
   };
   const emit = message => {
     if (message.method === 'serverRequest/resolved') pending.delete(message.params?.requestId);
@@ -45,7 +59,7 @@ export async function startRemoteServer({ socketPath, runtimeFactory, version = 
     else { state.result = result; state.ready = true; }
     for (const [peer, id] of state.waiters) {
       if (!error) peer.initialized = true;
-      send(peer.ws, { id, ...(error ? { error: { code: error.code ?? -32000, message: error.message } } : { result }) });
+      send(peer.ws, { id, ...(error ? { error: { code: error.code ?? -32000, message: error.message } } : { result }) }, true);
     }
     state.waiters.clear();
   }
@@ -75,7 +89,7 @@ export async function startRemoteServer({ socketPath, runtimeFactory, version = 
         try { message = JSON.parse(bytes); }
         catch { send(ws, { id: null, error: { code: -32700, message: 'Invalid JSON.' } }); return; }
         if (!message || typeof message !== 'object' || Array.isArray(message)) return;
-        const respond = result => send(ws, { id: message.id, result });
+        const respond = result => send(ws, { id: message.id, result }, true);
         try {
           if (shutdownRequested) throw Error('Remote gateway is stopping.');
           if (message.method === 'initialize') {
@@ -109,7 +123,7 @@ export async function startRemoteServer({ socketPath, runtimeFactory, version = 
           try { respond(await runtime.request(message.method, message.params)); }
           finally { if (control) controls--; else inFlight--; }
         } catch (error) {
-          if (message.id != null) send(ws, { id: message.id, error: { code: error.code ?? -32000, message: error.message } });
+          if (message.id != null) send(ws, { id: message.id, error: { code: error.code ?? -32000, message: error.message } }, true);
         }
       })();
       tasks.add(task); task.finally(() => tasks.delete(task));

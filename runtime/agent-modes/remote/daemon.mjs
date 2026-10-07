@@ -108,7 +108,11 @@ async function main() {
   if (action === 'stop') { prepareDirectory(); await stop(true); return; }
   if (action === 'proxy') {
     startRemoteProxy({ socketPath, directory,
-      onError: () => { console.error('Remote engine gateway connection failed.'); process.exitCode = 1; },
+      onError: error => { console.error('Remote engine gateway connection failed.', JSON.stringify({
+        code: error.code, direction: error.direction, method: error.method,
+        payloadBytes: error.payloadBytes, limitBytes: error.limitBytes,
+      })); process.exitCode = 1; },
+      onDiagnostic: detail => console.error('Remote engine gateway RPC diagnostic.', JSON.stringify(detail)),
       // Node intentionally keeps stdout's fd open after destroy(). Once both
       // WebSockets are gone, a stalled SSH reader must not retain this proxy.
       onClose: () => setImmediate(() => process.exit(process.exitCode ?? 0)),
