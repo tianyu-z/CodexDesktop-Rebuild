@@ -4,8 +4,9 @@ import { randomUUID } from 'node:crypto';
 
 /** Dedicated native transport: IDs from the client, gateway, and server never collide. */
 export class NativeClient {
-  constructor({ command, args, env, onNotification, onRequest, onExit, stderr = process.stderr }) {
+  constructor({ command, args, env, onNotification, onRequest, onExit, stderr = process.stderr, requestTimeoutMs = 30000 }) {
     this.pending = new Map(); this.serverRequests = new Map(); this.serverRequestIds = new Map(); this.closed = false;
+    this.requestTimeoutMs = requestTimeoutMs;
     this.child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
     this.child.stderr.pipe(stderr, { end: false });
     this.child.stdin.on('error', error => this.fail(error));
@@ -39,7 +40,7 @@ export class NativeClient {
       } else if (message.id !== undefined) {
         const pending = this.pending.get(message.id);
         if (!pending) return;
-        this.pending.delete(message.id);
+        this.pending.delete(message.id); clearTimeout(pending.timer);
         if (message.error) pending.reject(Object.assign(new Error(message.error.message), { code: message.error.code, data: message.error.data }));
         else pending.resolve(message.result);
       } else {
@@ -62,8 +63,13 @@ export class NativeClient {
   request(method, params) {
     const id = `gateway:${randomUUID()}`;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      try { this.send({ id, method, params }); } catch (error) { this.pending.delete(id); reject(error); }
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Native backend failed to respond within ${this.requestTimeoutMs} ms; the operation may have completed.`));
+      }, this.requestTimeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      try { this.send({ id, method, params }); }
+      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
     });
   }
   respond(message) {
@@ -72,9 +78,14 @@ export class NativeClient {
     this.send({ ...message, id }); return true;
   }
   notify(message) { this.send(message); }
-  fail(error) { for (const pending of this.pending.values()) pending.reject(error); this.pending.clear(); this.serverRequests.clear(); this.serverRequestIds.clear(); }
+  fail(error) {
+    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }
+    this.pending.clear(); this.serverRequests.clear(); this.serverRequestIds.clear();
+  }
   async close() {
     if (this.closed) return this.done;
+    this.closed = true;
+    this.fail(new Error('Native Codex is shutting down.'));
     this.child.stdin.end();
     const timer = setTimeout(() => this.child.kill('SIGTERM'), 1000);
     const hardTimer = setTimeout(() => this.child.kill('SIGKILL'), 3000);

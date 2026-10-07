@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
 import { readRemoteAgentMap } from './agent-map-snapshot.mjs';
@@ -8,16 +9,17 @@ const unsupportedMap = error => error?.code === -32601 || typeof error?.message 
   && /(?:unknown variant|unknown method|unsupported method|method not found)/i.test(error.message) && error.message.includes(mapMethod);
 
 /** Terminate stdio WebSocket framing, keeping one controller on the same owner. */
-export function startRemoteProxy({ socketPath, directory, input = process.stdin, output = process.stdout, onError = () => {}, onClose = () => {} }) {
+export function startRemoteProxy({ socketPath, directory, input = process.stdin, output = process.stdout, heartbeatIntervalMs = 30000, onError = () => {}, onClose = () => {} }) {
   const maxPayload = 16 * 1024 * 1024;
   const transport = Duplex.from({ readable: input, writable: output });
   const http = createServer((_request, response) => { response.writeHead(404); response.end(); });
   const sockets = new WebSocketServer({ noServer: true, maxPayload, perMessageDeflate: false });
   const pending = new Map(), abort = new AbortController();
-  let upstream, downstream, closed = false, sequence = 0, maps = 0;
+  let upstream, downstream, heartbeat, awaitingPong, closed = false, sequence = 0, maps = 0;
   const close = error => {
     if (closed) return;
-    closed = true; abort.abort(Error('Remote gateway proxy disconnected.'));
+    closed = true; clearInterval(heartbeat); awaitingPong = undefined;
+    abort.abort(Error('Remote gateway proxy disconnected.'));
     for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject?.(abort.signal.reason); }
     pending.clear(); upstream?.terminate(); downstream?.terminate(); transport.destroy(); sockets.close(); http.close();
     if (error) onError(error);
@@ -58,6 +60,16 @@ export function startRemoteProxy({ socketPath, directory, input = process.stdin,
       sockets.handleUpgrade(req, socket, head, ws => {
         downstream = ws;
         ws.on('error', close); ws.on('close', () => close());
+        ws.on('pong', payload => {
+          if (awaitingPong?.equals(payload)) awaitingPong = undefined;
+        });
+        heartbeat = setInterval(() => {
+          if (ws.readyState !== WebSocket.OPEN) return;
+          if (awaitingPong) { close(Error('Remote desktop failed to respond to heartbeat.')); return; }
+          awaitingPong = randomBytes(16);
+          ws.ping(awaitingPong, error => { if (error) close(error); });
+        }, heartbeatIntervalMs);
+        heartbeat.unref();
         ws.on('message', (bytes, binary) => {
           let message;
           try { message = JSON.parse(bytes); }
