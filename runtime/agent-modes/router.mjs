@@ -22,6 +22,11 @@ import { readAgentMap } from './agent-map.mjs';
 
 const now = () => Math.floor(Date.now() / 1000);
 const messageOf = error => error instanceof Error ? error.message : String(error);
+const bumpRevision = (revisions, id, turnId) => {
+  let turns = revisions.get(id);
+  if (!turns) revisions.set(id, turns = new Map());
+  turns.set(turnId, (turns.get(turnId) ?? 0) + 1);
+};
 const nativeParams = params => { const { engineMode, engineModel, engineModels, template, roleOverrides, claudePermissionMode, claudeActualPermissionMode, claudeCommandTarget, claudeEffort, skipAutoTitleGeneration, ...rest } = params; return rest; };
 const deny = () => ({ decision: 'decline' });
 
@@ -29,7 +34,7 @@ export class EngineRouter {
   constructor({ store, native, adapter, emit, templates, workflowFactory }) {
     Object.assign(this, { store, native, adapter, emit });
     this.runs = new Map(); this.approvals = new Map(); this.locks = new Map(); this.closed = false;
-    this.nativeTurnRevisions = new Map(); this.nativeNameRevisions = new Map(); this.pagedHistoryHydrated = new Set();
+    this.nativeTurnRevisions = new Map(); this.nativeUnpersistedTurnRevisions = new Map(); this.nativeNameRevisions = new Map(); this.pagedHistoryHydrated = new Set();
     this.workflow = new WorkflowRouter(this, { templates, workflowFactory });
     this.claudeCommands = new ClaudeCommandRouter(this);
   }
@@ -141,6 +146,7 @@ export class EngineRouter {
   }
   async hydrate(id) {
     const revisions = new Map(this.nativeTurnRevisions.get(id));
+    const unpersistedRevisions = new Map(this.nativeUnpersistedTurnRevisions.get(id));
     const nameRevision = this.nativeNameRevisions.get(id) ?? 0;
     const thread = await this.readNativeThread(id);
     recoverHistoryEdit(this, id, thread);
@@ -151,6 +157,9 @@ export class EngineRouter {
       .map(turn => this.cleanNativeTurn(id, turn));
     if (nameRevision !== (this.nativeNameRevisions.get(id) ?? 0)) thread.name = this.store.get(id)?.thread.name;
     this.store.ensureThread(thread);
+    const dirty = this.nativeUnpersistedTurnRevisions.get(id);
+    for (const turn of thread.turns) if (dirty?.has(turn.id) && dirty.get(turn.id) === unpersistedRevisions.get(turn.id)) dirty.delete(turn.id);
+    if (dirty?.size === 0) this.nativeUnpersistedTurnRevisions.delete(id);
     // A native session already contains its own pre-existing history.
     const value = this.store.get(id);
     if (!value.turns.some(row => row.engine !== 'codex' || row.nativeDetached)) this.store.setBinding(id, 'codex', { consumedSeq: Math.max(0, ...value.turns.map(row => row.seq)) });
@@ -216,8 +225,18 @@ export class EngineRouter {
     if (id && this.workflow.internal.has(id)) throw new Error('Internal workflow sessions are not public chats.');
     if (id && this.store.has(id) && ['thread/turns/list', 'thread/items/list'].includes(method)) {
       if (!this.pagedHistoryHydrated.has(id)) await this.hydrate(id);
-      const rows = this.store.require(id).turns;
-      return method === 'thread/turns/list' ? this.pageTurns(rows, params) : this.pageItems(rows, params);
+      const turnsPage = method === 'thread/turns/list';
+      const selected = () => turnsPage ? this.pageTurns(this.store.require(id).turns, params) : this.pageItems(this.store.require(id).turns, params);
+      let result = selected();
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const dirty = this.nativeUnpersistedTurnRevisions.get(id);
+        const needsContent = !turnsPage || params.itemsView !== 'notLoaded';
+        const intersects = needsContent && result.data.some(entry => dirty?.has(turnsPage ? entry.id : entry.turnId));
+        if (!intersects && !(needsContent && !turnsPage && params.turnId && dirty?.has(params.turnId))) break;
+        await this.hydrate(id);
+        result = selected();
+      }
+      return result;
     }
     if (method === 'engine/agents/read') return readAgentMap(this, params);
     if (method === 'engine/claude/commands') return this.claudeCommands.list(params);
@@ -359,7 +378,7 @@ export class EngineRouter {
     if (value && value.mode !== 'codex' && /^(turn\/(steer|tool)|thread\/(compact|realtime|startAeon|inject_items|shellCommand)|review\/)/.test(method)) throw new Error(`${method} is unavailable in ${value.mode === 'both' ? 'dual workflow' : 'Claude Code'} mode.`);
     const result = await this.native.request(method, nativeParams(params));
     if (value && ['thread/rollback', 'thread/revert', 'thread/delete'].includes(method)) {
-      this.store.remove(id); this.pagedHistoryHydrated.delete(id);
+      this.store.remove(id); this.pagedHistoryHydrated.delete(id); this.nativeUnpersistedTurnRevisions.delete(id);
       if (method !== 'thread/delete') { if (result.thread) this.store.ensureThread(result.thread); else await this.hydrate(id); }
     }
     if (method === 'thread/list' || method === 'thread/search') {
@@ -605,20 +624,19 @@ export class EngineRouter {
     const value = this.store.require(id);
     const nativeTurnId = params.turn?.id ?? params.turnId;
     if (nativeTurnId && value.discardedNativeTurnIds?.includes(nativeTurnId)) return;
-    if (nativeTurnId) {
-      let revisions = this.nativeTurnRevisions.get(id);
-      if (!revisions) this.nativeTurnRevisions.set(id, revisions = new Map());
-      revisions.set(nativeTurnId, (revisions.get(nativeTurnId) ?? 0) + 1);
-    }
-    if (method === 'thread/deleted') { this.store.remove(id); this.pagedHistoryHydrated.delete(id); }
+    if (method === 'thread/deleted') { this.store.remove(id); this.pagedHistoryHydrated.delete(id); this.nativeUnpersistedTurnRevisions.delete(id); }
     if (method === 'thread/name/updated') { this.nativeNameRevisions.set(id, (this.nativeNameRevisions.get(id) ?? 0) + 1); const current = this.store.require(id); current.thread.name = params.threadName; this.store.save(current); }
     // The native container is idle during a Claude run; don't let an unrelated
     // metadata refresh overwrite its status in the frontend.
     if ((value.activeRun?.engine === 'claude' || value.activeTurn?.mode === 'both') && method === 'thread/status/changed') return;
     if (params.turn && (method === 'turn/started' || method === 'turn/completed')) {
+      bumpRevision(this.nativeTurnRevisions, id, params.turn.id);
       if (method === 'turn/started' && !value.activeRun) this.store.beginRun(id, { id: params.turn.id, turnId: params.turn.id, engine: 'codex' });
       const row = this.rememberNativeTurn(id, params.turn);
       if (method === 'turn/completed') {
+        const dirty = this.nativeUnpersistedTurnRevisions.get(id);
+        dirty?.delete(params.turn.id);
+        if (dirty?.size === 0) this.nativeUnpersistedTurnRevisions.delete(id);
         const active = this.store.get(id).activeRun;
         if (params.turn.status === 'completed' || (active?.engine === 'codex' && active.acknowledgedSeq === row.seq)) this.store.setBinding(id, 'codex', { consumedSeq: Math.max(row.seq, this.store.get(id).bindings.codex.consumedSeq) });
         if (active?.engine === 'codex') this.store.finishRun(id, active.id);
@@ -648,7 +666,13 @@ export class EngineRouter {
           if (item?.type === 'agentMessage') item.text += params.delta;
         }
         this.store.putTurn(id, turn, { engine: 'codex' });
+        bumpRevision(this.nativeTurnRevisions, id, params.turnId);
       }
+    } else if (nativeTurnId && method.startsWith('item/') && /delta$/i.test(method) &&
+      (value.turns.at(-1)?.turn.id === nativeTurnId ? value.turns.at(-1).engine === 'codex' : value.turns.some(row => row.turn.id === nativeTurnId && row.engine === 'codex'))) {
+      // Native owns these streaming item bodies; the event is forwarded without
+      // changing the persisted store. A later full page needs a fresh snapshot.
+      bumpRevision(this.nativeUnpersistedTurnRevisions, id, nativeTurnId);
     }
     this.emit(message);
   }

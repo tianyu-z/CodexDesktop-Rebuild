@@ -105,3 +105,97 @@ test('paged router reads hydrate once, while explicit read and resume refresh na
   assert.equal(recreated.data[0].id, 'first');
   assert.equal(readCount(), 5);
 });
+
+function liveHistory(t) {
+  const directory = mkdtempSync(join(tmpdir(), 'live-history-'));
+  const store = new ConversationStore(directory);
+  const thread = { id: 'history', cwd: directory, status: { type: 'active' }, turns: [
+    { id: 'completed', status: 'completed', items: [{ id: 'done', type: 'agentMessage', text: 'stable' }] },
+    { id: 'active', status: 'inProgress', items: [{ id: 'command', type: 'commandExecution', aggregatedOutput: 'before' }] },
+  ] };
+  store.ensureThread({ ...thread, turns: [] });
+  let reads = 0;
+  const native = { async request(method) {
+    if (method !== 'thread/read') throw new Error(`Unexpected native request: ${method}`);
+    reads++;
+    return { thread: structuredClone(thread) };
+  } };
+  const router = new EngineRouter({ store, native, adapter: {}, emit() {} });
+  t.after(async () => { await router.close(); rmSync(directory, { recursive: true, force: true }); });
+  return { thread, router, native, reads: () => reads };
+}
+
+test('unpersisted output delta refreshes selected active content only', async t => {
+  const f = liveHistory(t);
+  const active = { threadId: 'history', turnId: 'active' };
+  assert.equal((await f.router.request('thread/items/list', active)).data[0].item.aggregatedOutput, 'before');
+  assert.equal(f.reads(), 1);
+  f.thread.turns[1].items[0].aggregatedOutput = 'before after';
+  f.router.nativeNotification({ method: 'item/commandExecution/outputDelta', params: { ...active, itemId: 'command', delta: ' after' } });
+  const completedPage = await f.router.request('thread/turns/list', { threadId: 'history', sortDirection: 'asc', limit: 1, itemsView: 'full' });
+  assert.equal(completedPage.data[0].items[0].text, 'stable');
+  const metadataPage = await f.router.request('thread/turns/list', { threadId: 'history', sortDirection: 'desc', limit: 1, itemsView: 'notLoaded' });
+  assert.deepEqual(metadataPage.data[0].items, []);
+  assert.equal(f.reads(), 1);
+  const changed = await f.router.request('thread/items/list', active);
+  assert.equal(changed.data[0].item.aggregatedOutput, 'before after');
+  assert.equal(f.reads(), 2);
+  const cached = await f.router.request('thread/turns/list', { threadId: 'history', sortDirection: 'desc', limit: 1, itemsView: 'full' });
+  assert.equal(cached.data[0].items[0].aggregatedOutput, 'before after');
+  assert.equal(f.reads(), 2);
+  f.thread.turns[1].items[0].aggregatedOutput = 'before after latest';
+  f.router.nativeNotification({ method: 'item/commandExecution/outputDelta', params: { ...active, itemId: 'command', delta: ' latest' } });
+  f.thread.turns[1].status = 'completed';
+  f.router.nativeNotification({ method: 'turn/completed', params: { threadId: 'history', turn: structuredClone(f.thread.turns[1]) } });
+  const finished = await f.router.request('thread/turns/list', { threadId: 'history', sortDirection: 'desc', limit: 1, itemsView: 'full' });
+  assert.equal(finished.data[0].items[0].aggregatedOutput, 'before after latest');
+  assert.equal(f.reads(), 2);
+});
+
+test('delta received during hydration remains dirty until a newer native snapshot is read', async t => {
+  const f = liveHistory(t);
+  const active = { threadId: 'history', turnId: 'active' };
+  await f.router.request('thread/items/list', active);
+  f.thread.turns[1].items[0].aggregatedOutput = 'before after';
+  f.router.nativeNotification({ method: 'item/commandExecution/outputDelta', params: { ...active, itemId: 'command', delta: ' after' } });
+  let release;
+  const original = f.native.request.bind(f.native);
+  f.native.request = async method => {
+    if (!release) {
+      const snapshot = structuredClone(f.thread);
+      return new Promise(resolve => { release = () => resolve({ thread: snapshot }); });
+    }
+    return original(method);
+  };
+  const pending = f.router.request('thread/items/list', active);
+  for (let attempt = 0; attempt < 10 && !release; attempt++) await new Promise(resolve => setImmediate(resolve));
+  assert.ok(release, 'dirty item read should refresh native history');
+  f.thread.turns[1].items[0].aggregatedOutput = 'before after later';
+  f.router.nativeNotification({ method: 'item/commandExecution/outputDelta', params: { ...active, itemId: 'command', delta: ' later' } });
+  release();
+  const result = await pending;
+  assert.equal(result.data[0].item.aggregatedOutput, 'before after later');
+});
+
+test('continuous output bounds refreshes per page and leaves later content dirty', async t => {
+  const f = liveHistory(t);
+  const active = { threadId: 'history', turnId: 'active' };
+  await f.router.request('thread/items/list', active);
+  f.thread.turns[1].items[0].aggregatedOutput = 'before 1';
+  f.router.nativeNotification({ method: 'item/commandExecution/outputDelta', params: { ...active, itemId: 'command', delta: ' 1' } });
+  let refreshes = 0;
+  const original = f.native.request.bind(f.native);
+  f.native.request = async method => {
+    refreshes++;
+    const snapshot = structuredClone(f.thread);
+    f.thread.turns[1].items[0].aggregatedOutput += ` ${refreshes + 1}`;
+    f.router.nativeNotification({ method: 'item/commandExecution/outputDelta', params: { ...active, itemId: 'command', delta: ` ${refreshes + 1}` } });
+    return { thread: snapshot };
+  };
+  const bounded = await f.router.request('thread/items/list', active);
+  assert.equal(refreshes, 2);
+  assert.equal(bounded.data[0].item.aggregatedOutput, 'before 1 2');
+  f.native.request = original;
+  const latest = await f.router.request('thread/items/list', active);
+  assert.equal(latest.data[0].item.aggregatedOutput, 'before 1 2 3');
+});
