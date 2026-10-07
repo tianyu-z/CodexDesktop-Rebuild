@@ -125,17 +125,34 @@ the installed build was made from the updated application.
 
 The release was uploaded to rno. At `2026-10-07T13:05:21.986Z`, safe preparation
 returned `upgradeDeferred: true`: the old gateway was still busy with two real
-native tasks, including **Review scaling ladder config**. Its active runtime
-remains `dfceacacc13fe44296541b12e18ba702cef4fc65aa06bd1fd18adcbf5b062f61`.
-The official daemon PID 20516 and its original start time were preserved.
-Neither the desktop nor remote gateway was restarted by this repair.
+native tasks, including **Review scaling ladder config**. The last verified
+remote runtime was
+`dfceacacc13fe44296541b12e18ba702cef4fc65aa06bd1fd18adcbf5b062f61`.
+The official daemon PID 20516 and its original start time were preserved at
+that inspection.
 
-**On-disk installation is complete; live activation is pending the user's
-choice of migration timing.** Immediate activation requires restarting
-chatgpt-dev and stopping its old private rno gateway, which interrupts that
-gateway's current tasks. No approvals were auto-answered, no live task was
-silently cancelled, and the old nonterminal approval was not fabricated as
-completed.
+On 2026-10-07 the user explicitly authorized immediate activation. The installed
+runtime manifest, frontend archive SHA-256, and shared-native helper SHA-256
+were rechecked and matched this release. chatgpt-dev was quit normally and
+restarted. Its old desktop/runtime/native PIDs 83818, 83907, and 83954 exited;
+new desktop PID 27547 was verified at `2026-10-07T18:29:28.064357+00:00`.
+The official local desktop PID 99053 and native PID 99152 were preserved.
+The restarted development UI was subsequently verified as running.
+
+**Local activation is complete; remote activation is blocked by SSH key
+signing, not by missing user authorization.** Before and after the local
+restart, rno login failed with `Permission denied (publickey)` and Secretive
+`agent refused operation` / `communication with agent failed`. The same
+failure was visible in the development UI before restart. The user was asked
+to complete local Secretive/Touch ID authentication. No remote gateway stop
+was attempted, and current remote runtime/permissions could not be freshly
+verified. Once authentication is restored, continue with read-only inspection,
+stop only the old scoped development gateway if still necessary, activate the
+new runtime, and verify the shared daemon plus the affected chat's actual
+permission state. Existing authorization covers that migration.
+
+No approvals were auto-answered, no permission selector was changed, and the
+old nonterminal approval was not fabricated as completed.
 
 Release/install/state evidence:
 
