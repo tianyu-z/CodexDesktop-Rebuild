@@ -177,10 +177,18 @@ function buildMac(platform) {
 
   const resourcesDir = path.join(outApp, "Contents", "Resources");
 
-  // 3. Repack patched ASAR
+  // 3. Prepare native runtime selection in a disposable copy. Keep the source
+  // snapshot intact, and fail before packaging an unsupported upstream seam.
   const asarPath = path.join(resourcesDir, "app.asar");
   console.log("   [asar pack] _asar/ -> app.asar");
-  execSync(`npx asar pack "${asarDir}" "${asarPath}"`);
+  const runtimeStage = fs.mkdtempSync(path.join(require('os').tmpdir(), 'codex-native-runtime-'));
+  try {
+    copyRecursive(asarDir, runtimeStage);
+    require('./patch-computer-use-runtime.js').patchComputerUseBuild(runtimeStage);
+    execSync(`npx asar pack "${runtimeStage}" "${asarPath}"`);
+  } finally {
+    fs.rmSync(runtimeStage, { recursive: true, force: true });
+  }
 
   // 4. Update ASAR integrity hash in Info.plist
   const infoPlist = path.join(outApp, "Contents", "Info.plist");

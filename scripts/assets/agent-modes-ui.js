@@ -95,7 +95,7 @@
         const response = await manager.sendRequest('engine/capabilities', { ...(threadId != null ? { threadId } : {}), ...(cwd != null ? { cwd } : {}), ...(force ? { refresh: true } : {}) });
         if (row.revision !== revision) return row.snapshot;
         const models = normalizeModels(response?.claudeModels), error = displayText(response?.modelListError) || null;
-        update(row, { claudeModels: error && models.length === 0 ? row.snapshot.claudeModels : models, modelListError: error, engines: Array.isArray(response?.engines) ? response.engines.filter(value => typeof value === 'string') : row.snapshot.engines, claudeEffortSelection: response?.claudeEffortSelection === true, bothAvailable: response?.bothAvailable === true, bothUnavailableReason: displayText(response?.bothUnavailableReason), loadedAt: Date.now() });
+        update(row, { claudeModels: error && models.length === 0 ? row.snapshot.claudeModels : models, modelListError: error, engines: Array.isArray(response?.engines) ? response.engines.filter(value => typeof value === 'string') : row.snapshot.engines, claudeEffortSelection: response?.claudeEffortSelection === true, claudeWorkflowEffortSelection: response?.claudeWorkflowEffortSelection === true, bothAvailable: response?.bothAvailable === true, bothUnavailableReason: displayText(response?.bothUnavailableReason), loadedAt: Date.now() });
       } catch (error) {
         if (row.revision === revision) update(row, { modelListError: displayText(error?.message ?? String(error)) || 'Unable to discover Claude Code models', loadedAt: Date.now() });
       } finally {
@@ -171,7 +171,7 @@
     return `${model.description ? `${model.description}\n` : ''}Model ID: ${model.value}${model.resolvedModel && model.resolvedModel !== model.value ? `\nResolves to: ${model.resolvedModel}` : ''}`;
   }
   function validate(selection) {
-    if (selection.claudeEffort !== undefined && (selection.engineMode !== 'claude' || ![null, 'low', 'medium', 'high', 'xhigh', 'max'].includes(selection.claudeEffort))) throw Error('Invalid Claude effort selection');
+    if (selection.claudeEffort !== undefined && (!['claude', 'both'].includes(selection.engineMode) || ![null, 'low', 'medium', 'high', 'xhigh', 'max'].includes(selection.claudeEffort))) throw Error('Invalid Claude effort selection');
     if (!['codex', 'claude', 'both'].includes(selection.engineMode)) throw Error('Unknown chat engine mode');
     if (selection.claudePermissionMode !== undefined && !validPermission(selection.claudePermissionMode)) throw Error('Invalid Claude permission mode');
     if (selection.claudeCommandTarget !== undefined && selection.claudeCommandTarget !== null && !/^[a-z][a-z0-9_-]{0,63}$/.test(selection.claudeCommandTarget)) throw Error('Invalid Claude command target');
@@ -194,12 +194,39 @@
     const changed = selection.template && (selection.template.id !== state.template.id || selection.template.revision !== state.template.revision);
     return copy(selection.roleOverrides ?? (changed ? {} : state.roleOverrides));
   }
+  const effortSaveError = 'The host did not confirm this effort setting. Reconnect after its tasks finish to use an updated host, then try again.';
+  function confirmsEffort(selection, state) {
+    if (selection.claudeEffort === undefined) return true;
+    const field = selection.engineMode === 'both' ? 'claudeWorkflowOptions' : 'claudeSessionOptions';
+    return state?.engineMode === selection.engineMode && state?.[field]?.effort === selection.claudeEffort;
+  }
+  function draftEffortSelection(context, state, selection) {
+    const effort = state.claudeWorkflowOptions?.effort;
+    if (selection.engineMode !== 'both' || selection.claudeEffort !== undefined || effort == null) return selection;
+    const next = { ...state, models: { ...state.models, ...selection.engineModels }, template: selection.template ?? state.template, roleOverrides: selectionOverrides(state, selection) };
+    const templates = templateRecord(context.manager, context.hostId).snapshot;
+    const roles = snapshot => effectiveRoles(snapshot, templates).filter(role => role.engine === 'claude').map(role => Object.hasOwn(role, 'model') ? role.model ?? 'default' : snapshot.models.claude ?? 'default').sort();
+    const roleModels = overrides => Object.entries(overrides).map(([id, role]) => [id, role.engine, role.model]).sort(([a], [b]) => a.localeCompare(b));
+    const templateChanged = templateKey(next.template) !== templateKey(state.template);
+    const knownTemplate = templates.byRevision[templateKey(next.template)]?.roles;
+    const modelsChanged = knownTemplate ? JSON.stringify(roles(state)) !== JSON.stringify(roles(next))
+      : next.models.claude !== state.models.claude || JSON.stringify(roleModels(next.roleOverrides)) !== JSON.stringify(roleModels(state.roleOverrides));
+    if (state.engineMode === 'both' && !templateChanged && !modelsChanged) return selection;
+    const catalog = catalogRecord(context.manager, { hostId: context.hostId, cwd: context.cwd }).snapshot;
+    const nextModels = roles(next);
+    const compatible = knownTemplate && nextModels.length > 0 && nextModels.every(id => {
+      const model = catalog.claudeModels.find(model => model.value === id);
+      return model?.supportsEffort === true && model.supportedEffortLevels?.includes(effort);
+    });
+    return compatible ? selection : { ...selection, claudeEffort: null };
+  }
   function applyState(row, state) {
     const values = { loading: false, available: true, error: null };
     if (['codex', 'claude', 'both'].includes(state?.engineMode)) values.engineMode = state.engineMode;
     if (state?.models) values.models = { ...row.snapshot.models, ...state.models };
     for (const name of ['claudePermissionMode', 'claudeActualPermissionMode', 'claudeCommandTarget']) if (state?.[name] !== undefined) values[name] = state[name];
     if (state?.claudeClientActions) values.claudeClientActions = state.claudeClientActions;
+    if (state?.claudeWorkflowOptions !== undefined) values.claudeWorkflowOptions = copy(state.claudeWorkflowOptions);
     if (state?.claudeSessionOptions !== undefined) values.claudeSessionOptions = copy(state.claudeSessionOptions);
     if (state?.claudeEffort !== undefined) values.claudeSessionOptions = { ...row.snapshot.claudeSessionOptions, effort: state.claudeEffort };
     if (state?.claudeRoleActualPermissionModes) values.claudeRoleActualPermissionModes = state.claudeRoleActualPermissionModes;
@@ -212,7 +239,10 @@
     // A prewarmed shell still reports its old engine until the first turn reaches
     // the gateway. Reads may update busy/history, but cannot erase captured intent.
     if (row.creationIntent) {
-      if (row.creationIntent.claudeEffort !== undefined) values.claudeSessionOptions = { ...row.snapshot.claudeSessionOptions, effort: row.creationIntent.claudeEffort };
+      if (row.creationIntent.claudeEffort !== undefined) {
+        const field = row.creationIntent.engineMode === 'both' ? 'claudeWorkflowOptions' : 'claudeSessionOptions';
+        values[field] = { ...row.snapshot[field], effort: row.creationIntent.claudeEffort };
+      }
       for (const name of ['claudePermissionMode', 'claudeCommandTarget']) if (row.creationIntent[name] !== undefined) values[name] = row.creationIntent[name];
       values.engineMode = row.creationIntent.engineMode;
       if (row.creationIntent.engineMode === 'claude') values.models = { ...row.snapshot.models, ...values.models, claude: row.creationIntent.engineModel };
@@ -224,7 +254,7 @@
   function requestFields(options) {
     if (options?.engineMode == null) return {};
     validate(options);
-    if (options.engineMode === 'both') return { engineMode: 'both', ...(options.claudePermissionMode !== undefined ? { claudePermissionMode: options.claudePermissionMode } : {}), engineModels: copy({ codex: null, claude: 'default', ...options.engineModels }), template: copy(options.template ?? defaultTemplate()), ...(options.roleOverrides !== undefined ? { roleOverrides: copy(options.roleOverrides) } : {}), ...(options.claudeCommandTarget !== undefined ? { claudeCommandTarget: options.claudeCommandTarget } : {}) };
+    if (options.engineMode === 'both') return { engineMode: 'both', ...(options.claudeEffort !== undefined ? { claudeEffort: options.claudeEffort } : {}), ...(options.claudePermissionMode !== undefined ? { claudePermissionMode: options.claudePermissionMode } : {}), engineModels: copy({ codex: null, claude: 'default', ...options.engineModels }), template: copy(options.template ?? defaultTemplate()), ...(options.roleOverrides !== undefined ? { roleOverrides: copy(options.roleOverrides) } : {}), ...(options.claudeCommandTarget !== undefined ? { claudeCommandTarget: options.claudeCommandTarget } : {}) };
     return options.engineMode === 'claude'
       ? { engineMode: 'claude', engineModel: options.engineModel ?? 'default', ...(options.claudePermissionMode !== undefined ? { claudePermissionMode: options.claudePermissionMode } : {}), ...(options.claudeEffort !== undefined ? { claudeEffort: options.claudeEffort } : {}) }
       : { engineMode: 'codex' };
@@ -252,13 +282,16 @@
     const row = record(scope, null, hostId);
     if (row.snapshot.pending || row.snapshot.busy || row.nativeControlsBlocked) throw Error('Wait for the current turn to finish');
     row.revision++;
-    if (selection.claudeEffort !== undefined) update(row, { claudeSessionOptions: { ...row.snapshot.claudeSessionOptions, effort: selection.claudeEffort } });
+    if (selection.claudeEffort !== undefined) {
+      const field = selection.engineMode === 'both' ? 'claudeWorkflowOptions' : 'claudeSessionOptions';
+      update(row, { [field]: { ...row.snapshot[field], effort: selection.claudeEffort } });
+    }
     for (const name of ['claudePermissionMode', 'claudeCommandTarget']) if (selection[name] !== undefined) update(row, { [name]: selection[name] });
     update(row, { engineMode: selection.engineMode, models: { ...row.snapshot.models, ...copy(selection.engineModels ?? {}), ...(selection.engineMode === 'claude' && selection.engineModel != null ? { claude: selection.engineModel } : {}) }, template: copy(selection.template ?? row.snapshot.template), roleOverrides: selectionOverrides(row.snapshot, selection), error: null });
   }
   function capture(scope, hostId) {
     const state = record(scope, null, hostId).snapshot;
-    if (state.engineMode === 'both') return { ...requestFields({ engineMode: 'both', engineModels: state.models, template: state.template, roleOverrides: state.roleOverrides, claudePermissionMode: state.claudePermissionMode, claudeCommandTarget: state.claudeCommandTarget }), skipAutoTitleGeneration: true };
+    if (state.engineMode === 'both') return { ...requestFields({ engineMode: 'both', engineModels: state.models, template: state.template, roleOverrides: state.roleOverrides, claudePermissionMode: state.claudePermissionMode, claudeCommandTarget: state.claudeCommandTarget, claudeEffort: state.claudeWorkflowOptions?.effort }), skipAutoTitleGeneration: true };
     if (state.engineMode === 'claude') return { ...requestFields({ engineMode: 'claude', engineModel: state.models.claude ?? 'default', claudePermissionMode: state.claudePermissionMode, claudeEffort: state.claudeSessionOptions?.effort }), skipAutoTitleGeneration: true };
     return { engineMode: 'codex' };
   }
@@ -298,7 +331,10 @@
     const row = record(null, threadId, hostId);
     // Reads are applied by their caller with a revision check. An old in-flight read
     // must never undo a newly acknowledged selection.
-    if (method === 'engine/mode/set') { row.creationIntent = null; row.revision++; applyState(row, response); }
+    if (method === 'engine/mode/set') {
+      if (!confirmsEffort(params, response)) { update(row, { error: effortSaveError }); return; }
+      row.creationIntent = null; row.revision++; applyState(row, response);
+    }
     const acknowledgedTurnId = method === 'turn/start' ? response?.turn?.id ?? response?.turn?.turnId : null;
     if (acknowledgedTurnId) update(row, { workflows: latestWorkflowFlags(row, row.snapshot.workflows, acknowledgedTurnId, ++row.workflowReadOrder) });
     const intent = row.creationIntent;
@@ -338,12 +374,13 @@
     const { scope, threadId, hostId, manager } = context;
     const row = record(scope, threadId, hostId);
     if (row.snapshot.pending || row.snapshot.busy || row.nativeControlsBlocked) throw Error('Wait for the current turn to finish');
-    if (threadId == null) { setDraftSelection(scope, selection, hostId); return; }
+    if (threadId == null) { setDraftSelection(scope, draftEffortSelection(context, row.snapshot, selection), hostId); return; }
     row.revision++;
     update(row, { pending: true, error: null });
     try {
       const selected = requestFields({ claudePermissionMode: row.snapshot.claudePermissionMode, claudeCommandTarget: row.snapshot.claudeCommandTarget, ...selection, engineModel: selection.engineModel ?? row.snapshot.models.claude, engineModels: { ...row.snapshot.models, ...selection.engineModels }, template: selection.template ?? row.snapshot.template, ...(selection.engineMode === 'both' ? { roleOverrides: selectionOverrides(row.snapshot, selection) } : {}) });
       const state = await manager.sendRequest('engine/mode/set', { threadId, ...selected });
+      if (!confirmsEffort(selection, state)) throw Error(effortSaveError);
       row.creationIntent = null;
       applyState(row, state);
     } catch (error) {
@@ -655,11 +692,11 @@
         title: option.props.title, onSelect: () => { if (!props.disabled && !option.props.disabled) props.onChange?.({ target: { value: option.props.value } }); }, children: option.props.children }, option.props.value)) });
   }
   const effortLabel = value => ({ auto: 'Auto', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High', max: 'Max' })[value] ?? value;
-  function ClaudeModelPicker({ React, jsx, nativeUI, models, effort, onEffort, modelOnly, onRefresh, refreshing, effortAvailable = true, ...props }) {
+  function ClaudeModelPicker({ React, jsx, nativeUI, models, effort, onEffort, onRefresh, refreshing, effortAvailable = true, ...props }) {
     const [open, setOpen] = React.useState(false), [view, setView] = React.useState('advanced');
     if (!nativeUI) return jsx.jsx('select', props);
     const selected = models.find(model => model.value === props.value) ?? { value: props.value };
-    const levels = !modelOnly && selected.supportsEffort === true ? selected.supportedEffortLevels ?? [] : [];
+    const levels = selected.supportsEffort === true ? selected.supportedEffortLevels ?? [] : [];
     const canSetEffort = levels.length > 0;
     const current = effort ?? 'auto';
     const name = modelLabel(selected), label = `${name}${canSetEffort ? ` · ${effortLabel(current)}` : ''}`;
@@ -671,7 +708,7 @@
           onSelect: () => { if (!props.disabled) props.onChange({ target: { value: model.value } }); } })) },
       effort: canSetEffort ? { label: 'Effort', title: 'Effort', value: effortLabel(current), ariaLabel: `Effort ${effortLabel(current)}`, contentClassName: 'min-w-[180px]', disabled: props.disabled || !effortAvailable,
         options: ['auto', ...levels].map(value => ({ id: value, label: effortLabel(value), selected: value === current, onSelect: () => chooseEffort(value) })) } : null,
-      extras: jsx.jsxs(jsx.Fragment ?? 'div', { children: [canSetEffort && !effortAvailable ? jsx.jsx('div', { role: 'status', style: { padding: '6px 8px', fontSize: 12 }, children: 'Reconnect after the current task finishes to enable effort controls.' }) : null, onRefresh ? jsx.jsx(nativeUI.Menu.Item, { disabled: refreshing, onSelect: event => { event.preventDefault(); onRefresh(); }, children: refreshing ? 'Refreshing models…' : 'Refresh models' }) : null] }),
+      extras: jsx.jsxs(jsx.Fragment ?? 'div', { children: [!effortAvailable ? jsx.jsx('div', { role: 'status', style: { padding: '6px 8px', fontSize: 12 }, children: 'This host is still running an older version. Reconnect after its tasks finish to enable effort controls.' }) : null, onRefresh ? jsx.jsx(nativeUI.Menu.Item, { disabled: refreshing, onSelect: event => { event.preventDefault(); onRefresh(); }, children: refreshing ? 'Refreshing models…' : 'Refresh models' }) : null] }),
     };
     return jsx.jsx(nativeUI.Dropdown, { align: 'start', contentClassName: 'w-56', open, onOpenChange: value => { setOpen(value); if (value) props.onFocus?.(); }, disabled: props.disabled,
       triggerButton: composerButton(jsx, nativeUI, label, { disabled: props.disabled, title: label, 'aria-label': `Claude model and effort: ${label}`, 'data-testid': 'claude-model-selector', 'data-selected-reasoning-effort': current, 'aria-expanded': open }),
@@ -710,25 +747,25 @@
     // Native app-wide commands outlive individual button events. Their guard
     // reads this chat's current state, including the composer's native busy atoms.
     row.nativeControlsBlocked = disabled;
-    const change = selection => { changeSelection({ scope, threadId, hostId, manager }, selection).catch(() => {}); };
-    const inheritedEffort = modelId => {
-      const next = catalog.claudeModels.find(model => model.value === modelId), effort = state.claudeSessionOptions?.effort;
+    const change = selection => { changeSelection({ scope, threadId, hostId, cwd, manager }, selection).catch(() => {}); };
+    const inheritedEffort = (modelId, targetMode = mode) => {
+      const next = catalog.claudeModels.find(model => model.value === modelId), effort = (targetMode === 'both' ? state.claudeWorkflowOptions : state.claudeSessionOptions)?.effort;
       return effort != null && (next?.supportsEffort !== true || !next.supportedEffortLevels?.includes(effort)) ? { claudeEffort: null } : {};
     };
     const modePicker = jsx.jsxs(ComposerSelect, { React, jsx, nativeUI: props.nativeUI,
       'aria-label': 'Chat engine', 'data-testid': 'chat-engine-selector', value: mode, disabled, title: reason, style: selectStyle,
-      onChange: event => change({ engineMode: event.target.value, ...(event.target.value === 'claude' ? inheritedEffort(state.models.claude) : {}) }),
+      onChange: event => change({ engineMode: event.target.value, ...(['claude', 'both'].includes(event.target.value) ? inheritedEffort(state.models.claude, event.target.value) : {}) }),
       onFocus: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       onPointerDown: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       children: [jsx.jsx('option', { value: 'codex', children: 'Only Codex' }), jsx.jsx('option', { value: 'claude', disabled: !claudeAvailable, children: 'Only Claude Code' }), jsx.jsx('option', { value: 'both', disabled: !bothAvailable, title: catalog.bothUnavailableReason || 'Configure independent participants and host roles', children: 'Multi-agent (Codex / Claude)' })],
     });
     const claudePicker = mode === 'claude' || mode === 'both' ? jsx.jsx(ClaudeModelPicker, { React, jsx, nativeUI: props.nativeUI,
-      models: modelOptions(catalog, state.models.claude ?? 'default'), effort: state.claudeSessionOptions?.effort, effortAvailable: catalog.claudeEffortSelection === true, modelOnly: mode === 'both',
-      onEffort: claudeEffort => change({ engineMode: 'claude', claudeEffort }),
+      models: modelOptions(catalog, state.models.claude ?? 'default'), effort: (mode === 'both' ? state.claudeWorkflowOptions : state.claudeSessionOptions)?.effort, effortAvailable: (mode === 'both' ? catalog.claudeWorkflowEffortSelection : catalog.claudeEffortSelection) === true,
+      onEffort: claudeEffort => change({ engineMode: mode, claudeEffort }),
       onRefresh: () => refreshCapabilities(manager, { hostId, threadId, cwd, force: true }), refreshing: catalog.loading,
       'aria-label': 'Claude Code model', 'data-testid': 'claude-model-selector', value: state.models.claude ?? 'default', disabled: disabled || !claudeAvailable, title: 'Claude Code uses its own project/user permissions and per-tool approvals. The Codex permission selector applies only to Codex.', style: { ...selectStyle, maxWidth: 220 },
       onChange: event => {
-        change(mode === 'both' ? { engineMode: 'both', engineModels: { claude: event.target.value } } : { engineMode: 'claude', engineModel: event.target.value, ...inheritedEffort(event.target.value) });
+        change(mode === 'both' ? { engineMode: 'both', engineModels: { claude: event.target.value }, ...inheritedEffort(event.target.value) } : { engineMode: 'claude', engineModel: event.target.value, ...inheritedEffort(event.target.value) });
       },
       onFocus: () => refreshCapabilities(manager, { hostId, threadId, cwd }),
       onPointerDown: () => refreshCapabilities(manager, { hostId, threadId, cwd }),

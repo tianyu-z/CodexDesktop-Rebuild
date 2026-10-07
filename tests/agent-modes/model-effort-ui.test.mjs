@@ -23,9 +23,9 @@ test('Claude uses native model/effort/advanced controls with only supported leve
   assert.deepEqual(saved, [null, 'high']);
 });
 
-test('unknown model capability and multi-agent do not advertise an effort override', () => {
+test('unknown model capability does not advertise an effort override', () => {
   const api = load();
-  for (const props of [{ models: [{ value: 'custom' }], value: 'custom' }, { models: [model], value: model.value, modelOnly: true }]) {
+  for (const props of [{ models: [{ value: 'custom' }], value: 'custom' }, { models: [{ ...model, supportsEffort: false }], value: model.value }]) {
     const tree = api.ClaudeModelPicker({ React, jsx, nativeUI, ...props, onChange: () => {}, children: [] });
     assert.equal(tree.props.children.props.advancedConfig.effort, null);
     assert.equal(tree.props.children.props.showViewControls, false);

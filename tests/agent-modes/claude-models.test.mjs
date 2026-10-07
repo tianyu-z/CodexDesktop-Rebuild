@@ -112,6 +112,107 @@ test('provider API models merge with SDK aliases/context options and expose adve
   await models.close();
 });
 
+test('provider models inherit native capabilities only through exact resolved model identities', async () => {
+  const models = catalog(metadataQuery([
+    { value: 'opus', resolvedModel: 'claude-opus-current', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+    { value: 'opus[1m]', resolvedModel: 'claude-opus-current[1m]', supportsEffort: false, supportedEffortLevels: [] },
+  ]), { environment: () => foundry, fetchImpl: async () => Response.json({ data: [
+    { id: 'claude-opus-current' }, { id: 'claude-opus-current[1m]' }, { id: 'claude-opus-current-2' },
+  ] }) });
+  try {
+    const result = await models.list();
+    assert.equal(result.find(row => row.value === 'opus').resolvedModel, 'claude-opus-current');
+    assert.deepEqual(result.find(row => row.value === 'claude-opus-current').supportedEffortLevels, ['low', 'high']);
+    assert.equal(result.find(row => row.value === 'claude-opus-current').supportsEffort, true);
+    assert.equal(result.find(row => row.value === 'claude-opus-current[1m]').supportsEffort, false);
+    assert.deepEqual(result.find(row => row.value === 'claude-opus-current[1m]').supportedEffortLevels, []);
+    assert.equal(result.find(row => row.value === 'claude-opus-current-2').supportsEffort, undefined);
+  } finally { await models.close(); }
+});
+
+test('family overrides preserve configured aliases while native concrete models recover their capabilities', async () => {
+  const env = Object.freeze({ ...foundry, ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-6', ANTHROPIC_MODEL: 'opus' });
+  const settings = Object.freeze({ env: Object.freeze({ ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6' }), availableModels: ['opus'] });
+  const requests = [];
+  const primary = [
+    { value: 'default', resolvedModel: 'claude-opus-4-6', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+    { value: 'opus', resolvedModel: 'claude-opus-4-6', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+  ];
+  const native = [
+    { value: 'default', resolvedModel: 'claude-opus-5-5' },
+    { value: 'opus', resolvedModel: 'claude-opus-5-5' },
+    { value: 'claude-opus-4-6', resolvedModel: 'claude-opus-4-6', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'max'] },
+    { value: 'claude-opus-5-5', resolvedModel: 'claude-opus-5-5', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { value: 'claude-opus-5-5[1m]', resolvedModel: 'claude-opus-5-5[1m]', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { value: 'claude-unadvertised', resolvedModel: 'claude-unadvertised', supportsEffort: true },
+  ];
+  const models = catalog(request => {
+    requests.push(request);
+    return metadataQuery(request.options.settings.env ? native : primary)(request);
+  }, { environment: () => env, resolveSettingsImpl: async () => ({ effective: settings }), fetchImpl: async () => Response.json({ data: [
+    { id: 'claude-opus-4-6' }, { id: 'claude-opus-5-5' }, { id: 'claude-opus-5-5-2' },
+  ] }) });
+  try {
+    const result = await models.list();
+    assert.equal(result.find(row => row.value === 'default').resolvedModel, 'claude-opus-4-6');
+    assert.equal(result.find(row => row.value === 'opus').resolvedModel, 'claude-opus-4-6');
+    assert.deepEqual(result.find(row => row.value === 'claude-opus-4-6').supportedEffortLevels, ['low', 'high']);
+    assert.deepEqual(result.find(row => row.value === 'claude-opus-5-5').supportedEffortLevels, ['low', 'medium', 'high', 'xhigh', 'max']);
+    assert.equal(result.find(row => row.value === 'claude-opus-5-5[1m]').supportsEffort, true);
+    assert.equal(result.find(row => row.value === 'claude-opus-5-5-2').supportsEffort, undefined);
+    assert.equal(result.some(row => row.value === 'claude-unadvertised'), false);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].options.settings.env, undefined);
+    assert.deepEqual(requests[1].options.settings.env, { ANTHROPIC_DEFAULT_OPUS_MODEL: '', ANTHROPIC_DEFAULT_SONNET_MODEL: '', ANTHROPIC_DEFAULT_HAIKU_MODEL: '' });
+    for (const request of requests) {
+      assert.deepEqual(request.options.env, env);
+      assert.equal(request.options.persistSession, false);
+      assert.equal(request.options.settings.disableAllHooks, true);
+      assert.deepEqual(request.options.settingSources, ['user', 'project', 'local']);
+      assert.deepEqual(request.options.tools, []);
+      assert.deepEqual(request.options.hooks, {});
+    }
+    assert.equal(settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-4-6');
+    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'claude-opus-4-6');
+  } finally { await models.close(); }
+});
+
+test('optional native catalog failure preserves the configured primary catalog', async () => {
+  let nativeRequests = 0;
+  const models = catalog(request => metadataQuery(request.options.settings.env ? () => { nativeRequests++; throw Error('Optional metadata failed'); } : [rows[0]])(request), {
+    environment: () => ({ ...foundry, ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-8' }),
+    fetchImpl: async () => Response.json({ data: [{ id: 'claude-opus-4-8' }, { id: 'claude-opus-future' }] }),
+  });
+  try {
+    const result = await models.listCatalog();
+    assert.equal(result.source, 'provider-api+sdk');
+    assert.equal(result.models.find(row => row.value === 'opus').resolvedModel, 'claude-opus-4-8');
+    assert.deepEqual(result.models.find(row => row.value === 'claude-opus-4-8').supportedEffortLevels, ['low', 'high']);
+    assert.equal(result.models.find(row => row.value === 'claude-opus-future').supportsEffort, undefined);
+    assert.equal(nativeRequests, 1);
+  } finally { await models.close(); }
+});
+
+test('explicit capability restrictions from provider and configured SDK metadata remain effective', async () => {
+  const models = catalog(metadataQuery([
+    { value: 'claude-provider-restricted', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high'] },
+    { value: 'claude-provider-disabled', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+    { value: 'claude-native-disabled', supportsEffort: false, supportedEffortLevels: [] },
+  ]), { environment: () => foundry, fetchImpl: async () => Response.json({ data: [
+    { id: 'claude-provider-restricted', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+    { id: 'claude-provider-disabled', supportsEffort: false, supportedEffortLevels: [] },
+    { id: 'claude-native-disabled', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+  ] }) });
+  try {
+    const result = await models.list();
+    assert.deepEqual(result[0].supportedEffortLevels, ['low', 'high']);
+    for (const row of result.slice(1)) {
+      assert.equal(row.supportsEffort, false);
+      assert.deepEqual(row.supportedEffortLevels, []);
+    }
+  } finally { await models.close(); }
+});
+
 test('API errors and unsupported providers preserve SDK fallback with an explicit incompleteness warning', async () => {
   for (const env of [foundry, { CLAUDE_CODE_USE_BEDROCK: '1' }]) {
     const models = catalog(metadataQuery(rows), { environment: () => env, fetchImpl: async () => { throw new Error('fixture-key must not be exposed'); } });

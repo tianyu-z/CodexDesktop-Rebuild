@@ -10,7 +10,9 @@ import { TemplateStore } from '../../runtime/agent-modes/templates/store.mjs';
 import { EngineRouter } from '../../runtime/agent-modes/router.mjs';
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const composerImage = () => ({ type: 'image', url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC' });
-const selected = { engineMode: 'both', engineModels: { codex: 'codex-x', claude: 'claude-y' }, template: { id: 'debby', revision: 1, parameters: { rounds: 1 } } };
+// The synthetic role snapshots below use manual permissions; do not inherit a
+// developer app's customized default permission mode when testing its bundle.
+const selected = { engineMode: 'both', claudePermissionMode: 'default', engineModels: { codex: 'codex-x', claude: 'claude-y' }, template: { id: 'debby', revision: 1, parameters: { rounds: 1 } } };
 function fixture(t) {
   const dir = mkdtempSync(join(tmpdir(), 'dual-router-')), events = [], calls = [], workflows = [];
   let workflowReady; const workflowStarted = new Promise(resolve => { workflowReady = resolve; });
@@ -42,6 +44,69 @@ async function started(f) {
   await tick(); return result;
 }
 const roles = () => ['codex', 'claude'].map(engine => ({ id: `${engine}-run`, roleId: engine, stepId: `answers.${engine}`, round: 0, attempt: 1, status: 'running', engine, requestedModel: engine === 'codex' ? 'codex-current' : 'claude-y', cwd: '/fixture' }));
+
+const effortModels = () => [
+  { value: 'claude-y', supportsEffort: true, supportedEffortLevels: ['low', 'high', 'max'] },
+  { value: 'limited', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+  { value: 'unsupported', supportsEffort: false },
+];
+
+test('Both advertises distinct workflow effort support and persists draft effort separately from Only Claude', async t => {
+  const f = fixture(t); f.router.adapter.listModels = async () => effortModels();
+  const capabilities = await f.router.request('engine/capabilities', { cwd: f.dir });
+  assert.equal(capabilities.claudeEffortSelection, true);
+  assert.equal(capabilities.claudeWorkflowEffortSelection, true);
+  const result = await f.router.request('thread/start', { ...selected, cwd: f.dir, claudeEffort: 'high', effort: 'low' });
+  assert.deepEqual(result.engineState.claudeWorkflowOptions, { effort: 'high' });
+  assert.equal(f.store.get('chat').bindings.claude.claudeOptions, undefined);
+  assert.deepEqual(new ConversationStore(join(f.dir, 'conversations')).get('chat').claudeWorkflowOptions, { effort: 'high' });
+  assert.equal(Object.hasOwn(f.calls[0].params, 'claudeEffort'), false);
+  assert.equal(f.calls[0].params.effort, 'low');
+  f.store.setBinding('chat', 'claude', { claudeOptions: { effort: 'max', thinking: { type: 'adaptive' } } });
+  const state = await f.router.request('engine/mode/set', { threadId: 'chat', engineMode: 'both', claudeEffort: null });
+  assert.deepEqual(state.claudeWorkflowOptions, { effort: null });
+  assert.equal(f.store.get('chat').bindings.claude.claudeOptions.effort, 'max');
+  assert.equal(f.workflows.length, 0);
+  const only = await f.router.request('engine/mode/set', { threadId: 'chat', engineMode: 'claude' });
+  assert.equal(only.claudeSessionOptions.effort, 'max');
+  const both = await f.router.request('engine/mode/set', { threadId: 'chat', engineMode: 'both' });
+  assert.deepEqual(both.claudeWorkflowOptions, { effort: null });
+});
+
+test('Both validates all effective Claude role models before mode or workflow effort changes', async t => {
+  const f = fixture(t); f.router.adapter.listModels = async () => effortModels();
+  const override = { codex: { engine: 'claude', model: 'limited' } };
+  await assert.rejects(f.router.request('thread/start', { ...selected, cwd: f.dir, roleOverrides: override, claudeEffort: 'max' }), /support/i);
+  assert.equal(f.calls.length, 0);
+  await f.router.request('thread/start', { ...selected, cwd: f.dir, claudeEffort: 'max' });
+  const before = f.router.state('chat');
+  await assert.rejects(f.router.request('engine/mode/set', { threadId: 'chat', engineMode: 'both', roleOverrides: override, claudeEffort: 'max' }), /support/i);
+  assert.deepEqual(f.router.state('chat'), before);
+  await assert.rejects(f.router.request('turn/start', { threadId: 'chat', roleOverrides: override, claudeEffort: 'max', input: [{ type: 'text', text: 'No turn' }] }), /support/i);
+  assert.deepEqual(f.router.state('chat'), before);
+  const state = await f.router.request('engine/mode/set', { threadId: 'chat', engineMode: 'both', roleOverrides: override });
+  assert.deepEqual(state.claudeWorkflowOptions, { effort: null }, 'an incompatible inherited shared effort becomes Auto');
+  assert.deepEqual(state.roleOverrides, override);
+  assert.equal(f.store.get('chat').turns.length, 0);
+});
+
+test('prewarmed Both turn stores captured effort and Codex effort independently, and freezes workflow retry', async t => {
+  const f = fixture(t); f.router.adapter.listModels = async () => effortModels();
+  await f.router.request('thread/start', { cwd: f.dir });
+  await assert.rejects(f.router.request('turn/start', { ...selected, threadId: 'chat', roleOverrides: { claude: { model: 'unsupported' } }, claudeEffort: 'high', input: [{ type: 'text', text: 'Rejected' }] }), /support/i);
+  assert.equal(f.router.state('chat').engineMode, 'codex');
+  const { turn } = await f.router.request('turn/start', { ...selected, threadId: 'chat', claudeEffort: 'high', effort: 'low', input: [{ type: 'text', text: 'Compare' }] });
+  const workflow = await f.workflowStarted;
+  assert.deepEqual(workflow.options.claudeWorkflowOptions, { effort: 'high' });
+  assert.equal(workflow.options.nativeOptions.effort, 'low');
+  assert.deepEqual(f.store.get('chat').turns[0].workflow.config.claudeWorkflowOptions, { effort: 'high' });
+  for (const method of ['engine/mode/set', 'turn/start']) await assert.rejects(f.router.request(method, { threadId: 'chat', engineMode: 'both', claudeEffort: null, input: [{ type: 'text', text: 'busy' }] }), /active run/i);
+  workflow.finish('interrupted'); await tick();
+  await f.router.request('engine/mode/set', { threadId: 'chat', engineMode: 'both', claudeEffort: null });
+  await f.router.request('engine/runs/retry', { threadId: 'chat', turnId: turn.id }); await tick();
+  assert.deepEqual(f.workflows[1].options.claudeWorkflowOptions, { effort: 'high' });
+  assert.equal(f.workflows[1].options.nativeOptions.effort, 'low');
+});
 
 test('mixed image input stores one private capture and preserves its ID through retry and steering', async t => {
   const f = fixture(t);
