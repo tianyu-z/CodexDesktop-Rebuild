@@ -213,6 +213,17 @@ export async function readAgentMap(router, { threadId, turnId }) {
   if (!router.store.has(threadId)) await router.hydrate(threadId);
   const chat = router.store.require(threadId), row = selectedRow(chat, turnId);
   if (!row) return buildAgentMap(chat, turnId);
+  if (row.historyDetached) {
+    // A fork's historical agent records belong to the source conversation.
+    // Project only what was captured at the fork point; native refresh would
+    // follow the original child and import work produced after this snapshot.
+    const graph = buildAgentMap(chat, row.turn.id);
+    for (const node of graph.nodes) if (node.kind === 'subagent' && node.engine === 'codex') {
+      delete node.sessionId;
+      if (live(node.status) && node.status !== 'unknown') node.status = 'interrupted';
+    }
+    return graph;
+  }
   const assertCurrent = () => {
     const current = router.store.require(threadId);
     if (current !== chat || current.turns.find(current => current.turn.id === row.turn.id) !== row) throw new Error('Conversation history changed while reading its agents.');

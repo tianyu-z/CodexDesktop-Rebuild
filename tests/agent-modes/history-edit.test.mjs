@@ -291,6 +291,38 @@ test('forking a running mixed Codex turn detaches its partial native context wit
   assert.doesNotMatch(input, /SOURCE-FINISHED/);
 });
 
+test('a detached fork cannot refresh source subagents after they produce new output', async t => {
+  const f = fixture(t, ['claude', 'codex']);
+  const partial = { ...turn('turn-1', 'SPAWN-CHILD'), status: 'inProgress' };
+  partial.items.push({ id: 'spawn', type: 'collabAgentToolCall', tool: 'spawnAgent', status: 'completed', senderThreadId: 'source',
+    receiverThreadIds: ['source-child'], prompt: 'Inspect the API', agentsStates: { 'source-child': { status: 'running' } } });
+  partial.items.push({ id: 'activity', type: 'subAgentActivity', kind: 'started', agentThreadId: 'new-child' });
+  f.store.putTurn('source', partial, { engine: 'codex' });
+  f.nativeThreads.get('source').turns[0] = structuredClone(partial);
+  const row = f.store.require('source').turns[1];
+  row.agentThreads = { '["turn:turn-1","codex","source-child"]': { readAt: Date.now() - 3000, nativeActive: true,
+    turns: [{ id: 'captured', status: 'inProgress', items: [], result: 'CAPTURED-BEFORE-FORK' }] } };
+  row.agentHistory = { 'turn:turn-1': { path: '/source-agent-history.jsonl', readAt: Date.now() - 3000, dispatches: {} } };
+  f.store.save(f.store.require('source'));
+  f.store.beginRun('source', { id: 'active-codex', engine: 'codex', turnId: 'turn-1' });
+
+  const fork = await f.router.request('thread/fork', { threadId: 'source' });
+  f.nativeThreads.set('source-child', { id: 'source-child', cwd: f.dir, status: { type: 'idle' }, turns: [
+    { ...turn('child-later', 'SOURCE-ONLY'), items: [{ id: 'child-later:answer', type: 'agentMessage', phase: 'final_answer', text: 'FUTURE-SOURCE-ONLY' }] },
+  ] });
+  const graph = await f.router.request('engine/agents/read', { threadId: fork.thread.id });
+  const child = graph.nodes.find(node => node.kind === 'subagent' && node.engine === 'codex');
+  assert.equal(child?.result, 'CAPTURED-BEFORE-FORK');
+  assert.equal(child?.status, 'interrupted');
+  assert.equal(child?.sessionId, undefined);
+  assert.ok(graph.nodes.filter(node => node.kind === 'subagent').every(node => node.status !== 'running'));
+  assert.equal(f.calls.filter(call => call.params?.threadId === 'source-child').length, 0);
+  const detached = f.store.get(fork.thread.id);
+  assert.doesNotMatch(JSON.stringify(detached), /FUTURE-SOURCE-ONLY/);
+  assert.equal(detached.turns[1].agentThreads['["turn:turn-1","codex","source-child"]'].nativeActive, false);
+  assert.equal(detached.turns[1].agentHistory['turn:turn-1'].path, undefined);
+});
+
 test('a Codex turn that starts during source hydration can still be forked', async t => {
   const f = fixture(t, ['claude', 'codex']);
   const originalRequest = f.native.request;
@@ -343,7 +375,8 @@ test('forking a running workflow settles copied run state and clears mutable ses
   const chat = f.store.require('source');
   chat.turns[0].turn.status = 'inProgress';
   chat.turns[0].turn.items[1].status = 'inProgress';
-  chat.turns[0].runs = [{ id: 'role-run', engine: 'claude', status: 'awaitingApproval', nativeSessionId: 'old-role-session' }];
+  chat.turns[0].runs = [{ id: 'role-run', engine: 'claude', status: 'awaitingApproval', nativeSessionId: 'old-role-session',
+    nativeTasks: [{ id: 'task', status: 'running', summary: 'PARTIAL-TASK' }] }];
   chat.turns[0].workflow = { id: 'workflow-1', status: 'running', state: { status: 'running', bindings: { host: { sessionId: 'old-role-session' } }, runs: structuredClone(chat.turns[0].runs) } };
   chat.roleBindings.host = { engine: 'claude', sessionId: 'old-role-session', consumedSeq: 1 };
   chat.activeTurn = { id: 'workflow-1', turnId: 'turn-0', mode: 'both' };
@@ -358,6 +391,7 @@ test('forking a running workflow settles copied run state and clears mutable ses
   assert.equal(row.workflow.status, 'interrupted');
   assert.equal(row.workflow.state.status, 'interrupted');
   assert.equal(row.runs[0].status, 'interrupted');
+  assert.equal(row.runs[0].nativeTasks[0].status, 'interrupted');
   assert.equal(row.workflow.state.runs[0].status, 'interrupted');
   assert.deepEqual(row.workflow.state.bindings, {});
   assert.deepEqual(branch.roleBindings, {});

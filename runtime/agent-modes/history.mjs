@@ -8,6 +8,11 @@ const idle = chat => {
 };
 const liveStatus = status => ['inProgress', 'queued', 'preparing', 'running', 'awaitingApproval'].includes(status);
 const settle = value => { if (liveStatus(value?.status)) value.status = 'interrupted'; };
+const settleRun = run => {
+  settle(run);
+  delete run.nativeSessionId;
+  for (const task of run.nativeTasks ?? []) settle(task);
+};
 const activeNativeRow = (source, row) => nativeRow(row) &&
   (row.turn.status === 'inProgress' || source.activeRun?.engine === 'codex' && source.activeRun.turnId === row.turn.id);
 
@@ -59,7 +64,7 @@ function detachedSnapshot(source, thread, rows) {
       settle(item.dispatch);
       for (const agent of Object.values(item.agentsStates ?? {})) settle(agent);
     }
-    for (const run of row.runs ?? []) { settle(run); delete run.nativeSessionId; }
+    for (const run of row.runs ?? []) settleRun(run);
     // Historical results remain visible, but must not recover mutable native
     // sessions or retry workspaces owned by the previous version.
     if (row.workflow) {
@@ -67,7 +72,23 @@ function detachedSnapshot(source, thread, rows) {
       if (row.workflow.state) {
         settle(row.workflow.state);
         row.workflow.state.bindings = {};
-        for (const run of row.workflow.state.runs ?? []) { settle(run); delete run.nativeSessionId; }
+        for (const run of row.workflow.state.runs ?? []) settleRun(run);
+      }
+    }
+    for (const history of Object.values(row.agentHistory ?? {})) {
+      delete history.path;
+      for (const state of Object.values(history.turnStates ?? {})) settle(state);
+      for (const dispatch of Object.values(history.dispatches ?? {})) settle(dispatch);
+    }
+    for (const snapshot of Object.values(row.agentThreads ?? {})) {
+      snapshot.nativeActive = false;
+      for (const dispatch of Object.values(snapshot.dispatches ?? {})) settle(dispatch);
+      for (const turn of snapshot.turns ?? []) {
+        settle(turn);
+        for (const item of turn.items ?? []) {
+          settle(item);
+          for (const agent of Object.values(item.agentsStates ?? {})) settle(agent);
+        }
       }
     }
   }
