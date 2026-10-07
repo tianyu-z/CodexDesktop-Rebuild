@@ -174,13 +174,14 @@ export class ConversationStore {
           && !(turn.id === current?.id && existing.turn.status === 'interrupted')) continue;
       this.putTurn(thread.id, turn, { engine: 'codex', save: false });
     }
-    if ((!value.activeRun || value.activeRun.id === 'native:unknown') && thread.status?.type === 'active') {
+    const nativeOwned = value.activeRun?.engine === 'codex' && value.activeRun.mode !== 'both';
+    if ((!value.activeRun || nativeOwned) && thread.status?.type === 'active') {
       if (current && !value.discardedNativeTurnIds?.includes(current.id)
           && value.turns.some(row => row.engine === 'codex' && row.turn.id === current.id && row.turn.status === 'inProgress')) {
-        value.activeRun = { id: current.id, turnId: current.id, engine: 'codex' };
+        if (value.activeRun?.turnId !== current.id) value.activeRun = { id: current.id, turnId: current.id, engine: 'codex' };
       } else if (!value.activeRun) value.activeRun = { id: 'native:unknown', turnId: null, engine: 'codex' };
     }
-    if (value.activeRun?.id === 'native:unknown' && thread.status?.type === 'idle') value.activeRun = null;
+    if (nativeOwned && thread.status?.type === 'idle') value.activeRun = null;
     this.save(value);
     return clone(value);
   }

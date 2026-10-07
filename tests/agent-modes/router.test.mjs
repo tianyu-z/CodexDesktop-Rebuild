@@ -109,6 +109,50 @@ test('delayed active metadata cannot override a newer idle status notification',
   assert.equal(f.router.thread('thread-1').status.type, 'idle');
 });
 
+test('delayed idle snapshot cannot clear a newer native start notification', async t => {
+  const f = fixture(t); await start(f);
+  const snapshot = { ...f.thread, status: { type: 'idle' }, turns: [] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === 'thread/read'
+    ? new Promise(resolve => { release = () => resolve({ thread: structuredClone(snapshot) }); }) : original(method, params);
+  const hydration = f.router.hydrate('thread-1'); await tick(); assert.ok(release);
+  const turn = { id: 'newer-native', status: 'inProgress', items: [] };
+  f.router.nativeNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn } });
+  release(); await hydration;
+  assert.equal(f.router.store.get('thread-1').activeRun.turnId, turn.id);
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+});
+
+test('delayed sidebar list cannot clear a newer native start notification', async t => {
+  const f = fixture(t); await start(f);
+  const snapshot = { ...f.thread, status: { type: 'idle' }, turns: [] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === 'thread/list'
+    ? new Promise(resolve => { release = () => resolve({ data: [structuredClone(snapshot)], nextCursor: null }); }) : original(method, params);
+  const listing = f.router.request('thread/list', {}); await tick(); assert.ok(release);
+  const turn = { id: 'sidebar-newer-native', status: 'inProgress', items: [] };
+  f.router.nativeNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn } });
+  release(); const result = await listing;
+  assert.equal(f.router.store.get('thread-1').activeRun.turnId, turn.id);
+  assert.equal(result.data[0].status.type, 'active');
+});
+
+test('delayed sidebar list cannot clear a newer metadata-only active guard', async t => {
+  const f = fixture(t); await start(f);
+  const snapshot = { ...f.thread, status: { type: 'idle' }, turns: [] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === 'thread/list'
+    ? new Promise(resolve => { release = () => resolve({ data: [structuredClone(snapshot)], nextCursor: null }); }) : original(method, params);
+  const listing = f.router.request('thread/list', {}); await tick(); assert.ok(release);
+  f.router.nativeNotification({ method: 'thread/status/changed', params: { threadId: 'thread-1', status: { type: 'active', activeFlags: [] } } });
+  release(); const result = await listing;
+  assert.equal(f.router.store.get('thread-1').activeRun.id, 'native:unknown');
+  assert.equal(result.data[0].status.type, 'active');
+});
+
 test('composer effort persists without a turn and reaches the next Claude run', async t => {
   const f = fixture(t); await start(f, 'claude');
   f.router.adapter.listModels = async () => [{ value: 'opus', supportsEffort: true, supportedEffortLevels: ['low', 'high', 'max'] }];

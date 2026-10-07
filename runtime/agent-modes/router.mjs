@@ -380,6 +380,7 @@ export class EngineRouter {
     }
     if (value && (value.mode !== 'codex' || value.turns.some(row => row.engine !== 'codex' || row.nativeDetached) || value.discardedNativeTurnIds?.length || (method === 'thread/rollback' && value.thread.historyMode === 'paginated')) && ['thread/fork', 'thread/rollback', 'thread/revert'].includes(method)) return editManagedHistory(this, method, params);
     if (value && value.mode !== 'codex' && /^(turn\/(steer|tool)|thread\/(compact|realtime|startAeon|inject_items|shellCommand)|review\/)/.test(method)) throw new Error(`${method} is unavailable in ${value.mode === 'both' ? 'dual workflow' : 'Claude Code'} mode.`);
+    const listLifecycle = method === 'thread/list' ? new Map([...this.nativeLifecycle].map(([threadId, state]) => [threadId, state.revision])) : null;
     const result = await this.native.request(method, nativeParams(params));
     if (value && ['thread/rollback', 'thread/revert', 'thread/delete'].includes(method)) {
       this.store.remove(id); this.pagedHistoryHydrated.delete(id); this.nativeUnpersistedTurnRevisions.delete(id);
@@ -398,7 +399,9 @@ export class EngineRouter {
       }
       result.data = method === 'thread/search' ? visible : visible.map(thread => {
       if (!this.store.get(thread.id)) return thread;
-      this.store.mergeNativeThread(thread);
+      const latest = this.nativeLifecycle.get(thread.id);
+      const status = (latest?.revision ?? 0) !== (listLifecycle.get(thread.id) ?? 0) ? latest.status : thread.status;
+      this.store.mergeNativeThread({ ...thread, status });
       return { ...thread, ...this.thread(thread.id, { includeTurns: false }) };
       });
     }

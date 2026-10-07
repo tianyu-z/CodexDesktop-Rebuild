@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -26,6 +27,31 @@ else console.log(JSON.stringify({ status: 'alreadyRunning', socketPath: '/tmp/of
   assert.equal(await ensureSharedNativeDaemon({ command: cli, env, timeoutMs: 2000 }), '/tmp/official-codex.sock');
   assert.deepEqual(readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse), Array(2).fill(['-c', 'features.code_mode_host=true', 'app-server', 'daemon', 'start']));
   await assert.rejects(ensureSharedNativeDaemon({ command: cli, env: { ...env, CDX_TEST_HANG: '1' }, timeoutMs: 50 }), /timed out/i);
+});
+
+test('daemon startup timeout releases pipes inherited by an unrelated descendant', { timeout: 5000 }, t => {
+  const dir = mkdtempSync(join(tmpdir(), 'cdx-shared-inherited-')), cli = join(dir, 'codex');
+  writeFileSync(cli, `#!${process.execPath}\n` + String.raw`
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const descendant = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 8000)'], { stdio: ['ignore', 'inherit', 'inherit'] });
+fs.writeFileSync(process.env.CDX_TEST_DESCENDANT_MARKER, String(descendant.pid));
+descendant.unref(); setInterval(() => {}, 1000);
+`, { mode: 0o700 });
+  const module = new URL('../../runtime/agent-modes/remote/shared-native.mjs', import.meta.url).href;
+  const script = `const {ensureSharedNativeDaemon}=await import(${JSON.stringify(module)});\n` +
+    `try { await ensureSharedNativeDaemon({command:process.argv[1],timeoutMs:2000}); process.exitCode=2; }\n` +
+    `catch(error) { console.log(error.message); }`;
+  const marker = join(dir, 'spawned');
+  t.after(() => {
+    if (existsSync(marker)) try { process.kill(Number(readFileSync(marker, 'utf8')), 'SIGTERM'); } catch {}
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const run = spawnSync(process.execPath, ['--input-type=module', '-e', script, cli],
+    { encoding: 'utf8', timeout: 4000, env: { ...process.env, CDX_TEST_DESCENDANT_MARKER: marker } });
+  assert.equal(existsSync(marker), true, 'The descendant inherited the CLI pipes before timeout');
+  assert.equal(run.status, 0, run.error?.message ?? run.stderr);
+  assert.match(run.stdout, /timed out/i);
 });
 
 function fixture(t) {

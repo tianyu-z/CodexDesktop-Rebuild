@@ -11,22 +11,39 @@ export function ensureSharedNativeDaemon({ command, env = process.env, timeoutMs
   return new Promise((resolve, reject) => {
     const child = spawn(command, ['-c', 'features.code_mode_host=true', 'app-server', 'daemon', 'start'],
       { env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', settled = false;
-    const finish = (error, value) => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(value); };
-    const timer = setTimeout(() => { child.kill('SIGKILL'); finish(Error('Shared native daemon startup timed out.')); }, timeoutMs);
-    child.stdout.on('data', bytes => { stdout += bytes; if (stdout.length > 8192) { child.kill('SIGKILL'); finish(Error('Invalid shared native daemon response.')); } });
-    child.stderr.on('data', bytes => { stderr = (stderr + bytes).slice(-8192); });
-    child.on('error', error => finish(error));
-    child.on('close', code => {
-      if (code !== 0) { finish(Error(`Shared native daemon startup failed (${code}): ${stderr.trim()}`)); return; }
+    let stdout = '', stdoutBytes = 0, stderr = '', settled = false, failure, exitCode, drainTimer;
+    const finish = () => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); clearTimeout(drainTimer);
+      // The CLI may have launched an independent daemon or another descendant
+      // that inherited these pipes. Release only this probe's read handles.
+      child.stdout.destroy(); child.stderr.destroy();
+      if (failure) { reject(failure); return; }
+      if (exitCode !== 0) { reject(Error(`Shared native daemon startup failed (${exitCode}): ${stderr.trim()}`)); return; }
       let result;
-      try { result = JSON.parse(stdout); } catch { finish(Error('Invalid shared native daemon response.')); return; }
+      try { result = JSON.parse(stdout); } catch { reject(Error('Invalid shared native daemon response.')); return; }
       if (!['started', 'alreadyRunning'].includes(result?.status) || typeof result.socketPath !== 'string'
           || !isAbsolute(result.socketPath) || result.socketPath.includes('\n')) {
-        finish(Error('Shared native daemon did not provide a valid running socket.')); return;
+        reject(Error('Shared native daemon did not provide a valid running socket.')); return;
       }
-      finish(null, result.socketPath);
+      resolve(result.socketPath);
+    };
+    const stop = error => {
+      if (failure || settled) return;
+      failure = error; child.kill('SIGKILL');
+      drainTimer ??= setTimeout(finish, 200);
+    };
+    const timer = setTimeout(() => stop(Error('Shared native daemon startup timed out.')), timeoutMs);
+    child.stdout.on('data', bytes => {
+      if (failure || settled) return;
+      stdoutBytes += bytes.length;
+      if (stdoutBytes > 8192) { stop(Error('Invalid shared native daemon response.')); return; }
+      stdout += bytes;
     });
+    child.stderr.on('data', bytes => { if (!failure && !settled) stderr = (stderr + bytes).slice(-8192); });
+    child.on('error', error => { failure ??= error; if (!child.pid) finish(); });
+    child.once('exit', code => { exitCode = code; drainTimer ??= setTimeout(finish, 200); });
+    child.once('close', code => { exitCode ??= code; finish(); });
   });
 }
 
