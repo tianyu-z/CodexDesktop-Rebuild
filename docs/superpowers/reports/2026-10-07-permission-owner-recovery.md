@@ -244,3 +244,77 @@ Release/install/state evidence:
 The independent rollback copy is
 `.artifacts/rollback-permission-owner-20261007/chatgpt-dev.app`; the prior bundle
 is also parked at `/Applications/.chatgpt-dev-before-permission-owner.app`.
+
+## Retry and direct native socket correction
+
+At 21:19Z the Mac was still locked. Existing SSH masters remained reachable.
+Read-only gateway checks returned in 2.081s on bar and 33.648s on rno. rno's
+610a gateway remained healthy/busy. bar had no reachable scoped gateway socket;
+its gateway log repeatedly reported `Shared native daemon handshake timed out`.
+
+The shared bridge launched an additional `codex app-server proxy` subprocess
+and imposed a 5-second handshake deadline. On bar, the actual CLI proxy took
+18.596s to produce HTTP 101; a native `--version` call took 12.594s, and other
+CLI probes exceeded 20s. In contrast, direct HTTP upgrade on the same existing
+native Unix socket took 0.2ms. The shared home's `.codex/tmp/arg0` contained
+79,471 entries and its directory scan took 3.400s, consistent with expensive
+CLI startup/cleanup; no temporary directories were deleted. Evidence:
+`.artifacts/bar-native-handshake-retry.json` and
+`.artifacts/bar-socket-retry.json`.
+
+Commit `48c2d6c` removes that additional CLI startup. The JSON-line bridge now
+opens the official daemon's existing Unix WebSocket directly. Official daemon
+startup/discovery, permissions, request framing, payload bounds, and the
+5-second socket-handshake deadline remain in place. Closing the bridge closes
+only its client socket; missing/unresponsive sockets fail without a private
+native fallback. The live isolated-daemon probe uses a private test-only Unix
+relay for its remote socket.
+
+The new stalled-CLI regression failed with the original handshake timeout and
+passed after the change. Root verification covered 28 distinct tests across
+shared-native, remote daemon/server, and native request/approval lifecycle
+suites, all passing across the focused runs. An initial concurrent run also
+hit an unchanged CLI fixture's 2-second startup deadline; the sequential rerun
+passed. Independent review approved the final change and passed 19 tests.
+The source merge into the original workspace preserved existing edits. Its
+integration run passed 27/28: the unrelated pinned-desktop fixture could not
+open the preexisting missing `src-DJnwJvdz.js` in that workspace. That test
+passes in the repair worktree where its pinned source is present. Evidence:
+`.artifacts/shared-native-socket-red.log`,
+`.artifacts/shared-native-socket-regressions.log`,
+`.artifacts/shared-native-socket-additional.log`, and
+`.artifacts/source-native-socket-merge/tests.log`.
+
+The exact revised bridge was then tested on both real remote hosts, using only
+`initialize`, `initialized`, and `thread/list(limit=1)`. bar's native 0.154.0
+initialized in 112.1ms and listed in 72.5ms; rno's 0.142.5 initialized in
+138.8ms and listed in 392ms. Both succeeded. Temporary bridge files were
+removed, and no model turn, thread setting, approval response, or production
+daemon stop was issued. Evidence: `.artifacts/native-direct-live-results.json`.
+
+This resolves the unnecessary CLI startup in the shared-owner attachment
+path. It does not establish that rno's shared SSH transport delay is fixed.
+Frontend restart/visual verification still requires manual Mac unlock; the
+last GUI retry returned the same locked-Mac error.
+
+The revised signed bundle was installed by atomic exchange at approximately
+21:38Z. Its remote runtime archive is
+`dc066ef461979de93d714049b7b6042d2a56959f54bc26065a98e1b5bc586b33`.
+The frontend ASAR remains byte-for-byte
+`ae2667da4c61c1973a777ab59b3b224a8aacaf1af07e6d3d071364961c54a7eb`, including
+the picker correction. The build verified 8,618 unrelated ASAR files and
+6,405 unrelated remote runtime files unchanged. Backups:
+`/Applications/.chatgpt-dev-before-native-socket.app` and
+`.artifacts/rollback-native-socket-20261007/chatgpt-dev.app`. Evidence:
+`.artifacts/native-socket-release/build-manifest.json` and
+`.artifacts/native-socket-install.json`.
+
+Installation is complete; activation is still pending. Desktop PID 44586
+continues running its previous frontend. Official desktop/native PIDs
+99053/99152 remained alive. The new dc066ef remote release was not deployed
+or forced over a busy gateway while the desktop remained locked. After manual
+unlock, quit only chatgpt-dev normally, measure rno SSH latency with dev closed,
+then launch the installed app and verify bar startup plus the affected rno
+chat's permission label. Preserve the pending native request and the official
+daemon. Compare rno transport latency after reopening before attributing that
+remaining delay to a specific cause.
