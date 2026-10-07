@@ -199,15 +199,184 @@ test('editing the first Claude message resets context and clears pending client 
   assert.equal(f.runs[0].options.prompt, 'NEW FIRST');
 });
 
-test('invalid boundaries and active runs reject before changing native or public history', async t => {
+test('invalid boundaries and active history edits reject before changing native or public history', async t => {
   const f = fixture(t), before = f.store.get('source');
   for (const numTurns of [0, -1, 1.5, 4, '1']) await assert.rejects(f.router.request('thread/rollback', { threadId: 'source', numTurns }), /turn|count|boundary/i);
   await assert.rejects(f.router.request('thread/revert', { threadId: 'source', beforeTurnId: 'missing' }), /turn|boundary/i);
   await assert.rejects(f.router.request('thread/fork', { threadId: 'source', lastTurnId: 'missing' }), /turn|boundary/i);
   assert.deepEqual(f.store.get('source'), before);
   f.store.beginRun('source', { id: 'active', engine: 'claude', turnId: 'turn-2' });
-  for (const method of ['thread/fork', 'thread/rollback', 'thread/revert']) await assert.rejects(f.router.request(method, { threadId: 'source', numTurns: 1, beforeTurnId: 'turn-2' }), /active|progress/i);
-  assert.equal(f.calls.filter(x => ['thread/fork', 'thread/rollback', 'thread/revert'].includes(x.method)).length, 0);
+  for (const method of ['thread/rollback', 'thread/revert']) await assert.rejects(f.router.request(method, { threadId: 'source', numTurns: 1, beforeTurnId: 'turn-2' }), /active|progress/i);
+  assert.equal(f.calls.filter(x => ['thread/rollback', 'thread/revert'].includes(x.method)).length, 0);
+  f.store.finishRun('source', 'active');
+});
+
+test('forking an active Claude turn keeps its partial content in an idle independent branch', async t => {
+  const f = fixture(t, ['claude', 'claude']);
+  const partial = { ...turn('turn-1', 'MARKER-1'), status: 'inProgress', items: [
+    { id: 'turn-1:user', type: 'userMessage', content: [{ type: 'text', text: 'MARKER-1' }] },
+    { id: 'turn-1:answer', type: 'agentMessage', text: 'PARTIAL-ANSWER', status: 'inProgress' },
+  ] };
+  f.store.putTurn('source', partial, { engine: 'claude' });
+  f.store.beginRun('source', { id: 'active-claude', engine: 'claude', turnId: 'turn-1' });
+  f.nativeThreads.get('source').status = { type: 'active', activeFlags: [] };
+  const sourceBefore = f.store.get('source');
+
+  const fork = await f.router.request('thread/fork', { threadId: 'source' });
+  const branch = f.store.get(fork.thread.id);
+  assert.equal(fork.thread.status.type, 'idle');
+  assert.equal(fork.engineState.busy, false);
+  assert.equal(branch.thread.status.type, 'idle');
+  assert.equal(branch.activeRun, null);
+  assert.equal(branch.activeTurn, null);
+  assert.deepEqual(branch.turns.map(row => row.turn.status), ['completed', 'interrupted']);
+  assert.equal(branch.turns[1].turn.items[1].text, 'PARTIAL-ANSWER');
+  assert.equal(branch.turns[1].turn.items[1].status, 'interrupted');
+  assert.equal(branch.bindings.claude.sessionId, null);
+  assert.deepEqual(f.store.get('source').turns, sourceBefore.turns);
+  assert.deepEqual(f.store.get('source').activeRun, sourceBefore.activeRun);
+  assert.deepEqual(f.store.get('source').bindings, sourceBefore.bindings);
+
+  const earlier = await f.router.request('thread/fork', { threadId: 'source', lastTurnId: 'turn-0' });
+  assert.deepEqual(earlier.thread.turns.map(row => row.id), ['turn-0']);
+  assert.equal(f.store.get(earlier.thread.id).activeRun, null);
+  await assert.rejects(f.router.request('thread/revert', { threadId: 'source', beforeTurnId: 'turn-1' }), /active|progress/i);
+  await assert.rejects(f.router.request('thread/rollback', { threadId: 'source', numTurns: 1 }), /active|progress/i);
+  assert.equal(f.store.get('source').activeRun.id, 'active-claude');
+  await f.router.request('turn/start', { threadId: fork.thread.id, input: [{ type: 'text', text: 'BRANCH-ONLY' }] }); await tick();
+  assert.equal(f.runs[0].options.nativeSessionId, null);
+  assert.match(f.runs[0].options.prompt, /PARTIAL-ANSWER/);
+  assert.match(f.runs[0].options.prompt, /BRANCH-ONLY/);
+  assert.equal(f.store.get('source').activeRun.id, 'active-claude');
+  f.runs[0].finish({ status: 'completed', nativeSessionId: 'branch-only-session' }); await tick();
+  f.store.finishRun('source', 'active-claude');
+});
+
+test('forking a running mixed Codex turn detaches its partial native context without touching the source', async t => {
+  const f = fixture(t, ['claude', 'codex', 'codex']);
+  const partial = { ...turn('turn-2', 'MARKER-2'), status: 'inProgress', items: [
+    { id: 'turn-2:user', type: 'userMessage', content: [{ type: 'text', text: 'MARKER-2' }] },
+    { id: 'turn-2:answer', type: 'agentMessage', text: 'PARTIAL-CODEX', status: 'inProgress' },
+  ] };
+  f.store.putTurn('source', partial, { engine: 'codex' });
+  f.nativeThreads.get('source').turns[1] = structuredClone(partial);
+  f.nativeThreads.get('source').status = { type: 'active', activeFlags: [] };
+  f.store.beginRun('source', { id: 'active-codex', engine: 'codex', turnId: 'turn-2' });
+  const sourceBefore = f.store.get('source');
+
+  const fork = await f.router.request('thread/fork', { threadId: 'source' });
+  const branch = f.store.get(fork.thread.id);
+  assert.equal(f.calls.find(call => call.method === 'thread/fork').params.lastTurnId, 'turn-1');
+  assert.deepEqual(branch.turns.map(row => row.turn.id), ['turn-0', 'fork-1-native-0', 'turn-2']);
+  assert.equal(branch.turns[2].nativeDetached, true);
+  assert.equal(branch.turns[2].turn.status, 'interrupted');
+  assert.equal(branch.turns[2].turn.items[1].text, 'PARTIAL-CODEX');
+  assert.deepEqual(f.nativeThreads.get(fork.thread.id).turns.map(row => row.id), ['fork-1-native-0']);
+  assert.equal(fork.thread.status.type, 'idle');
+  assert.equal(fork.engineState.busy, false);
+  assert.deepEqual(f.store.get('source').turns, sourceBefore.turns);
+  assert.deepEqual(f.store.get('source').activeRun, sourceBefore.activeRun);
+  assert.deepEqual(f.store.get('source').bindings, sourceBefore.bindings);
+  assert.deepEqual(f.nativeThreads.get('source').turns.map(row => row.id), ['turn-1', 'turn-2']);
+
+  const completed = turn('turn-2', 'SOURCE-FINISHED');
+  f.nativeThreads.get('source').turns[1] = structuredClone(completed);
+  f.router.nativeNotification({ method: 'turn/completed', params: { threadId: 'source', turn: completed } });
+  assert.equal(f.store.get('source').activeRun, null);
+  assert.equal(f.store.get('source').turns[2].turn.items[1].text, 'Answer: SOURCE-FINISHED');
+  assert.equal(f.store.get(fork.thread.id).turns[2].turn.items[1].text, 'PARTIAL-CODEX');
+  await f.router.request('turn/start', { threadId: fork.thread.id, input: [{ type: 'text', text: 'BRANCH-ONLY' }] });
+  const input = f.calls.find(call => call.method === 'turn/start').params.input[0].text;
+  assert.match(input, /PARTIAL-CODEX/);
+  assert.doesNotMatch(input, /SOURCE-FINISHED/);
+});
+
+test('a Codex turn that starts during source hydration can still be forked', async t => {
+  const f = fixture(t, ['claude', 'codex']);
+  const originalRequest = f.native.request;
+  let started = false;
+  f.native.request = async (method, params) => {
+    if (method === 'thread/read' && params.threadId === 'source' && !started) {
+      started = true;
+      const partial = { ...turn('turn-2', 'LATE-START'), status: 'inProgress' };
+      f.nativeThreads.get('source').turns.push(structuredClone(partial));
+      f.store.putTurn('source', partial, { engine: 'codex' });
+      f.store.beginRun('source', { id: 'late-run', engine: 'codex', turnId: 'turn-2' });
+    }
+    return originalRequest(method, params);
+  };
+  const fork = await f.router.request('thread/fork', { threadId: 'source' });
+  assert.deepEqual(fork.thread.turns.map(row => row.status), ['completed', 'completed', 'interrupted']);
+  assert.equal(f.store.get(fork.thread.id).turns[2].nativeDetached, true);
+  assert.equal(f.store.get('source').activeRun.id, 'late-run');
+  f.store.finishRun('source', 'late-run');
+});
+
+test('a fork freezes source content when the active native turn finishes during native I/O', async t => {
+  const f = fixture(t, ['claude', 'codex']);
+  const partial = { ...turn('turn-1', 'START'), status: 'inProgress' };
+  f.store.putTurn('source', partial, { engine: 'codex' });
+  f.nativeThreads.get('source').turns[0] = structuredClone(partial);
+  f.store.beginRun('source', { id: 'active-codex', engine: 'codex', turnId: 'turn-1' });
+  const originalRequest = f.native.request;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let entered;
+  const atFork = new Promise(resolve => { entered = resolve; });
+  f.native.request = async (method, params) => { if (method === 'thread/fork') { entered(); await gate; } return originalRequest(method, params); };
+  const forking = f.router.request('thread/fork', { threadId: 'source' });
+  try {
+    await atFork;
+    const completed = turn('turn-1', 'FINISHED-LATER');
+    f.nativeThreads.get('source').turns[0] = structuredClone(completed);
+    f.router.nativeNotification({ method: 'turn/completed', params: { threadId: 'source', turn: completed } });
+  } finally { release(); }
+  const fork = await forking;
+  assert.equal(fork.thread.turns[1].items[1].text, 'Answer: START');
+  assert.equal(fork.thread.turns[1].status, 'interrupted');
+  assert.equal(f.nativeThreads.get(fork.thread.id).turns.length, 0);
+  assert.equal(f.store.get('source').turns[1].turn.items[1].text, 'Answer: FINISHED-LATER');
+});
+
+test('forking a running workflow settles copied run state and clears mutable sessions', async t => {
+  const f = fixture(t, ['both']);
+  const chat = f.store.require('source');
+  chat.turns[0].turn.status = 'inProgress';
+  chat.turns[0].turn.items[1].status = 'inProgress';
+  chat.turns[0].runs = [{ id: 'role-run', engine: 'claude', status: 'awaitingApproval', nativeSessionId: 'old-role-session' }];
+  chat.turns[0].workflow = { id: 'workflow-1', status: 'running', state: { status: 'running', bindings: { host: { sessionId: 'old-role-session' } }, runs: structuredClone(chat.turns[0].runs) } };
+  chat.roleBindings.host = { engine: 'claude', sessionId: 'old-role-session', consumedSeq: 1 };
+  chat.activeTurn = { id: 'workflow-1', turnId: 'turn-0', mode: 'both' };
+  f.store.save(chat);
+  const sourceBefore = f.store.get('source');
+  const fork = await f.router.request('thread/fork', { threadId: 'source' });
+  const branch = f.store.get(fork.thread.id), row = branch.turns[0];
+  assert.equal(branch.activeTurn, null);
+  assert.equal(branch.thread.status.type, 'idle');
+  assert.equal(row.turn.status, 'interrupted');
+  assert.equal(row.turn.items[1].status, 'interrupted');
+  assert.equal(row.workflow.status, 'interrupted');
+  assert.equal(row.workflow.state.status, 'interrupted');
+  assert.equal(row.runs[0].status, 'interrupted');
+  assert.equal(row.workflow.state.runs[0].status, 'interrupted');
+  assert.deepEqual(row.workflow.state.bindings, {});
+  assert.deepEqual(branch.roleBindings, {});
+  assert.equal(branch.bindings.claude.sessionId, null);
+  assert.deepEqual(f.store.get('source'), sourceBefore);
+});
+
+test('a failed active fork removes only its new native branch', async t => {
+  const f = fixture(t, ['claude', 'codex']);
+  f.store.beginRun('source', { id: 'active', engine: 'claude', turnId: 'turn-0' });
+  const before = f.store.get('source'), nativeBefore = structuredClone(f.nativeThreads.get('source'));
+  const originalReplace = f.store.replaceIdleHistory.bind(f.store);
+  f.store.replaceIdleHistory = snapshot => { if (snapshot.id !== 'source') throw Error('fork save failed'); return originalReplace(snapshot); };
+  await assert.rejects(f.router.request('thread/fork', { threadId: 'source' }), /fork save failed/);
+  assert.deepEqual(f.store.get('source'), before);
+  assert.deepEqual(f.nativeThreads.get('source'), nativeBefore);
+  assert.equal(f.calls.filter(call => call.method === 'thread/archive' && call.params.threadId === 'source').length, 0);
+  assert.deepEqual(f.calls.filter(call => call.method === 'thread/archive').map(call => call.params.threadId), ['fork-1']);
+  assert.equal(f.store.has('fork-1'), false);
   f.store.finishRun('source', 'active');
 });
 

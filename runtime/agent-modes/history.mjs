@@ -4,8 +4,12 @@ import { publicHistory } from './handoff.mjs';
 const clone = value => structuredClone(value);
 const nativeRow = row => row.engine === 'codex' && !row.nativeDetached;
 const idle = chat => {
-  if (chat.activeRun || chat.turns.some(row => row.turn.status === 'inProgress')) throw new Error('Finish or interrupt the active run before editing or forking history.');
+  if (chat.activeRun || chat.turns.some(row => row.turn.status === 'inProgress')) throw new Error('Finish or interrupt the active run before editing history.');
 };
+const liveStatus = status => ['inProgress', 'queued', 'preparing', 'running', 'awaitingApproval'].includes(status);
+const settle = value => { if (liveStatus(value?.status)) value.status = 'interrupted'; };
+const activeNativeRow = (source, row) => nativeRow(row) &&
+  (row.turn.status === 'inProgress' || source.activeRun?.engine === 'codex' && source.activeRun.turnId === row.turn.id);
 
 function boundary(chat, method, params) {
   if (method === 'thread/rollback') {
@@ -32,9 +36,10 @@ function detachedSnapshot(source, thread, rows) {
   const next = clone(source);
   next.id = thread.id;
   next.cwd = thread.cwd;
-  next.thread = { ...source.thread, ...metadata, preview: rows.flatMap(row => row.turn.items).find(item => item.type === 'userMessage')?.content?.filter(item => item.type === 'text').map(item => item.text).join('\n').slice(0, 250) ?? '' };
+  next.thread = { ...source.thread, ...metadata, status: { type: 'idle' }, preview: rows.flatMap(row => row.turn.items).find(item => item.type === 'userMessage')?.content?.filter(item => item.type === 'text').map(item => item.text).join('\n').slice(0, 250) ?? '' };
   next.turns = clone(rows);
   next.activeRun = null; next.activeTurn = null;
+  delete next.pendingHistoryEdit;
   next.bindings = {
     // Native Codex retained its own prefix, including handoffs in those turns.
     codex: { sessionId: thread.id, consumedSeq: Math.max(0, ...rows.filter(nativeRow).map(row => row.seq)) },
@@ -48,9 +53,23 @@ function detachedSnapshot(source, thread, rows) {
   delete next.claudeActualPermissionMode;
   for (const row of next.turns) {
     row.historyDetached = true;
+    settle(row.turn);
+    for (const item of row.turn.items) {
+      settle(item);
+      settle(item.dispatch);
+      for (const agent of Object.values(item.agentsStates ?? {})) settle(agent);
+    }
+    for (const run of row.runs ?? []) { settle(run); delete run.nativeSessionId; }
     // Historical results remain visible, but must not recover mutable native
     // sessions or retry workspaces owned by the previous version.
-    if (row.workflow?.state) row.workflow.state.bindings = {};
+    if (row.workflow) {
+      settle(row.workflow);
+      if (row.workflow.state) {
+        settle(row.workflow.state);
+        row.workflow.state.bindings = {};
+        for (const run of row.workflow.state.runs ?? []) { settle(run); delete run.nativeSessionId; }
+      }
+    }
   }
   return next;
 }
@@ -78,7 +97,7 @@ export function recoverHistoryEdit(router, id, nativeThread) {
 /** History operations for the unified transcript used by the native edit UI. */
 export async function editManagedHistory(router, method, params) {
   const id = params.threadId;
-  idle(router.store.get(id));
+  if (method !== 'thread/fork') idle(router.store.get(id));
   if (method === 'thread/fork') {
     if (params.path || params.ephemeral) throw new Error('Managed history forks require a persistent conversation ID.');
     if (params.cwd && realpathSync(params.cwd) !== realpathSync(router.store.get(id).cwd)) throw new Error('Fork managed history in the same workspace.');
@@ -86,7 +105,8 @@ export async function editManagedHistory(router, method, params) {
   // Validate against the unified timeline after loading every native page.
   await router.hydrate(id);
   router.assertOpen();
-  const source = router.store.get(id); idle(source);
+  const source = router.store.get(id);
+  if (method !== 'thread/fork') idle(source);
   const index = boundary(source, method, params);
   const retained = source.turns.slice(0, index), removed = source.turns.slice(index);
   if (method !== 'thread/fork') {
@@ -110,7 +130,10 @@ export async function editManagedHistory(router, method, params) {
     return { ...result, thread: router.thread(id), engineState: router.state(id) };
   }
 
-  const retainedCodex = retained.filter(nativeRow);
+  // The source may keep streaming while native I/O runs. Preserve the public
+  // partial turn as a detached, interrupted snapshot; native Codex forks only
+  // through the last completed turn so later source output cannot leak in.
+  const retainedCodex = retained.filter(row => nativeRow(row) && !activeNativeRow(source, row));
   // `lastTurnId` is a public boundary. The native fork ends at the closest
   // retained Codex turn; a Claude-only prefix has no native boundary at all.
   const { lastTurnId, engineMode, engineModel, engineModels, template, roleOverrides, claudePermissionMode, claudeActualPermissionMode, claudeCommandTarget, skipAutoTitleGeneration, ...clean } = params;
@@ -136,7 +159,7 @@ export async function editManagedHistory(router, method, params) {
     let nativeIndex = 0;
     const mapped = retained.map(row => {
       if (!nativeRow(row)) return row;
-      if (detachCodex) return { ...clone(row), nativeDetached: true };
+      if (detachCodex || activeNativeRow(source, row)) return { ...clone(row), nativeDetached: true };
       const copy = clone(row), nativeTurn = nativeFork.turns[nativeIndex++].turn;
       copy.turn = clone(nativeTurn);
       const user = copy.turn.items.find(item => item.type === 'userMessage');
