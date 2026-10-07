@@ -29,15 +29,19 @@ export function presentItem(item, engine) {
   const source = engine === 'both' && ['codex', 'claude'].includes(item.cdxEngineSource) ? item.cdxEngineSource : engine;
   return { ...structuredClone(item), cdxEngineSource: source };
 }
-export function presentTurn(turn, engine) {
-  return { ...structuredClone(turn), items: turn.items.map(item => presentItem(item, engine)), cdxEngineSource: engine, itemsView: 'full' };
+export function presentTurn(turn, engine, itemsView = 'full') {
+  const { items, ...metadata } = turn;
+  const unloaded = itemsView === 'notLoaded';
+  return { ...structuredClone(metadata), items: unloaded ? [] : (items ?? []).map(item => presentItem(item, engine)), cdxEngineSource: engine, itemsView: unloaded ? 'notLoaded' : 'full' };
 }
 
-/** Stable anchor cursors survive newly appended turns and support reversing direction. */
-export function page(entries, params, kind) {
+/** Stable anchor cursors survive newly appended turns and support reversing direction.
+ * A size-changing presenter should provide a conservative measure alongside present.
+ */
+export function page(entries, params, kind, presenter = row => row.value) {
   const direction = params.sortDirection ?? (kind === 'turns' ? 'desc' : 'asc');
   if (!['asc', 'desc'].includes(direction)) throw new Error('Invalid pagination direction.');
-  const ordered = direction === 'desc' ? [...entries].reverse() : [...entries];
+  const ordered = direction === 'desc' ? [...entries].reverse() : entries;
   let start = 0;
   if (params.cursor) {
     let cursor;
@@ -48,8 +52,19 @@ export function page(entries, params, kind) {
     if (!cursor.inclusive) start++;
   }
   const limit = Math.min(500, Math.max(1, params.limit ?? 50));
-  const rows = ordered.slice(start, start + limit);
+  const byteTarget = Number.isSafeInteger(params.byteTargetBytes) && params.byteTargetBytes > 0 ? Math.min(8 * 1024 * 1024, params.byteTargetBytes) : 8 * 1024 * 1024;
+  const present = typeof presenter === 'function' ? presenter : presenter.present;
+  const measure = typeof presenter === 'function' ? row => Buffer.byteLength(JSON.stringify(row.value)) : (presenter.measure ?? (row => Buffer.byteLength(JSON.stringify(row.value))));
+  const rows = [];
+  let bytes = 2; // JSON array brackets; one comma between entries.
+  for (let index = start; index < ordered.length && rows.length < limit; index++) {
+    const row = ordered[index];
+    const nextBytes = measure(row) + (rows.length ? 1 : 0);
+    if (rows.length && bytes + nextBytes > byteTarget) break;
+    rows.push(row);
+    bytes += nextBytes;
+  }
   const cursor = (anchor, inclusive) => Buffer.from(JSON.stringify({ kind, threadId: params.threadId, turnId: params.turnId ?? null, anchor, inclusive })).toString('base64url');
-  return { data: rows.map(row => row.value), nextCursor: start + rows.length < ordered.length && rows.length ? cursor(rows.at(-1).key, false) : null,
+  return { data: rows.map(present), nextCursor: start + rows.length < ordered.length && rows.length ? cursor(rows.at(-1).key, false) : null,
     backwardsCursor: rows.length ? cursor(rows[0].key, true) : null };
 }

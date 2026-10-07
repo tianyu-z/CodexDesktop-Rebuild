@@ -29,7 +29,7 @@ export class EngineRouter {
   constructor({ store, native, adapter, emit, templates, workflowFactory }) {
     Object.assign(this, { store, native, adapter, emit });
     this.runs = new Map(); this.approvals = new Map(); this.locks = new Map(); this.closed = false;
-    this.nativeTurnRevisions = new Map(); this.nativeNameRevisions = new Map();
+    this.nativeTurnRevisions = new Map(); this.nativeNameRevisions = new Map(); this.pagedHistoryHydrated = new Set();
     this.workflow = new WorkflowRouter(this, { templates, workflowFactory });
     this.claudeCommands = new ClaudeCommandRouter(this);
   }
@@ -154,6 +154,7 @@ export class EngineRouter {
     // A native session already contains its own pre-existing history.
     const value = this.store.get(id);
     if (!value.turns.some(row => row.engine !== 'codex' || row.nativeDetached)) this.store.setBinding(id, 'codex', { consumedSeq: Math.max(0, ...value.turns.map(row => row.seq)) });
+    this.pagedHistoryHydrated.add(id);
     return this.store.get(id);
   }
   cleanNativeTurn(id, turn) {
@@ -188,6 +189,21 @@ export class EngineRouter {
     return { ...value.thread, cwd: value.cwd, historyMode: 'legacy', status: value.activeRun ? { type: 'active', activeFlags: [] } : { type: 'idle' },
       turns: includeTurns ? value.turns.map(row => presentTurn(row.turn, row.engine)) : [], engineState: this.state(id) };
   }
+  pageTurns(rows, params) {
+    const unloaded = params.itemsView === 'notLoaded';
+    const entries = rows.map(row => ({ key: row.turn.id, value: row.turn, engine: row.engine }));
+    return page(entries, params, 'turns', {
+      present: row => presentTurn(row.value, row.engine, params.itemsView),
+      measure: row => Buffer.byteLength(JSON.stringify(unloaded ? { ...row.value, items: [] } : row.value)) + 128 * (unloaded ? 1 : (row.value.items?.length ?? 0) + 1),
+    });
+  }
+  pageItems(rows, params) {
+    const entries = rows.filter(row => !params.turnId || row.turn.id === params.turnId).flatMap(row => row.turn.items.map(item => ({ key: `${row.turn.id}/${item.id}`, value: item, turnId: row.turn.id, engine: row.engine })));
+    return page(entries, params, 'items', {
+      present: row => ({ turnId: row.turnId, item: presentItem(row.value, row.engine) }),
+      measure: row => Buffer.byteLength(JSON.stringify(row.value)) + Buffer.byteLength(row.turnId) + 128,
+    });
+  }
   async dispatch(method, params) {
     this.assertOpen();
     if (params.claudePermissionMode !== undefined) assertClaudePermissionMode(params.claudePermissionMode);
@@ -196,8 +212,13 @@ export class EngineRouter {
     if (method === 'thread/goal/set' && (params.status == null || params.status === 'active') && this.store.get(id)?.mode !== undefined && this.store.get(id).mode !== 'codex') {
       throw new Error('Native /goal requires Only Codex. Remove /goal to send a regular turn to the selected engine.');
     }
-    if (id && this.store.get(id)?.pendingHistoryEdit && !['engine/capabilities', 'engine/claude/commands', 'turn/interrupt', 'engine/runs/interrupt'].includes(method)) await this.hydrate(id);
+    if (id && this.store.has(id) && this.store.require(id).pendingHistoryEdit && !['engine/capabilities', 'engine/claude/commands', 'turn/interrupt', 'engine/runs/interrupt'].includes(method)) await this.hydrate(id);
     if (id && this.workflow.internal.has(id)) throw new Error('Internal workflow sessions are not public chats.');
+    if (id && this.store.has(id) && ['thread/turns/list', 'thread/items/list'].includes(method)) {
+      if (!this.pagedHistoryHydrated.has(id)) await this.hydrate(id);
+      const rows = this.store.require(id).turns;
+      return method === 'thread/turns/list' ? this.pageTurns(rows, params) : this.pageItems(rows, params);
+    }
     if (method === 'engine/agents/read') return readAgentMap(this, params);
     if (method === 'engine/claude/commands') return this.claudeCommands.list(params);
     if (method === 'engine/claude/client-action/claim') return this.claudeCommands.claim(id, params.actionId);
@@ -330,22 +351,15 @@ export class EngineRouter {
         if (value && result.thread.id !== id) throw new Error('Resuming managed history into another thread is unsupported.');
         await this.hydrate(result.thread.id);
         return { ...result, ...(value?.mode === 'both' && value.models.codex ? { model: value.models.codex } : {}), thread: this.thread(result.thread.id, { includeTurns: method === 'thread/resume' ? !params.excludeTurns : params.includeTurns === true }),
-          initialTurnsPage: params.initialTurnsPage ? page(this.store.get(id).turns.map(row => ({ key: row.turn.id, value: presentTurn(row.turn, row.engine) })), { ...params.initialTurnsPage, threadId: id }, 'turns') : null, turnsBackwardsCursor: null, itemsBackwardsCursor: null, engineState: this.state(result.thread.id) };
+          initialTurnsPage: params.initialTurnsPage ? this.pageTurns(this.store.require(result.thread.id).turns, { ...params.initialTurnsPage, threadId: result.thread.id }) : null, turnsBackwardsCursor: null, itemsBackwardsCursor: null, engineState: this.state(result.thread.id) };
       }
       return result;
-    }
-    if (value && ['thread/turns/list', 'thread/items/list'].includes(method)) {
-      await this.hydrate(id);
-      const rows = this.store.get(id).turns;
-      if (method === 'thread/turns/list') return page(rows.map(row => ({ key: row.turn.id, value: presentTurn(row.turn, row.engine) })), params, 'turns');
-      const entries = rows.filter(row => !params.turnId || row.turn.id === params.turnId).flatMap(row => row.turn.items.map(item => ({ key: `${row.turn.id}/${item.id}`, value: { turnId: row.turn.id, item: presentItem(item, row.engine) } })));
-      return page(entries, params, 'items');
     }
     if (value && (value.mode !== 'codex' || value.turns.some(row => row.engine !== 'codex' || row.nativeDetached) || value.discardedNativeTurnIds?.length) && ['thread/fork', 'thread/rollback', 'thread/revert'].includes(method)) return editManagedHistory(this, method, params);
     if (value && value.mode !== 'codex' && /^(turn\/(steer|tool)|thread\/(compact|realtime|startAeon|inject_items|shellCommand)|review\/)/.test(method)) throw new Error(`${method} is unavailable in ${value.mode === 'both' ? 'dual workflow' : 'Claude Code'} mode.`);
     const result = await this.native.request(method, nativeParams(params));
     if (value && ['thread/rollback', 'thread/revert', 'thread/delete'].includes(method)) {
-      this.store.remove(id);
+      this.store.remove(id); this.pagedHistoryHydrated.delete(id);
       if (method !== 'thread/delete') { if (result.thread) this.store.ensureThread(result.thread); else await this.hydrate(id); }
     }
     if (method === 'thread/list' || method === 'thread/search') {
@@ -596,7 +610,7 @@ export class EngineRouter {
       if (!revisions) this.nativeTurnRevisions.set(id, revisions = new Map());
       revisions.set(nativeTurnId, (revisions.get(nativeTurnId) ?? 0) + 1);
     }
-    if (method === 'thread/deleted') this.store.remove(id);
+    if (method === 'thread/deleted') { this.store.remove(id); this.pagedHistoryHydrated.delete(id); }
     if (method === 'thread/name/updated') { this.nativeNameRevisions.set(id, (this.nativeNameRevisions.get(id) ?? 0) + 1); const current = this.store.require(id); current.thread.name = params.threadName; this.store.save(current); }
     // The native container is idle during a Claude run; don't let an unrelated
     // metadata refresh overwrite its status in the frontend.
