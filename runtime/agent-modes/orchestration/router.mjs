@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import { updateClaudeProgress, applyClaudeThinking } from '../claude-progress.mjs';
 import { existsSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveParameters, resolveRoleConfig } from '../templates/schema.mjs';
 import { assertClaudeModel } from '../claude-models.mjs';
 import { CLAUDE_PERMISSION_MODES } from '../claude-permissions.mjs';
+import { DEFAULT_CLAUDE_MODEL, DEFAULT_CLAUDE_PERMISSION_MODE } from '../claude-defaults.mjs';
 import { createClaudeInteraction } from '../claude-interactions.mjs';
 import { publicHistory, writeHistorySnapshot } from '../handoff.mjs';
 import { claudeInputText, captureClaudeInput, readClaudeInputCapture } from '../claude-input.mjs';
@@ -50,7 +52,7 @@ export class WorkflowRouter {
     this.assertAvailable(params);
     const supplied = params.engineModels;
     if (supplied !== undefined && (!supplied || typeof supplied !== 'object' || Array.isArray(supplied) || Object.keys(supplied).some(key => !['codex', 'claude'].includes(key)))) throw new Error('Invalid engine model selection.');
-    const models = { codex: null, claude: 'default', ...current?.models, ...supplied };
+    const models = { codex: null, claude: DEFAULT_CLAUDE_MODEL, ...current?.models, ...supplied };
     const resolved = params.collaborationMode?.settings?.model ?? params.model;
     if (nativeModel && resolved != null) models.codex = resolved;
     for (const model of Object.values(models)) if (model !== null) assertClaudeModel(model);
@@ -61,7 +63,7 @@ export class WorkflowRouter {
     const parameters = resolveParameters(template, selected.parameters ?? {});
     const sameTemplate = current?.template?.id === template.id && current?.template?.revision === template.revision;
     const overrides = params.roleOverrides === undefined ? (sameTemplate ? current?.roleOverrides ?? {} : {}) : params.roleOverrides;
-    const effective = resolveRoleConfig(template, overrides, models);
+    const effective = resolveRoleConfig(template, overrides, models, { claudePermissionMode: params.claudePermissionMode ?? current?.claudePermissionMode ?? DEFAULT_CLAUDE_PERMISSION_MODE });
     return { models: clone(models), ...effective, parameters, selected: { id: template.id, revision: template.revision, parameters } };
   }
   templateRequest(method, params) {
@@ -79,7 +81,18 @@ export class WorkflowRouter {
   read(id, turnId) {
     const chat = this.store.get(id);
     const latestTurnId = chat?.turns.at(-1)?.turn.id;
-    return { workflows: (chat?.turns ?? []).filter(row => row.workflow && (!turnId || row.turn.id === turnId)).map(row => ({ turnId: row.turn.id, isLatestTurn: row.turn.id === latestTurnId, workflowId: row.workflow.id, status: row.workflow.status, config: row.workflow.config, runs: row.runs, state: row.workflow.state })) };
+    return { workflows: (chat?.turns ?? []).filter(row => row.workflow && (!turnId || row.turn.id === turnId)).map(row => ({ turnId: row.turn.id, isLatestTurn: row.turn.id === latestTurnId, workflowId: row.workflow.id, status: row.workflow.status, config: row.workflow.config,
+      runs: row.runs.map(child => {
+        const activity = !terminal.has(child.status) && this.active.get(row.workflow.id)?.claudeProgress.get(child.id);
+        return activity ? { ...child, activity: { ...activity, runId: child.id, turnId: row.turn.id } } : child;
+      }), state: row.workflow.state })) };
+  }
+  progress(id) {
+    const chat = this.store.has(id) ? this.store.require(id) : null, owner = this.active.get(chat?.activeTurn?.id);
+    if (!owner || owner.controller.signal.aborted) return [];
+    const row = chat.turns.find(row => row.workflow?.id === owner.id);
+    return (row?.runs ?? []).filter(child => child.engine === 'claude' && !terminal.has(child.status) && owner.claudeProgress.has(child.id))
+      .map(child => ({ runId: child.id, roleId: child.roleId, turnId: row.turn.id, activity: { ...owner.claudeProgress.get(child.id), runId: child.id, turnId: row.turn.id } }));
   }
   async start(id, params) {
     this.router.assertOpen();
@@ -100,13 +113,14 @@ export class WorkflowRouter {
     if (history[0] && (omitted || history[0].text.length > 60000)) history[0].text = `[Earlier public history: ${historyPath}]\n${history[0].text.slice(-60000)}`;
     const config = { mode: 'both', models: selected.models, roleOverrides: selected.roleOverrides, template: selected.template, parameters: selected.parameters,
       claudePermissionMode: params.claudePermissionMode === undefined ? chat.claudePermissionMode : params.claudePermissionMode,
+      claudeWorkflowOptions: clone(chat.claudeWorkflowOptions ?? {}),
       nativeOptions, cwd: chat.cwd, input, history, throughSeq: chat.nextSeq - 1 };
     this.store.beginWorkflow(id, { id: idRun, turn, config });
     this.launch(id, idRun, turn, config);
     return { turn: presentTurn(turn, 'both'), engineState: this.router.state(id) };
   }
   launch(id, workflowId, turn, config, recovery = {}) {
-    const run = { id: workflowId, threadId: id, turn: clone(turn), controller: new AbortController(), handle: null };
+    const run = { id: workflowId, threadId: id, turn: clone(turn), controller: new AbortController(), handle: null, claudeProgress: new Map() };
     this.active.set(workflowId, run);
     run.done = new Promise(resolve => setImmediate(resolve)).then(async () => {
       this.router.notify('thread/status/changed', { threadId: id, status: { type: 'active', activeFlags: [] } });
@@ -183,13 +197,25 @@ export class WorkflowRouter {
     });
   }
   event(run, event) {
-    if (this.store.get(run.threadId)?.activeTurn?.id !== run.id) return;
+    if (!this.store.has(run.threadId) || this.store.require(run.threadId).activeTurn?.id !== run.id) return;
+    if (event.engine === 'claude' && ['activity', 'token-usage'].includes(event.type)) {
+      const child = this.store.workflowRecord(run.threadId, run.id).row.runs.find(child => child.id === event.runId);
+      if (!child || child.engine !== 'claude' || terminal.has(child.status) || run.controller.signal.aborted) return;
+      // Do not persist counters or put a snapshot in the workflow event log.
+      const { eventId, seq, runId, engine, roleId, stepId, round, ...progress } = event;
+      run.claudeProgress.set(child.id, updateClaudeProgress(run.claudeProgress.get(child.id), progress));
+      return;
+    }
     const history = this.store.workflowRecord(run.threadId, run.id).row.workflow.events;
     if (history.some(previous => previous.eventId === event.eventId && previous.runId === event.runId)) return;
     const notifications = [];
     const notify = (method, params) => notifications.push([method, params]);
     this.store.batch(run.threadId, () => {
       this.store.appendWorkflowEvent(run.threadId, run.id, event);
+      if (event.type === 'agent-model') {
+        const { value, row } = this.store.workflowRecord(run.threadId, run.id);
+        (row.agentModels ??= {})[event.parentToolUseId] = event.model; this.store.save(value);
+      }
       if (event.type === 'session' && event.engine === 'codex') this.registerInternal(event.sessionId);
       const source = { cdxEngineSource: event.engine, cdxRunId: event.runId, cdxRoleId: event.roleId, cdxStepId: event.stepId };
       const id = run.threadId, turn = run.turn;
@@ -201,6 +227,7 @@ export class WorkflowRouter {
         if (index < 0) notify('item/started', { threadId: id, turnId: turn.id, item: presentItem(item, 'both') });
         if (complete) notify('item/completed', { threadId: id, turnId: turn.id, item: presentItem(item, 'both') });
       };
+      applyClaudeThinking(event, { turn, update, threadId: id, source, notify, save: () => this.store.putTurn(id, turn, { engine: 'both', runId: run.id }) });
       if (event.type === 'message-start') update({ id: event.id, type: 'agentMessage', text: '', phase: 'commentary' }, false);
       if (event.type === 'message-completed') update({ id: event.id, type: 'agentMessage', text: event.text, phase: event.nativeItem?.phase ?? 'final_answer' }, true);
       if (event.type === 'text-delta') {

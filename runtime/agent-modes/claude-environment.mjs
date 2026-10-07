@@ -4,12 +4,14 @@ import { join } from 'node:path';
 import { parse } from 'jsonc-parser';
 
 // Only connection and model selection are shared with the editor. Its tool
-// permissions, MCP credentials, hooks, PATH and executable options stay separate.
+// permissions, feature switches, MCP credentials, hooks, PATH and executable
+// options stay separate. Importing DISABLE_EXPERIMENTAL_BETAS also silently
+// disables native thinking summaries, even with --thinking-display summarized.
 const editorVariables = new Set([
   'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
   'ANTHROPIC_CUSTOM_HEADERS',
   'ANTHROPIC_FOUNDRY_API_KEY', 'ANTHROPIC_FOUNDRY_BASE_URL', 'ANTHROPIC_FOUNDRY_RESOURCE',
-  'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
+  'CLAUDE_CODE_USE_FOUNDRY',
   'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
 ]);

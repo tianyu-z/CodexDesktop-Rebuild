@@ -52,8 +52,9 @@ export function validateRoleOverrides(value, roles) {
   return structuredClone(value);
 }
 /** Resolve role choices once; effective roles are safe to snapshot and retry. */
-export function resolveRoleConfig(input, overrides = {}, models = {}) {
+export function resolveRoleConfig(input, overrides = {}, models = {}, { claudePermissionMode = 'default' } = {}) {
   const template = validateTemplate(input);
+  choice(claudePermissionMode, CLAUDE_PERMISSION_MODES, '$.claudePermissionMode');
   const roleOverrides = validateRoleOverrides(overrides, template.roles);
   fields(models, ENGINES, '$.models');
   for (const [engine, model] of Object.entries(models)) validateModel(model, `$.models.${engine}`);
@@ -61,7 +62,7 @@ export function resolveRoleConfig(input, overrides = {}, models = {}) {
     const override = roleOverrides[id] ?? {};
     const engine = override.engine ?? role.engine;
     template.roles[id] = { ...role, ...override, model: own(override, 'model') ? override.model : own(role, 'model') ? role.model : models[engine] ?? null,
-      ...(engine === 'claude' ? { permissionMode: override.permissionMode ?? role.permissionMode ?? 'default' } : {}) };
+      ...(engine === 'claude' ? { permissionMode: override.permissionMode ?? role.permissionMode ?? claudePermissionMode } : {}) };
   }
   return { template: validateTemplate(template), roleOverrides };
 }

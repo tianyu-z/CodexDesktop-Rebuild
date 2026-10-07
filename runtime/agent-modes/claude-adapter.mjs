@@ -356,10 +356,27 @@ export class ClaudeAdapter {
             })();
             query = queryImpl({ prompt, options: {
               cwd: options.cwd,
-              env: environment,
+              // The native default retries a timed-out request up to ten times,
+              // which can leave a desktop turn waiting for nearly an hour.
+              // Bound automatic recovery, preserving any explicit configuration.
+              env: { ...environment, CLAUDE_CODE_MAX_RETRIES: environment.CLAUDE_CODE_MAX_RETRIES ?? '2',
+                // Foundry can send only SSE pings until a long thinking block
+                // finishes. Native Claude ignores those pings for its five-minute
+                // event watchdog, aborting useful work and restarting it without
+                // streaming. Use its supported longer window for this provider;
+                // explicit env and native project settings still take precedence.
+                ...(/^(1|true|yes|on)$/i.test(environment.CLAUDE_CODE_USE_FOUNDRY ?? '') ? {
+                  CLAUDE_STREAM_IDLE_TIMEOUT_MS: environment.CLAUDE_STREAM_IDLE_TIMEOUT_MS ?? '3600000',
+                } : {}),
+              },
               ...(options.nativeSessionId ? { resume: options.nativeSessionId } : {}),
               ...(options.model ? { model: options.model } : {}),
               ...sessionQueryOptions,
+              // Ask native Claude for API-side summaries like its editor UI.
+              // This display flag leaves native thinking enablement/budget alone;
+              // explicit per-session display choices and disabled thinking win.
+              ...(sessionQueryOptions.thinking?.type !== 'disabled' && sessionQueryOptions.thinking?.display === undefined
+                ? { extraArgs: { 'thinking-display': 'summarized' } } : {}),
               pathToClaudeCodeExecutable: this.executablePath,
               settingSources: ['user', 'project', 'local'],
               systemPrompt: { type: 'preset', preset: 'claude_code', ...(options.instructions ? { append: options.instructions } : {}) },

@@ -1,3 +1,5 @@
+import { claudeModelCapabilities } from './claude-model-capabilities.mjs';
+
 const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const enabled = (value) => typeof value === 'string' && /^(1|true|yes)$/i.test(value);
 const nonempty = (value) => typeof value === 'string' && value.length > 0;
@@ -97,6 +99,7 @@ function advertisedModel(row, provider) {
     resolvedModel: row.id,
     displayName: nonempty(row.display_name) ? row.display_name : nonempty(row.displayName) ? row.displayName : row.id,
     description: descriptions.join(' '),
+    ...claudeModelCapabilities(row),
   };
 }
 

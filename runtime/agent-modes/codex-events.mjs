@@ -2,10 +2,17 @@
 export function toolItem(event, cwd) {
   const done = event.type === 'tool-completed';
   const output = typeof event.output === 'string' ? event.output : JSON.stringify(event.output ?? '');
+  const metadata = {
+    ...(typeof event.parentToolUseId === 'string' && event.parentToolUseId ? { cdxParentToolUseId: event.parentToolUseId } : {}),
+    ...(Number.isFinite(event.startedAt) ? { startedAt: event.startedAt } : {}),
+    ...(Number.isFinite(event.completedAt) ? { completedAt: event.completedAt } : {}),
+    ...(typeof event.model === 'string' && event.model ? { model: event.model } : {}),
+    durationMs: Number.isFinite(event.durationMs) && event.durationMs >= 0 ? event.durationMs : null,
+  };
   if (event.name === 'Bash') return {
     id: event.id, type: 'commandExecution', command: event.input?.command ?? '', cwd,
     commandActions: [], status: done ? (event.isError ? 'failed' : 'completed') : 'inProgress',
-    aggregatedOutput: done ? output : null, exitCode: null, durationMs: null,
+    aggregatedOutput: done ? output : null, exitCode: null, ...metadata,
   };
   // Preserve the actual arguments/results; guessing a patch from an Edit/Write
   // request would falsely report a file change before Claude confirms execution.
@@ -14,7 +21,7 @@ export function toolItem(event, cwd) {
     status: done ? (event.isError ? 'failed' : 'completed') : 'inProgress',
     success: done ? !event.isError : null,
     contentItems: done ? [{ type: 'inputText', text: output }] : null,
-    durationMs: null,
+    ...metadata,
   };
 }
 

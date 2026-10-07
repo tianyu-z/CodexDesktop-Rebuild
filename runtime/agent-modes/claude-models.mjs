@@ -5,10 +5,12 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { resolveClaudeEnvironment } from './claude-environment.mjs';
 import { discoverProviderModels, providerCatalogInfo } from './claude-provider-models.mjs';
+import { claudeModelCapabilities } from './claude-model-capabilities.mjs';
 
 const modelPattern = /^[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,255}$/;
 const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const validModel = (value) => typeof value === 'string' && modelPattern.exec(value)?.[0] === value;
+const familyDefaults = ['ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL'];
 
 /** Validate syntax, never a hardcoded list: providers may expose new/custom IDs. */
 export function assertClaudeModel(value) {
@@ -28,11 +30,8 @@ function normalizeModels(value) {
       ...(validModel(row.resolvedModel) ? { resolvedModel: row.resolvedModel } : {}),
       displayName: typeof row.displayName === 'string' && row.displayName ? row.displayName : row.value,
       description: typeof row.description === 'string' ? row.description : '',
+      ...claudeModelCapabilities(row),
     };
-    for (const key of ['supportsEffort', 'supportsAdaptiveThinking', 'supportsFastMode', 'supportsAutoMode']) {
-      if (typeof row[key] === 'boolean') model[key] = row[key];
-    }
-    if (Array.isArray(row.supportedEffortLevels)) model.supportedEffortLevels = [...new Set(row.supportedEffortLevels.filter((level) => typeof level === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(level)))];
     models.push(model);
   }
   return models;
@@ -40,6 +39,11 @@ function normalizeModels(value) {
 
 function mergeModels(sdkModels, apiModels) {
   const api = new Map(apiModels.map(model => [model.value, model]));
+  const capabilities = new Map();
+  for (const model of sdkModels) {
+    const identity = model.resolvedModel ?? model.value;
+    capabilities.set(identity, claudeModelCapabilities(capabilities.get(identity), model));
+  }
   const merged = new Map();
   const contextBase = value => value?.replace(/\[[^\]]+\]$/, '');
   for (const model of sdkModels) {
@@ -51,13 +55,30 @@ function mergeModels(sdkModels, apiModels) {
     );
     const mappedContext = isContext && (api.has(contextBase(model.value)) || api.has(contextBase(model.resolvedModel)));
     if (!advertised && !isAlias && !mappedContext) continue;
-    merged.set(model.value, advertised ? {
-      ...advertised, ...model,
-      description: [model.description, advertised.description].filter(Boolean).join(' '),
-    } : model);
+    merged.set(model.value, {
+      ...(advertised ? {
+        ...advertised, ...model,
+        description: [model.description, advertised.description].filter(Boolean).join(' '),
+      } : model),
+      ...claudeModelCapabilities(capabilities.get(model.resolvedModel ?? model.value), model, advertised, api.get(model.resolvedModel)),
+    });
   }
-  for (const model of apiModels) if (!merged.has(model.value)) merged.set(model.value, model);
+  for (const model of apiModels) if (!merged.has(model.value)) merged.set(model.value, { ...model, ...claudeModelCapabilities(capabilities.get(model.value), model) });
   return [...merged.values()];
+}
+
+function enrichNativeModels(configuredModels, nativeModels) {
+  const models = new Map(configuredModels.map(model => [model.value, model]));
+  for (const model of nativeModels) {
+    // Alternate defaults are only a way to enumerate native concrete IDs.
+    // The configured query remains authoritative for every alias and default.
+    if (model.value !== model.resolvedModel) continue;
+    const configured = models.get(model.value);
+    models.set(model.value, configured
+      ? { ...model, ...configured, ...claudeModelCapabilities(model, configured) }
+      : model);
+  }
+  return [...models.values()];
 }
 
 function discoveryIdentity(cwd, executablePath, env) {
@@ -231,9 +252,11 @@ export class ClaudeModelCatalog {
     // SDK cleanup aborts its own controller. Independent controllers prevent
     // that cleanup from cancelling a provider request that is still reading.
     const sdkController = new AbortController();
+    const nativeController = new AbortController();
     const apiController = new AbortController();
     const abort = () => {
       sdkController.abort(controller.signal.reason);
+      nativeController.abort(controller.signal.reason);
       apiController.abort(controller.signal.reason);
     };
     controller.signal.addEventListener('abort', abort, { once: true });
@@ -250,7 +273,19 @@ export class ClaudeModelCatalog {
       };
       const apiSuccess = provider.apiStatus === 'success';
       if (!apiSuccess && sdk.status === 'rejected') throw sdk.reason;
-      const sdkModels = sdk.status === 'fulfilled' ? sdk.value : [];
+      let sdkModels = sdk.status === 'fulfilled' ? sdk.value : [];
+      if (apiSuccess && sdk.status === 'fulfilled' && familyDefaults.some(key => providerEnv[key])) {
+        // Family overrides replace native picker rows with configured aliases.
+        // A second metadata-only query exposes built-in concrete models while
+        // retaining the same provider, managed policy and settings cascade.
+        try {
+          sdkModels = enrichNativeModels(sdkModels, await this.probeSdk(cwd, env, nativeController, true));
+        } catch (error) {
+          if (error?.code === 'CLAUDE_MODEL_PROCESS_EXIT_FAILED') throw error;
+          // Optional enrichment must not hide an otherwise usable catalog.
+        }
+        controller.signal.throwIfAborted();
+      }
       return {
         models: apiSuccess ? mergeModels(sdkModels, provider.models) : sdkModels,
         source: apiSuccess ? (sdk.status === 'fulfilled' ? 'provider-api+sdk' : 'provider-api') : 'sdk-fallback',
@@ -291,7 +326,7 @@ export class ClaudeModelCatalog {
     }
   }
 
-  async probeSdk(cwd, env, controller) {
+  async probeSdk(cwd, env, controller, nativeDefaults = false) {
     let query;
     let releaseInput;
     let abortListener;
@@ -315,7 +350,7 @@ export class ClaudeModelCatalog {
           pathToClaudeCodeExecutable: this.executablePath,
           settingSources: ['user', 'project', 'local'],
           tools: [], mcpServers: {}, strictMcpConfig: true, hooks: {},
-          settings: { disableAllHooks: true },
+          settings: { disableAllHooks: true, ...(nativeDefaults ? { env: Object.fromEntries(familyDefaults.map(key => [key, ''])) } : {}) },
           permissionMode: 'default',
           persistSession: false,
           abortController: controller,

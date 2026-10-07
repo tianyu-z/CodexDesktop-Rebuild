@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { validateRoleOverrides } from './templates/schema.mjs';
 import { assertClaudePermissionMode } from './claude-permissions.mjs';
+import { DEFAULT_CLAUDE_MODEL, DEFAULT_CLAUDE_PERMISSION_MODE } from './claude-defaults.mjs';
 
 const clone = value => structuredClone(value);
 const engines = new Set(['codex', 'claude']);
@@ -137,7 +138,7 @@ export class ConversationStore {
     }
   }
 
-  ensureThread(thread, { mode = 'codex', claudePermissionMode = 'default' } = {}) {
+  ensureThread(thread, { mode = 'codex', claudePermissionMode = DEFAULT_CLAUDE_PERMISSION_MODE } = {}) {
     if (typeof thread?.id !== 'string' || !thread.id) throw new Error('Thread id is required.');
     assertClaudePermissionMode(claudePermissionMode);
     if (!this.records.has(thread.id)) {
@@ -145,7 +146,7 @@ export class ConversationStore {
       const { turns = [], ...metadata } = thread;
       this.records.set(thread.id, legacyAlias({
         schemaVersion: 2, id: thread.id, mode, cwd: thread.cwd,
-        thread: clone(metadata), models: { codex: thread.model ?? null, claude: 'default' }, claudePermissionMode,
+        thread: clone(metadata), models: { codex: thread.model ?? null, claude: DEFAULT_CLAUDE_MODEL }, claudePermissionMode,
         bindings: {
           codex: { sessionId: thread.id, consumedSeq: 0 },
           claude: { sessionId: null, consumedSeq: 0 },

@@ -179,7 +179,7 @@ function denyNativeRequest(method) {
 
 const permissionMethods = new Set(['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval', 'mcpServer/elicitation/request', 'item/tool/requestUserInput', 'execCommandApproval', 'applyPatchApproval']);
 
-const publicTools = new Set(['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'collabAgentToolCall', 'webSearch', 'imageView', 'imageGeneration']);
+const publicTools = new Set(['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'collabAgentToolCall', 'subAgentActivity', 'webSearch', 'imageView', 'imageGeneration']);
 
 /** Normalize public App Server items without exposing reasoning/raw API events. */
 class CodexRoleEvents {

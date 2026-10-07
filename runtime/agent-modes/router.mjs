@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { updateClaudeProgress, applyClaudeThinking } from './claude-progress.mjs';
 import { writeFileSync, statSync, realpathSync } from 'node:fs';
 import { assertMode } from './store.mjs';
 import { WorkflowRouter } from './orchestration/router.mjs';
@@ -7,6 +8,7 @@ import { claudeInputText, claudeInputContent, isClaudeCommandInput } from './cla
 import { page, presentItem, presentTurn, toolItem } from './codex-events.mjs';
 import { assertClaudeModel } from './claude-models.mjs';
 import { assertClaudePermissionMode } from './claude-permissions.mjs';
+import { DEFAULT_CLAUDE_MODEL, DEFAULT_CLAUDE_PERMISSION_MODE } from './claude-defaults.mjs';
 import { normalizeClaudeSessionOptions } from './claude-native-controls.mjs';
 import { createClaudeInteraction } from './claude-interactions.mjs';
 import { ClaudeCommandRouter } from './claude-command-router.mjs';
@@ -16,6 +18,7 @@ import { validateRoleOverrides } from './templates/schema.mjs';
 import { editManagedHistory, recoverHistoryEdit } from './history.mjs';
 import { restoreLegacyResumePermissions } from './legacy-permission-resume.mjs';
 import { prepareClaudeEffort } from './claude-effort-selection.mjs';
+import { readAgentMap } from './agent-map.mjs';
 
 const now = () => Math.floor(Date.now() / 1000);
 const messageOf = error => error instanceof Error ? error.message : String(error);
@@ -50,18 +53,28 @@ export class EngineRouter {
   }
   state(id) {
     const value = this.store.get(id);
+    const claudeRun = this.runs.get(value?.activeRun?.id);
     let claudeSessionOptions = {};
     try { if (value && ['claude', 'both'].includes(value.mode)) claudeSessionOptions = this.claudeCommands.context(id).claudeOptions; }
     catch { /* Codex-only templates and unavailable role contexts have no Claude selection. */ }
     const claudeActiveRuns = (value?.turns.find(row => row.turn.id === value?.activeRun?.turnId)?.runs ?? []).filter(run => run.engine === 'claude' && run.roleId && ['running', 'awaitingApproval'].includes(run.status)).map(({ id, roleId, stepId, round }) => ({ id, roleId, stepId, round }));
-    return { threadId: id, engineMode: value?.mode ?? 'codex', models: value?.models ?? { codex: null, claude: 'default' }, busy: !!value?.activeRun,
-      claudePermissionMode: value?.claudePermissionMode ?? 'default', claudeActualPermissionMode: value?.claudeActualPermissionMode ?? null,
+    return { threadId: id, engineMode: value?.mode ?? 'codex', models: value?.models ?? { codex: null, claude: DEFAULT_CLAUDE_MODEL }, busy: !!value?.activeRun,
+      claudePermissionMode: value?.claudePermissionMode ?? DEFAULT_CLAUDE_PERMISSION_MODE, claudeActualPermissionMode: value?.claudeActualPermissionMode ?? null,
       claudeCommandTarget: value?.claudeCommandTarget ?? null,
+      claudeWorkflowOptions: value?.claudeWorkflowOptions ?? {},
       claudeSessionOptions,
+      claudeActivity: claudeRun ? { ...claudeRun.activity, turnId: claudeRun.turn.id, runId: claudeRun.id } : null,
+      claudeRoleActivities: this.workflow.progress(id),
       claudeActiveRuns, claudeCommandRunId: claudeActiveRuns.some(run => run.id === value?.claudeCommandRunId) ? value.claudeCommandRunId : null,
       claudeClientActions: (value?.claudeClientActions ?? []).map(({ id, type, roleId }) => ({ id, type, roleId })),
       claudeRoleActualPermissionModes: Object.fromEntries((value?.turns ?? []).flatMap(row => row.runs ?? []).filter(run => run.engine === 'claude' && run.roleId && run.actualPermissionMode).map(run => [run.roleId, run.actualPermissionMode])),
       engines: ['codex', 'claude'], bothAvailable: this.workflow.available, roleOverrides: value?.roleOverrides ?? {}, template: value?.template ?? { id: 'polly', revision: 1, parameters: {} }, turnEngines: Object.fromEntries((value?.turns ?? []).map(row => [row.turn.id, row.engine])) };
+  }
+  saveClaudeEffort(id, options) {
+    if (options === undefined) return;
+    const chat = this.store.require(id);
+    if (chat.mode === 'both') { chat.claudeWorkflowOptions = options; this.store.save(chat); }
+    else this.store.setBinding(id, 'claude', { claudeOptions: options });
   }
   notify(method, params) { this.emit({ method, params }); }
   async interruptManagedTurn(id, turnId) {
@@ -90,7 +103,7 @@ export class EngineRouter {
     const id = params.threadId;
     // Read-only catalog discovery can wait on a subprocess. It must not queue
     // a user's interrupt or next submission behind that independent work.
-    if (!id || ['engine/capabilities', 'engine/claude/commands', 'turn/interrupt', 'engine/runs/interrupt'].includes(method)) return this.dispatch(method, params);
+    if (!id || ['engine/capabilities', 'engine/claude/commands', 'engine/agents/read', 'turn/interrupt', 'engine/runs/interrupt'].includes(method)) return this.dispatch(method, params);
     // Reserve submission before awaiting native I/O. Approval responses use the
     // separate response path and cannot deadlock behind a pending turn request.
     const previous = this.locks.get(id) ?? Promise.resolve();
@@ -107,7 +120,9 @@ export class EngineRouter {
       result = await this.native.request('thread/read', { threadId: id, includeTurns: false });
     }
     const thread = structuredClone(result.thread);
-    if (thread.historyMode === 'paginated' || !Array.isArray(thread.turns)) {
+    // Side chats can inherit paginated metadata from a persistent fork, but
+    // ephemeral threads have no pageable history. Keep their streamed turns.
+    if (!thread.ephemeral && (thread.historyMode === 'paginated' || !Array.isArray(thread.turns))) {
       thread.turns = [];
       let cursor; const visited = new Set();
       do {
@@ -183,6 +198,7 @@ export class EngineRouter {
     }
     if (id && this.store.get(id)?.pendingHistoryEdit && !['engine/capabilities', 'engine/claude/commands', 'turn/interrupt', 'engine/runs/interrupt'].includes(method)) await this.hydrate(id);
     if (id && this.workflow.internal.has(id)) throw new Error('Internal workflow sessions are not public chats.');
+    if (method === 'engine/agents/read') return readAgentMap(this, params);
     if (method === 'engine/claude/commands') return this.claudeCommands.list(params);
     if (method === 'engine/claude/client-action/claim') return this.claudeCommands.claim(id, params.actionId);
     if (method === 'engine/claude/control') return liveClaudeControl(this, method, params);
@@ -222,28 +238,30 @@ export class EngineRouter {
         modelListError = 'Could not load Claude models. Refresh models to retry.';
       }
       const bothAvailable = this.workflow.available && (this.remote || !params.hostId || params.hostId === 'local');
-      return { engines: ['codex', 'claude'], claudeEffortSelection: true, bothAvailable, ...(bothAvailable ? { templateSchemaVersion: 2, workflowVersion: 2 } : { bothUnavailableReason: 'Collaborative workflows require the native engine gateway on the selected host.' }), claudeModels, modelListError, modelCatalog, localOnly: !this.remote };
+      return { engines: ['codex', 'claude'], claudeEffortSelection: true, claudeWorkflowEffortSelection: true, bothAvailable, ...(bothAvailable ? { templateSchemaVersion: 2, workflowVersion: 2 } : { bothUnavailableReason: 'Collaborative workflows require the native engine gateway on the selected host.' }), claudeModels, modelListError, modelCatalog, localOnly: !this.remote };
     }
     if (params.engineModel !== undefined && (params.engineMode === 'claude' || (params.engineMode == null && id && this.store.get(id)?.mode === 'claude'))) assertClaudeModel(params.engineModel);
     if (method === 'engine/turns/read') { if (!this.store.get(id)) await this.hydrate(id); return { turns: this.state(id).turnEngines }; }
     if (method === 'engine/mode/read') { if (!this.store.get(id)) await this.hydrate(id); return this.state(id); }
     if (method === 'engine/mode/set') {
       assertMode(params.engineMode);
-      const selected = params.engineMode === 'both' ? this.workflow.selection(params, this.store.get(id)) : null;
-      const commandTarget = this.claudeCommands.selection(params, this.store.get(id), selected);
       if (this.store.get(id)?.activeRun) throw new Error('Finish or interrupt the active run before switching engines.');
       await this.hydrate(id);
-      const effortOptions = await prepareClaudeEffort(this.adapter, params, this.store.get(id));
-      this.store.setMode(id, params.engineMode, { ...(selected ? { models: selected.models, template: selected.selected, roleOverrides: selected.roleOverrides } : { model: params.engineModel }), claudePermissionMode: params.claudePermissionMode });
-      if (effortOptions) this.store.setBinding(id, 'claude', { claudeOptions: effortOptions });
-      if (commandTarget !== undefined) { const chat = this.store.require(id); chat.claudeCommandTarget = commandTarget; this.store.save(chat); }
+      const selected = params.engineMode === 'both' ? this.workflow.selection(params, this.store.get(id)) : null;
+      const commandTarget = this.claudeCommands.selection(params, this.store.get(id), selected);
+      const effortOptions = await prepareClaudeEffort(this.adapter, params, this.store.get(id), selected);
+      this.store.batch(id, () => {
+        this.store.setMode(id, params.engineMode, { ...(selected ? { models: selected.models, template: selected.selected, roleOverrides: selected.roleOverrides } : { model: params.engineModel }), claudePermissionMode: params.claudePermissionMode });
+        this.saveClaudeEffort(id, effortOptions);
+        if (commandTarget !== undefined) { const chat = this.store.require(id); chat.claudeCommandTarget = commandTarget; this.store.save(chat); }
+      });
       return this.state(id);
     }
     if (method === 'thread/start') {
       assertMode(params.engineMode ?? 'codex');
-      const effortOptions = await prepareClaudeEffort(this.adapter, params);
       const selected = params.engineMode === 'both' ? this.workflow.selection(params, null, { nativeModel: true }) : null;
       const commandTarget = this.claudeCommands.selection(params, null, selected);
+      const effortOptions = await prepareClaudeEffort(this.adapter, params, undefined, selected);
       const clean = nativeParams(params);
       if (params.engineMode === 'claude') delete clean.model;
       const result = await this.native.request(method, clean);
@@ -253,18 +271,19 @@ export class EngineRouter {
       if (params.engineModel && value.mode === 'claude') value.models.claude = params.engineModel;
       if (commandTarget !== undefined) value.claudeCommandTarget = commandTarget;
       this.store.save(value);
-      if (effortOptions) this.store.setBinding(value.id, 'claude', { claudeOptions: effortOptions });
+      this.saveClaudeEffort(value.id, effortOptions);
       if (selected) this.store.setMode(value.id, 'both', { models: selected.models, template: selected.selected, roleOverrides: selected.roleOverrides });
       return { ...result, thread: this.thread(value.id), engineState: this.state(value.id) };
     }
     if (method === 'turn/start') {
       if (!this.store.get(id)) await this.hydrate(id);
       if (params.claudeEffort !== undefined && this.store.get(id)?.activeRun) throw new Error('Finish or interrupt the active run before changing Claude effort.');
-      const effortOptions = await prepareClaudeEffort(this.adapter, params, this.store.get(id));
-      let selected;
+      if (params.engineMode) assertMode(params.engineMode);
+      const current = this.store.get(id), mode = params.engineMode ?? current.mode;
+      let selected = mode === 'both' && !current.activeRun ? this.workflow.selection(params, current, { nativeModel: true }) : null;
+      const effortOptions = current.activeRun ? undefined : await prepareClaudeEffort(this.adapter, params, current, selected);
       if (params.engineMode) {
-        assertMode(params.engineMode);
-        selected = params.engineMode === 'both' ? this.workflow.selection(params, this.store.get(id)) : null;
+        if (params.engineMode === 'both') selected ??= this.workflow.selection(params, this.store.get(id));
         if (params.engineMode !== this.store.get(id).mode) {
           await this.hydrate(id);
           this.store.setMode(id, params.engineMode, { ...(selected ? { models: selected.models, template: selected.selected, roleOverrides: selected.roleOverrides } : { model: params.engineModel }), claudePermissionMode: params.claudePermissionMode });
@@ -286,7 +305,7 @@ export class EngineRouter {
       }
       if ((params.engineModel && value.mode === 'claude') || params.claudePermissionMode !== undefined) this.store.setMode(id, value.mode, { ...(value.mode === 'claude' ? { model: params.engineModel } : {}), claudePermissionMode: params.claudePermissionMode });
       if (value.mode !== 'codex') {
-        if (effortOptions) this.store.setBinding(id, 'claude', { claudeOptions: effortOptions });
+        this.saveClaudeEffort(id, effortOptions);
         const command = await this.claudeCommands.prepare(id, params);
         this.assertOpen();
         if (command) return this.startClaude(id, params, command);
@@ -399,7 +418,8 @@ export class EngineRouter {
     const turn = { id: turnId, status: 'inProgress', items: [{ type: 'userMessage', id: `user:${randomUUID()}`, content: publicInput, ...(params.clientUserMessageId ? { clientId: params.clientUserMessageId } : {}) }], startedAt: now(), error: null };
     this.store.beginRun(id, { id: runId, turnId, engine: 'claude', permissionMode: value.claudePermissionMode });
     this.store.putTurn(id, turn, { engine: 'claude', runId });
-    const run = { id: runId, threadId: id, turn, commandContext, controller: new AbortController(), adapterRun: null, done: null };
+    const run = { id: runId, threadId: id, turn, commandContext, controller: new AbortController(), adapterRun: null, done: null,
+      activity: { phase: 'starting', startedAt: Date.now(), updatedAt: Date.now() } };
     this.runs.set(runId, run);
     run.done = new Promise(resolve => setImmediate(resolve)).then(async () => {
       this.notify('thread/status/changed', { threadId: id, status: { type: 'active', activeFlags: [] } });
@@ -443,6 +463,12 @@ export class EngineRouter {
       if (result.error) turn.error = { message: result.error };
       const row = this.store.putTurn(id, turn, { engine: 'claude', runId });
       if (result.nativeTasks) { const current = this.store.require(id); current.turns.find(value => value.seq === row.seq).runs[0].nativeTasks = result.nativeTasks; this.store.save(current); }
+      if (result.actualModel || result.usage) {
+        const current = this.store.require(id), saved = current.turns.find(value => value.seq === row.seq).runs[0];
+        if (result.actualModel) saved.actualModel = result.actualModel;
+        if (result.usage) saved.usage = structuredClone(result.usage);
+        this.store.save(current);
+      }
       try {
         const sessionId = result.nativeSessionId ?? this.claudeCommands.binding(id, commandContext).sessionId;
         const acknowledged = result.status === 'completed' || this.store.get(id).activeRun?.acknowledgedSeq != null;
@@ -469,9 +495,19 @@ export class EngineRouter {
   }
   claudeEvent(run, event) {
     const { threadId, turn } = run;
+    if (event.type === 'activity' || event.type === 'token-usage') {
+      if (this.runs.get(run.id) !== run || run.controller.signal.aborted) return;
+      run.activity = updateClaudeProgress(run.activity, event);
+      return;
+    }
+    if (event.type.startsWith('thinking-') && (this.runs.get(run.id) !== run || run.controller.signal.aborted)) return;
     if (event.type === 'native-tasks') {
       const chat = this.store.require(threadId), row = chat.turns.find(row => row.turn.id === turn.id);
       row.runs[0].nativeTasks = event.nativeTasks; this.store.save(chat); return;
+    }
+    if (event.type === 'agent-model') {
+      const chat = this.store.require(threadId), row = chat.turns.find(row => row.turn.id === turn.id);
+      (row.agentModels ??= {})[event.parentToolUseId] = event.model; this.store.save(chat); return;
     }
     if (event.type === 'permission-mode') {
       const current = this.store.require(threadId);
@@ -500,6 +536,7 @@ export class EngineRouter {
       if (!existed) this.notify('item/started', { threadId, turnId: turn.id, item: presentItem(item, 'claude') });
       if (complete) this.notify('item/completed', { threadId, turnId: turn.id, item: presentItem(item, 'claude') });
     };
+    applyClaudeThinking(event, { turn, update, threadId, save: () => this.store.putTurn(threadId, turn, { engine: 'claude', runId: run.id }), notify: (method, params) => this.notify(method, params) });
     if (event.type === 'message-start') update({ id: event.id, type: 'agentMessage', text: '', phase: 'commentary' }, false);
     if (event.type === 'text-delta') {
       let item = turn.items.find(item => item.id === event.id);

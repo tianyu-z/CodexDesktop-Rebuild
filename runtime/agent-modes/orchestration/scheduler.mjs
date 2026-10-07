@@ -68,7 +68,7 @@ class WorkflowExecution {
     if (previous && previous.id !== supplied.runId) throw new Error('Workflow recovery ID does not match the saved snapshot.');
     // Snapshot all caller-owned execution data before scheduling even one microtask.
     const data = previous?.config ?? { runId: supplied.runId, template: supplied.template, roleOverrides: supplied.roleOverrides ?? {}, parameters: supplied.parameters ?? {}, models: supplied.models ?? {},
-      nativeOptions: supplied.nativeOptions ?? {}, cwd: supplied.cwd, input: supplied.input ?? '', history: supplied.history ?? [],
+      nativeOptions: supplied.nativeOptions ?? {}, claudeWorkflowOptions: supplied.claudeWorkflowOptions ?? {}, cwd: supplied.cwd, input: supplied.input ?? '', history: supplied.history ?? [],
       ...(supplied.inputCapture ? { inputCapture: supplied.inputCapture } : {}), ...(supplied.throughSeq !== undefined ? { throughSeq: supplied.throughSeq } : {}) };
     const { template, roleOverrides } = resolveRoleConfig(data.template, data.roleOverrides ?? {}, data.models);
     const parameters = resolveParameters(template, data.parameters);
@@ -392,7 +392,10 @@ class WorkflowExecution {
     if (this.jobs.has(key)) return clone(await this.jobs.get(key));
     const slots = this.options.nativeOptions;
     const nativeOptions = Object.hasOwn(slots, 'codex') || Object.hasOwn(slots, 'claude') ? slots[role.engine] ?? {} : slots;
-    const claudeOptions = role.engine === 'claude' ? normalizeClaudeSessionOptions(this.binding({ roleId: input.roleId, cwd, purpose: input.purpose ?? 'default', requestedModel: role.model }).value?.claudeOptions) : undefined;
+    const claudeOptions = role.engine === 'claude' ? normalizeClaudeSessionOptions({
+      ...this.binding({ roleId: input.roleId, cwd, purpose: input.purpose ?? 'default', requestedModel: role.model }).value?.claudeOptions,
+      ...(Object.hasOwn(this.options.claudeWorkflowOptions ?? {}, 'effort') ? { effort: this.options.claudeWorkflowOptions.effort } : {}),
+    }) : undefined;
     const proposed = frozen({ roleId: input.roleId, stepId: input.stepId, round, engine: role.engine,
       prompt: input.prompt, cwd, access, instructions: input.instructions ?? role.prompt, requestedModel: role.model, nativeOptions,
       ...(this.options.inputCapture && (Object.hasOwn(input.inputValues ?? {}, 'request') || Object.hasOwn(input.inputValues?.workflowContext ?? {}, 'request')) ? { inputCapture: this.options.inputCapture } : {}),
@@ -499,9 +502,14 @@ class WorkflowExecution {
       this.alive();
       if (active.controller.signal.aborted) throw stoppedError();
       const guidance = this.state.guidance.slice(0, guidanceCount).map(entry => entry.text).filter(text => text.trim());
+      const dispatchedPrompt = guidance.length ? `${descriptor.prompt}\n\n[Additional user guidance]\n${guidance.join('\n\n')}` : descriptor.prompt;
+      run.startedAt = Date.now();
+      run.dispatch = { tool: 'workflow.run', prompt: dispatchedPrompt, instructions: descriptor.instructions,
+        arguments: { engine, roleId, stepId, round, model: requestedModel, cwd, access: descriptor.access, attempt } };
+      this.notify();
       active.handle = this.owner.runner.start({ ...clone(descriptor),
         ...(inputContent.length ? { inputContent: clone(inputContent) } : {}),
-        ...(guidance.length ? { prompt: `${descriptor.prompt}\n\n[Additional user guidance]\n${guidance.join('\n\n')}` } : {}),
+        prompt: dispatchedPrompt,
         runId: run.id, model: requestedModel,
         ...(role.session === 'reuse' && binding.value?.sessionId ? { nativeSessionId: binding.value.sessionId } : {}),
         signal: active.controller.signal,
@@ -534,7 +542,9 @@ class WorkflowExecution {
     // Runtime attribution cannot be overwritten by native/operation output.
     const { status: ignoredStatus, id: ignoredId, engine: ignoredEngine, roleId: ignoredRole, stepId: ignoredStep, attempt: ignoredAttempt, round: ignoredRound,
       requestedModel: ignoredModel, permissionMode: ignoredPermissionMode, cwd: ignoredCwd, ...publicResult } = summary;
-    Object.assign(run, publicResult, { status });
+    const completedAt = Date.now();
+    Object.assign(run, publicResult, { status, dispatch: run.dispatch, startedAt: run.startedAt, completedAt,
+      ...(run.startedAt != null ? { durationMs: Math.max(0, completedAt - run.startedAt) } : {}) });
     if (status !== 'completed' && !this.stopping) this.blockers.add(run.id);
     this.notify();
     this.emit(run, { type: 'result', ...clone(publicResult), status });
@@ -543,6 +553,7 @@ class WorkflowExecution {
   }
   nativeEvent(run, active, descriptor, event) {
     if (this.terminal || settled.has(run.status)) return;
+    if (active.controller.signal.aborted && ['activity', 'token-usage', 'thinking-start', 'thinking-delta', 'thinking-completed'].includes(event.type)) return;
     // Only the scheduler's validated terminal result is published as completion.
     if (event.type === 'result') return;
     if (event.type === 'native-tasks' && run.engine === 'claude' && Array.isArray(event.nativeTasks)) run.nativeTasks = clone(event.nativeTasks);
@@ -562,8 +573,10 @@ class WorkflowExecution {
   }
   emit(run, event) {
     const enriched = { ...clone(event), eventId: `${run.id}:${++this.seq}`, seq: this.seq, runId: run.id,
-      engine: run.engine, roleId: run.roleId, stepId: run.stepId, attempt: run.attempt, round: run.round };
-    this.state.events.push(enriched); this.notify();
+      engine: run.engine, roleId: run.roleId, stepId: run.stepId, attempt: event.type === 'activity' ? event.attempt : run.attempt, round: run.round };
+    if (!(run.engine === 'claude' && ['activity', 'token-usage'].includes(event.type))) {
+      this.state.events.push(enriched); this.notify();
+    }
     if (this.callbackError) return;
     try { this.owner.onEvent?.(clone(enriched)); } catch (error) { this.fatal(error); }
   }

@@ -10,13 +10,16 @@ const modelContent = (content) => record(content) && (
   (content.type === 'thinking' && identifier(content.thinking) && identifier(content.signature))
 );
 
-/** Converts SDK envelopes into public text/tool events; never exposes thinking blocks. */
+/** Converts SDK envelopes into separate reply, returned-thinking and tool events.
+ * Signatures and redacted payloads never leave this normalizer. */
 export class ClaudeEventNormalizer {
-  constructor({ onEvent }) {
+  constructor({ onEvent, now = Date.now }) {
     this.onEvent = onEvent;
+    this.now = now;
     this.messages = new Map();
     this.active = new Map();
     this.tools = new Map();
+    this.agentModels = new Map();
     this.seen = new Set();
     this.nativeSessionId = undefined;
     this.error = undefined;
@@ -25,6 +28,7 @@ export class ClaudeEventNormalizer {
     this.resultTextLength = 0;
     this.nativeTaskState = new Map();
     this.localOutputs = new Map();
+    this.turnUsage = new Map();
   }
 
   consume(envelope, { sideResult = false } = {}) {
@@ -44,18 +48,42 @@ export class ClaudeEventNormalizer {
       this.messages.clear();
       this.active.clear();
       this.tools.clear();
+      this.agentModels.clear();
       this.localOutputs.clear();
       this.resultTextLength = 0;
+      this.beginTurn();
       this.onEvent({ type: 'context-reset', sessionId: this.nativeSessionId, ...(identifier(envelope.trigger) ? { trigger: envelope.trigger } : {}), ...(identifier(envelope.user_message_uuid) ? { userMessageId: envelope.user_message_uuid } : {}) });
       this.onEvent({ type: 'session', sessionId: this.nativeSessionId });
       return;
     }
     const model = envelope.type === 'assistant' ? envelope.message?.model : envelope.type === 'system' && envelope.subtype === 'init' ? envelope.model : envelope.type === 'stream_event' ? envelope.event?.message?.model : undefined;
     if (scope === null && identifier(model) && model !== '<synthetic>') this.actualModel = model;
+    else if (scope !== null && identifier(model) && model !== '<synthetic>' && this.agentModels.get(scope) !== model) {
+      this.agentModels.set(scope, model);
+      const tool = this.tools.get(scope);
+      if (tool) tool.model = model;
+      this.onEvent({ type: 'agent-model', parentToolUseId: scope, model });
+    }
     if (scope === null && identifier(envelope.session_id) && !this.obsoleteSessions.has(envelope.session_id) && (envelope.session_id !== this.nativeSessionId || !this.sessionReported)) {
       this.nativeSessionId = envelope.session_id;
       this.sessionReported = true;
       this.onEvent({ type: 'session', sessionId: this.nativeSessionId });
+    }
+    if (scope === null && envelope.type === 'system') {
+      if (envelope.subtype === 'hook_started') this.activity('starting');
+      if (envelope.subtype === 'status' && ['requesting', 'compacting'].includes(envelope.status)) this.activity(envelope.status);
+      if (envelope.subtype === 'thinking_tokens' && indexValue(envelope.estimated_tokens)) {
+        this.typedThinkingTokens = true;
+        this.activity('thinking', { estimatedThinkingTokens: envelope.estimated_tokens });
+      }
+      if (envelope.subtype === 'api_retry') {
+        const details = {};
+        for (const [source, target] of [['attempt', 'attempt'], ['max_retries', 'maxRetries'], ['retry_delay_ms', 'retryDelayMs'], ['error_status', 'errorStatus']]) {
+          if (indexValue(envelope[source])) details[target] = envelope[source];
+        }
+        if (envelope.error_status === null) details.errorKind = 'connection_error';
+        this.activity('retrying', details);
+      }
     }
     if (envelope.type === 'system' && taskEvents.has(envelope.subtype)) { this.consumeTask(envelope); return; }
     if (envelope.type === 'stream_event') this.consumePartial(envelope.event, scope);
@@ -115,13 +143,40 @@ export class ClaudeEventNormalizer {
     if (block) this.completeText(block);
   }
 
+  activity(phase, details = {}) {
+    const next = { phase, ...details };
+    if (JSON.stringify(next) === JSON.stringify(this.lastActivity)) return;
+    // Progress is ephemeral in both routers, so every native estimate can reach
+    // the UI without a durable workflow snapshot on every token.
+    this.lastActivity = next;
+    this.onEvent({ type: 'activity', ...next });
+  }
+
   beginTurn() {
     this.resultTextLength = this.modelText.length;
+    this.turnUsage.clear();
+    this.lastUsage = undefined;
+    this.lastActivity = undefined;
+    this.typedThinkingTokens = false;
+  }
+
+  usage(message, usage) {
+    if (message.scope !== null || message.synthetic || !record(usage)) return;
+    const previous = this.turnUsage.get(message.id) ?? {};
+    for (const key of ['input_tokens', 'output_tokens']) if (indexValue(usage[key])) previous[key] = usage[key];
+    if (!Object.keys(previous).length) return;
+    this.turnUsage.set(message.id, previous);
+    const totals = { type: 'token-usage', inputTokens: 0, outputTokens: 0 };
+    for (const row of this.turnUsage.values()) { totals.inputTokens += row.input_tokens ?? 0; totals.outputTokens += row.output_tokens ?? 0; }
+    if (JSON.stringify(totals) === JSON.stringify(this.lastUsage)) return;
+    this.lastUsage = totals;
+    this.onEvent(totals);
   }
 
   get nativeTasks() { return structuredClone([...this.nativeTaskState.values()]); }
 
   consumeTask(event) {
+    const observedAt = this.now();
     const update = (id, values) => {
       const task = this.nativeTaskState.get(id) ?? { id, status: 'unknown' };
       for (const [source, target] of [['description', 'description'], ['task_type', 'taskType'], ['summary', 'summary'], ['last_tool_name', 'lastToolName'], ['output_file', 'outputFile'], ['reason', 'reason'], ['tool_use_id', 'toolUseId']]) {
@@ -129,6 +184,7 @@ export class ClaudeEventNormalizer {
       }
       for (const [source, target] of [['is_backgrounded', 'isBackgrounded'], ['ambient', 'ambient']]) if (typeof values[source] === 'boolean') task[target] = values[source];
       if (record(values.usage)) task.usage = Object.fromEntries(['total_tokens', 'tool_uses', 'duration_ms'].filter(key => Number.isFinite(values.usage[key]) && values.usage[key] >= 0).map(key => [key, values.usage[key]]));
+      task.updatedAt = observedAt;
       this.nativeTaskState.set(id, task);
       return task;
     };
@@ -138,33 +194,43 @@ export class ClaudeEventNormalizer {
       const live = new Set(tasks.map(task => task.task_id));
       for (const task of this.nativeTaskState.values()) if (task.isBackgrounded && !live.has(task.id)) {
         task.backgroundActive = false;
+        task.updatedAt = observedAt;
         // A level update can precede its terminal bookend. Absence proves only
         // that it is no longer in the live set, not how the task finished.
         if (!terminalTask(task.status)) task.status = 'unknown';
       }
       for (const row of tasks) {
         const task = update(row.task_id, row);
-        task.isBackgrounded = task.backgroundActive = true;
+        task.isBackgrounded = true;
+        task.backgroundActive = !terminalTask(task.status);
         if (!terminalTask(task.status) && task.status !== 'paused') task.status = 'running';
       }
     } else {
       if (!identifier(event.task_id)) return;
       const task = update(event.task_id, event.subtype === 'task_updated' && record(event.patch) ? event.patch : event);
       if (event.subtype === 'task_started' || event.subtype === 'task_progress') {
-        if (!terminalTask(task.status)) task.status = 'running';
+        if (!terminalTask(task.status)) {
+          if (event.subtype === 'task_started') task.startedAt ??= observedAt;
+          task.status = 'running';
+        }
       } else if (event.subtype === 'task_updated' && ['pending', 'running', 'completed', 'failed', 'killed', 'paused'].includes(event.patch?.status)) {
         if (!terminalTask(task.status) || terminalTask(event.patch.status)) task.status = event.patch.status;
       } else if (event.subtype === 'task_notification' && ['completed', 'failed', 'stopped'].includes(event.status)) task.status = event.status;
-      if (terminalTask(task.status)) task.backgroundActive = false;
+      if (terminalTask(task.status)) {
+        task.backgroundActive = false;
+        if (task.status !== 'process-ended') task.completedAt ??= observedAt;
+      }
     }
     this.onEvent({ type: 'native-tasks', nativeTasks: this.nativeTasks });
   }
 
   endTasks() {
+    const observedAt = this.now();
     for (const task of this.nativeTaskState.values()) {
       if (!terminalTask(task.status)) { task.lastStatus = task.status; task.status = 'process-ended'; }
       task.processEnded = true;
       task.backgroundActive = false;
+      task.updatedAt = observedAt;
     }
     if (this.nativeTaskState.size) this.onEvent({ type: 'native-tasks', nativeTasks: this.nativeTasks });
   }
@@ -191,8 +257,16 @@ export class ClaudeEventNormalizer {
       message.blocks.set(index, block);
       this.onEvent({ type: 'message-start', id: block.id });
       this.appendText(block, content.text);
+    } else if (content.type === 'thinking' && typeof content.thinking === 'string') {
+      Object.assign(block, { id: `claude-thinking:${message.scope || 'main'}:${message.id}:${index}`, text: '' });
+      message.blocks.set(index, block);
+      this.onEvent({ type: 'thinking-start', id: block.id });
+      this.appendThinking(block, content.thinking);
+    } else if (content.type === 'redacted_thinking') {
+      // Track the block only to accept legacy token estimates, never its data.
+      message.blocks.set(index, block);
     } else if (content.type === 'tool_use' && identifier(content.id) && identifier(content.name)) {
-      Object.assign(block, { id: content.id, name: content.name, input: record(content.input) ? content.input : {}, json: '' });
+      Object.assign(block, { id: content.id, name: content.name, input: record(content.input) ? content.input : {}, json: '', ...(message.scope !== null ? { parentToolUseId: message.scope } : {}) });
       message.blocks.set(index, block);
     } else return;
     message.nextIndex = Math.max(message.nextIndex, index + 1);
@@ -211,6 +285,18 @@ export class ClaudeEventNormalizer {
     this.onEvent({ type: 'message-completed', id: block.id, text: block.text });
   }
 
+  appendThinking(block, delta) {
+    if (block.completed || !delta) return;
+    block.text += delta;
+    this.onEvent({ type: 'thinking-delta', id: block.id, delta });
+  }
+
+  completeThinking(block) {
+    if (block.type !== 'thinking' || block.completed) return;
+    block.completed = true;
+    this.onEvent({ type: 'thinking-completed', id: block.id, text: block.text });
+  }
+
   startTool(block) {
     if (this.tools.has(block.id)) return;
     if (block.json) {
@@ -220,9 +306,12 @@ export class ClaudeEventNormalizer {
         block.input = input;
       } catch { return; }
     }
-    const tool = { id: block.id, name: block.name, input: block.input, completed: false };
+    const tool = { id: block.id, name: block.name, input: block.input, startedAt: this.now(),
+      ...(block.parentToolUseId ? { parentToolUseId: block.parentToolUseId } : {}),
+      ...(this.agentModels.has(block.id) ? { model: this.agentModels.get(block.id) } : {}), completed: false };
     this.tools.set(block.id, tool);
-    this.onEvent({ type: 'tool-start', id: tool.id, name: tool.name, input: tool.input });
+    const { completed, ...metadata } = tool;
+    this.onEvent({ type: 'tool-start', ...metadata });
   }
 
   consumePartial(event, scope) {
@@ -232,6 +321,7 @@ export class ClaudeEventNormalizer {
       if (message) {
         this.active.set(scope, message);
         message.synthetic = event.message?.model === '<synthetic>';
+        this.usage(message, event.message?.usage);
         const inputTokens = event.message?.usage?.input_tokens;
         if (!message.synthetic && Number.isFinite(inputTokens) && inputTokens > 0) this.acknowledgeInput(scope);
       }
@@ -239,10 +329,22 @@ export class ClaudeEventNormalizer {
     }
     const message = this.active.get(scope);
     if (!message) return;
+    if (scope === null && !message.synthetic && event.type === 'content_block_start') {
+      message.thinkingEstimate = 0;
+      const phase = { thinking: 'thinking', redacted_thinking: 'thinking', text: 'responding', tool_use: 'preparingTool' }[event.content_block?.type];
+      if (phase) this.activity(phase);
+    }
     if (event.type === 'content_block_start') this.block(message, event.index, event.content_block, true);
     else if (event.type === 'content_block_delta') {
       const block = message.blocks.get(event.index);
       if (!block || block.finalized || !record(event.delta)) return;
+      if (event.delta.type === 'thinking_delta' && ['thinking', 'redacted_thinking'].includes(block.type)) {
+        if (scope === null && !message.synthetic && !this.typedThinkingTokens && indexValue(event.delta.estimated_tokens)) {
+          message.thinkingEstimate = (message.thinkingEstimate ?? 0) + event.delta.estimated_tokens;
+          this.activity('thinking', { estimatedThinkingTokens: message.thinkingEstimate });
+        }
+        if (block.type === 'thinking' && typeof event.delta.thinking === 'string') this.appendThinking(block, event.delta.thinking);
+      }
       if (block.type === 'text' && event.delta.type === 'text_delta' && typeof event.delta.text === 'string') {
         if (!message.synthetic && event.delta.text) this.acknowledgeInput(scope);
         this.appendText(block, event.delta.text);
@@ -253,7 +355,8 @@ export class ClaudeEventNormalizer {
     } else if (event.type === 'content_block_stop') {
       const block = message.blocks.get(event.index);
       if (block?.type === 'tool_use') this.startTool(block);
-    } else if (event.type === 'message_stop') {
+    } else if (event.type === 'message_delta') this.usage(message, event.usage);
+    else if (event.type === 'message_stop') {
       // The final assistant envelope may follow message_stop and can repair a
       // missing partial delta. Finalize there, or in finish() on result/abort.
       this.active.delete(scope);
@@ -265,11 +368,13 @@ export class ClaudeEventNormalizer {
     const message = this.message(raw.id, scope);
     if (!message) return;
     if (raw.model === '<synthetic>') message.synthetic = true;
+    this.usage(message, raw.usage);
     // Synthetic local/auth errors are still rendered, but they do not prove the
     // prompt reached a model and must not advance the persisted handoff cursor.
     if (canAcknowledge && raw.role === 'assistant' && identifier(raw.model) && raw.model !== '<synthetic>' && raw.content.some(modelContent)) this.acknowledgeInput(scope);
     for (const [index, content] of raw.content.entries()) {
       if (!record(content)) continue;
+      if (content.type === 'thinking' && typeof content.signature !== 'string') continue;
       // SDK 0.3 emits one envelope per completed block, sharing message.id.
       // Match the first unfinalized streaming block instead of appending its text twice.
       const snapshotBlock = raw.stop_reason != null ? message.blocks.get(index) : undefined;
@@ -282,6 +387,10 @@ export class ClaudeEventNormalizer {
         // The completed block is authoritative if a partial stream was incomplete.
         block.text = content.text;
         this.completeText(block);
+      } else if (block.type === 'thinking' && typeof content.thinking === 'string') {
+        if (content.thinking.startsWith(block.text)) this.appendThinking(block, content.thinking.slice(block.text.length));
+        block.text = content.thinking;
+        this.completeThinking(block);
       } else if (block.type === 'tool_use' && record(content.input)) {
         block.input = content.input;
         block.json = '';
@@ -300,12 +409,16 @@ export class ClaudeEventNormalizer {
       const tool = this.tools.get(content.tool_use_id);
       if (!tool || tool.completed) continue;
       tool.completed = true;
-      this.onEvent({ type: 'tool-completed', id: tool.id, name: tool.name, input: tool.input, output: content.content ?? '', isError: content.is_error === true });
+      const completedAt = this.now();
+      const { completed, ...metadata } = tool;
+      this.onEvent({ type: 'tool-completed', ...metadata, completedAt, durationMs: Math.max(0, completedAt - tool.startedAt), output: content.content ?? '', isError: content.is_error === true });
     }
   }
 
   finish() {
-    for (const message of this.messages.values()) for (const block of message.blocks.values()) this.completeText(block);
+    for (const message of this.messages.values()) for (const block of message.blocks.values()) {
+      this.completeText(block); this.completeThinking(block);
+    }
   }
 
   get text() {

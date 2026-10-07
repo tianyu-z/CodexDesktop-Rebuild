@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { createConnection } from 'node:net';
 import { request } from 'node:http';
 import { mkdirSync, lstatSync, unlinkSync, openSync, closeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -12,6 +11,7 @@ import { startRemoteServer } from './server.mjs';
 import { remoteClaudeEnvironment } from './environment.mjs';
 import { acquireStartupLock } from './startup-lock.mjs';
 import { resolveRemoteSandboxArgs } from './sandbox.mjs';
+import { startRemoteProxy } from './proxy.mjs';
 
 const scope = process.env.CDX_REMOTE_SCOPE ?? 'chatgpt-dev';
 if (!/^[a-z0-9-]{1,100}$/.test(scope)) throw Error('Invalid remote engine scope.');
@@ -107,11 +107,12 @@ async function main() {
   if (action === 'ensure') { console.log(JSON.stringify(await ensure())); return; }
   if (action === 'stop') { prepareDirectory(); await stop(true); return; }
   if (action === 'proxy') {
-    const socket = createConnection(socketPath);
-    socket.on('error', () => { console.error('Remote engine gateway connection failed.'); process.exitCode = 1; process.stdin.destroy(); });
-    socket.on('close', () => { process.stdin.destroy(); });
-    process.stdin.on('error', () => socket.destroy()); process.stdout.on('error', () => socket.destroy());
-    process.stdin.pipe(socket); socket.pipe(process.stdout); return;
+    startRemoteProxy({ socketPath, directory,
+      onError: () => { console.error('Remote engine gateway connection failed.'); process.exitCode = 1; },
+      // Node intentionally keeps stdout's fd open after destroy(). Once both
+      // WebSockets are gone, a stalled SSH reader must not retain this proxy.
+      onClose: () => setImmediate(() => process.exit(process.exitCode ?? 0)),
+    }); return;
   }
   if (action !== 'serve') throw Error('Expected ensure, serve or proxy.');
   prepareDirectory();
