@@ -175,13 +175,15 @@ export class ConversationStore {
       this.putTurn(thread.id, turn, { engine: 'codex', save: false });
     }
     const nativeOwned = value.activeRun?.engine === 'codex' && value.activeRun.mode !== 'both';
+    // Until turn/start responds or emits turn/started, a native snapshot cannot
+    // identify or release the locally reserved run.
     if ((!value.activeRun || nativeOwned) && thread.status?.type === 'active') {
       if (current && !value.discardedNativeTurnIds?.includes(current.id)
           && value.turns.some(row => row.engine === 'codex' && row.turn.id === current.id && row.turn.status === 'inProgress')) {
-        if (value.activeRun?.turnId !== current.id) value.activeRun = { id: current.id, turnId: current.id, engine: 'codex' };
+        if (value.activeRun?.turnId !== current.id && !value.activeRun?.pendingStart) value.activeRun = { id: current.id, turnId: current.id, engine: 'codex' };
       } else if (!value.activeRun) value.activeRun = { id: 'native:unknown', turnId: null, engine: 'codex' };
     }
-    if (nativeOwned && thread.status?.type === 'idle') value.activeRun = null;
+    if (nativeOwned && !value.activeRun.pendingStart && thread.status?.type === 'idle') value.activeRun = null;
     this.save(value);
     return clone(value);
   }

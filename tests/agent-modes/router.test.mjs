@@ -153,6 +153,109 @@ test('delayed sidebar list cannot clear a newer metadata-only active guard', asy
   assert.equal(result.data[0].status.type, 'active');
 });
 
+test('delayed idle list preserves a pending local Codex start and its original input', async t => {
+  const f = fixture(t); await start(f);
+  f.store.putTurn('thread-1', { id: 'claude-history', status: 'completed', items: [
+    { id: 'prior-user', type: 'userMessage', content: [{ type: 'text', text: 'Earlier request' }] },
+    { id: 'prior-answer', type: 'agentMessage', text: 'Earlier answer' },
+  ] }, { engine: 'claude' });
+  const snapshot = { ...f.thread, status: { type: 'idle' }, turns: [] };
+  const original = f.router.native.request.bind(f.router.native);
+  let releaseList, releaseStart, startParams;
+  f.router.native.request = (method, params) => {
+    if (method === 'thread/list' && !releaseList) return new Promise(resolve => { releaseList = () => resolve({ data: [structuredClone(snapshot)], nextCursor: null }); });
+    if (method === 'turn/start') return new Promise(resolve => { startParams = params; releaseStart = turn => resolve({ turn }); });
+    return original(method, params);
+  };
+  const listing = f.router.request('thread/list', {}); await tick(); assert.ok(releaseList);
+  const input = [{ type: 'text', text: 'Current request' }];
+  const starting = f.router.request('turn/start', { threadId: 'thread-1', input });
+  await tick(); assert.ok(releaseStart);
+  const reserved = f.store.get('thread-1').activeRun;
+  assert.match(reserved.id, /^[0-9a-f]{8}-[0-9a-f-]{27,}$/);
+  assert.equal(reserved.turnId, null);
+  assert.deepEqual(reserved.originalInput, input);
+  releaseList(); await listing;
+  assert.deepEqual(f.store.get('thread-1').activeRun, reserved);
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+  releaseStart({ id: 'started-after-list', status: 'inProgress', items: [
+    { id: 'native-user', type: 'userMessage', content: startParams.input },
+  ] });
+  const { turn } = await starting;
+  assert.deepEqual(turn.items[0].content, input);
+  assert.equal(f.store.get('thread-1').activeRun.id, reserved.id);
+  assert.equal(f.store.get('thread-1').activeRun.turnId, turn.id);
+  assert.deepEqual(f.store.get('thread-1').turns.find(row => row.turn.id === turn.id).originalInput, input);
+  await f.router.hydrate('thread-1');
+  assert.equal(f.store.get('thread-1').activeRun, null, 'A later authoritative idle snapshot still releases the native run');
+});
+
+test('idle list requested during local start cannot clear its later native acknowledgement', async t => {
+  const f = fixture(t); await start(f);
+  const original = f.router.native.request.bind(f.router.native);
+  let releaseList, releaseStart;
+  f.router.native.request = (method, params) => {
+    if (method === 'turn/start') return new Promise(resolve => { releaseStart = () => resolve({ turn: {
+      id: 'acknowledged-turn', status: 'inProgress', items: [{ id: 'user', type: 'userMessage', content: params.input }],
+    } }); });
+    if (method === 'thread/list') return new Promise(resolve => { releaseList = () => resolve({ data: [{ ...f.thread, status: { type: 'idle' } }], nextCursor: null }); });
+    return original(method, params);
+  };
+  const starting = f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'work' }] });
+  await tick(); assert.ok(releaseStart);
+  const reservationId = f.store.get('thread-1').activeRun.id;
+  const listing = f.router.request('thread/list', {}); await tick(); assert.ok(releaseList);
+  releaseStart(); await starting;
+  assert.equal(f.store.get('thread-1').activeRun.turnId, 'acknowledged-turn');
+  releaseList(); await listing;
+  assert.equal(f.store.get('thread-1').activeRun.id, reservationId);
+  assert.equal(f.store.get('thread-1').activeRun.turnId, 'acknowledged-turn');
+});
+
+test('active snapshot cannot replace an unacknowledged local Codex reservation', async t => {
+  const f = fixture(t); await start(f);
+  const original = f.router.native.request.bind(f.router.native);
+  let releaseList, releaseStart;
+  f.router.native.request = (method, params) => {
+    if (method === 'turn/start') return new Promise(resolve => { releaseStart = () => resolve({ turn: {
+      id: 'new-local-turn', status: 'inProgress', items: [{ id: 'user', type: 'userMessage', content: params.input }],
+    } }); });
+    if (method === 'thread/list') return new Promise(resolve => { releaseList = () => resolve({ data: [{
+      ...f.thread, status: { type: 'active', activeFlags: [] },
+      turns: [{ id: 'older-native-turn', status: 'inProgress', items: [] }],
+    }], nextCursor: null }); });
+    return original(method, params);
+  };
+  const starting = f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'new work' }] });
+  await tick(); assert.ok(releaseStart);
+  const reserved = f.store.get('thread-1').activeRun;
+  const listing = f.router.request('thread/list', {}); await tick(); assert.ok(releaseList);
+  releaseList(); await listing;
+  assert.deepEqual(f.store.get('thread-1').activeRun, reserved);
+  releaseStart(); await starting;
+  assert.equal(f.store.get('thread-1').activeRun.id, reserved.id);
+  assert.equal(f.store.get('thread-1').activeRun.turnId, 'new-local-turn');
+});
+
+for (const source of ['thread/read', 'thread/list']) test(`delayed ${source} snapshot cannot replace a newer native turn identity`, async t => {
+  const f = fixture(t); await start(f);
+  const older = { id: 'older-native', status: 'inProgress', items: [] };
+  const snapshot = { ...f.thread, status: { type: 'active', activeFlags: [] }, turns: [older] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === source
+    ? new Promise(resolve => { release = () => resolve(source === 'thread/read'
+      ? { thread: structuredClone(snapshot) } : { data: [structuredClone(snapshot)], nextCursor: null }); }) : original(method, params);
+  const pending = source === 'thread/read' ? f.router.hydrate('thread-1') : f.router.request('thread/list', {});
+  await tick(); assert.ok(release);
+  const newer = { id: 'newer-native', status: 'inProgress', items: [] };
+  f.router.nativeNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn: newer } });
+  assert.equal(f.store.get('thread-1').activeRun.turnId, newer.id);
+  release(); await pending;
+  assert.equal(f.store.get('thread-1').activeRun.turnId, newer.id);
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+});
+
 test('composer effort persists without a turn and reaches the next Claude run', async t => {
   const f = fixture(t); await start(f, 'claude');
   f.router.adapter.listModels = async () => [{ value: 'opus', supportsEffort: true, supportedEffortLevels: ['low', 'high', 'max'] }];
