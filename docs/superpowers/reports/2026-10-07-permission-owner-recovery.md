@@ -318,3 +318,108 @@ then launch the installed app and verify bar startup plus the affected rno
 chat's permission label. Preserve the pending native request and the official
 daemon. Compare rno transport latency after reopening before attributing that
 remaining delay to a specific cause.
+
+
+## Approval replay recurrence and deployed correction
+
+The Mac was subsequently unlocked and the picker/direct-socket frontend was
+loaded by desktop PID 62470 at 22:28Z. The recurrence therefore was not simply
+an unactivated picker update. Direct native inspection found one live pending
+approval (native ID 88), while the development gateway retained 12 outward
+requests. Repeating `thread/resume` twice increased the gateway count to 13
+and 14. The native daemon intentionally replayed the same numeric ID; the
+bridge incorrectly assigned each replay another actionable UUID.
+
+Commit `9525ee3` preserves the outward identity for identical replay, suppresses
+replay after a local answer while awaiting native resolution, and retires an
+old outward identity before emitting changed request details with a new UUID.
+Different native requests remain separate. Native resolution clears the sole
+remaining identity, including across desktop reconnects. An independent review
+executed the installed frontend's actual request handlers and caught a first
+version that reused the UUID for changed details: the UI appends requests and
+looks up the first matching ID. The corrected retire-and-replace behavior
+avoids stale actionable command details. Old-ID answers are rejected.
+
+The failing reproductions and final regression runs are retained in
+`.artifacts/native-approval-replay-red.log`,
+`.artifacts/native-approval-updated-request-red.log`, and
+`.artifacts/native-approval-replay-regressions.log`. The focused root run passed
+18/18; the original workspace replay/upstream run passed 10/10 after a
+three-way source merge with backups. Independent review approved the corrected
+implementation. Commit `a65d192` also verified explicit restricted and Full
+access settings updates followed by bare resumes on an isolated rno native
+0.142.5 daemon, without starting a model turn or changing production policy.
+That test does not establish that updating settings clears an already pending
+approval or changes an old active turn's permission context.
+
+The signed release is installed and activated on rno. Runtime archive:
+`b642e0e44470b3ab789c5b4135b0a60f24eaf9c0ea560be1cc1c6c156c264218`.
+Frontend archive remains
+`ae2667da4c61c1973a777ab59b3b224a8aacaf1af07e6d3d071364961c54a7eb`.
+The build verified all 8,618 unrelated ASAR files and 6,406 unrelated runtime
+files unchanged. Only the scoped development gateway was restarted; official
+rno daemon PID 20516 retained starttime 8081145, and official local desktop and
+native PIDs 99053/99152 were preserved. The normal dev restart loaded this
+release as PID 78998. Evidence:
+`.artifacts/approval-replay-release/build-manifest.json`,
+`.artifacts/approval-replay-install.json`, and
+`.artifacts/approval-replay-after-deploy.json`.
+Backups include `/Applications/.chatgpt-dev-before-approval-replay.app` and
+`.artifacts/rollback-approval-replay-20261007/chatgpt-dev.app`.
+
+## Old Goal send block and user recovery
+
+A subsequent screenshot displayed `Unable to send message / Continuing goal…`.
+The pinned frontend's `VDr` selector treats an active Goal plus active runtime
+status plus a last displayed turn that is not in progress as a Goal
+continuation still loading. `c8c` and `l8c` then block message submission;
+the composer also hides its ordinary stop action for that state. Before
+recovery, native status was active with `waitingOnApproval`, and the old live
+turn was not the newest displayed turn. This explains how the legacy owner
+state could be classified as Goal continuation rather than an approval wait.
+It does not establish that every Goal continuation is stuck.
+
+The user explicitly reported manually deleting the old Goal and recovering
+message sending. Official desktop PID 99053 logged `thread/goal/clear` success
+at 2026-10-08T00:03:17.067Z, followed by successful user turn starts. A user
+interrupt briefly returned an active-turn mismatch (a newly displayed turn
+versus old turn `09cb2759-0e22-4530-b319-34632f525e5b`), followed by a successful
+interrupt and explicit settings changes. These events occurred in the official
+app while dev was closed. The stale recovery plan targeting native request 88
+was not executed; subsequent requests and user actions had superseded it.
+
+At 2026-10-08T00:07:15Z, a fresh direct native read confirmed `goal: null`,
+`status: idle`, zero nonterminal turns among 432 turns, and no pending request
+replayed by bare resume. Actual settings were `dangerFullAccess / never` with
+`:danger-full-access`. Read-only gateway health also confirmed the activated
+b642 release and the preserved native owner. Evidence:
+`.artifacts/goal-cleared-native-live.json` and
+`.artifacts/goal-cleared-owner-live.json`. The assistant did not clear the Goal,
+answer an approval, interrupt a native turn, or change the user's settings.
+
+A controlled gateway reconnect check then resumed the affected chat twice.
+Both responses retained `dangerFullAccess / never`, `idle`, and zero replayed
+requests. No completed approval returned. Evidence:
+`.artifacts/approval-replay-live-fixed.json`. Because the user had already
+resolved all pending approvals, this live check covers absence of ghost
+requests and permission stability; live pending-request deduplication is
+covered by the native/gateway regression tests, not by this zero-request
+snapshot. The earlier live probe's hardcoded obsolete item assertion failed
+and was not counted as a passing verification.
+
+Independent final review found that narrowing/removing only `VDr` would be
+unsafe: downstream send/steer/interrupt also select the latest history turn,
+and steering may fall back to starting a new turn. No speculative frontend
+bypass was added. The shared native owner correction prevents the demonstrated
+independent-owner divergence, while replay deduplication prevents duplicate
+approval identities. Future Goal continuation/queue/reconnect combinations
+under a single owner have not all been verified and are not claimed fixed by
+these changes alone.
+
+Final dev restart used PID 80751. Computer Use opened **Review scaling ladder
+config** and confirmed Full access, an ordinary Send button, and no Continuing
+Goal modal or pursuing-Goal banner. The assistant did not submit a test message.
+Official local desktop/native PIDs 99053/99152 remained alive. An incidental
+`thread/turns/list` stale engine-history-cursor error was logged while opening
+the chat; the visible chat and composer recovered. This observation was not
+counted as a successful history-pagination test or silently presented as fixed.
