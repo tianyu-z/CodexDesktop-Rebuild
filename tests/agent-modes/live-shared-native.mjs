@@ -68,12 +68,17 @@ try {
   const restricted = await rpc(second, 'thread/resume', { threadId: created.thread.id });
   assert.equal(restricted.approvalPolicy, 'on-request');
   assert.equal((restricted.sandbox ?? restricted.sandboxPolicy)?.type, 'workspaceWrite');
+  await rpc(first, 'thread/settings/update', { threadId: created.thread.id, approvalPolicy: 'never',
+    sandboxPolicy: { type: 'dangerFullAccess' } });
+  const restored = await rpc(second, 'thread/resume', { threadId: created.thread.id });
+  assert.equal(restored.approvalPolicy, 'never');
+  assert.equal((restored.sandbox ?? restored.sandboxPolicy)?.type, 'dangerFullAccess');
   await first.close();
   const read = await rpc(second, 'thread/read', { threadId: created.thread.id, includeTurns: false });
   assert.equal(resumed.thread.id, created.thread.id);
   assert.equal(read.thread.id, created.thread.id);
   console.log(JSON.stringify({ host, cliVersion, appServerVersion, sharedResume: true, fullBareResume: true,
-    restrictedBareResume: true, readAfterFirstProxyClose: true, threadId: created.thread.id }));
+    restrictedBareResume: true, restoredFullBareResume: true, readAfterFirstProxyClose: true, threadId: created.thread.id }));
 } finally {
   for (const client of clients) await client.close().catch(() => {});
   for (const { child, stream } of relays) { stream.destroy(); child.kill(); }
