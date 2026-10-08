@@ -63,3 +63,26 @@ The currently open edit draft was backed up before restart. The release changes
 only the branch helper, thread callback, user-message component, main window
 coordination module and its new IPC adapter. The remote runtime remains byte
 identical. Activation and read-only verification are recorded below when done.
+
+
+### Activated release
+
+- Source commit: `7edcff3`.
+- Installed and signed `/Applications/chatgpt-dev.app`; restarted only dev,
+  old PID 80751 → new PID 86346.
+- ASAR: `0ff094786ff59dcb80b216ca993fc8ca8764737e311fe104cde45e4fbaff65d5`.
+- Runtime remains `b642e0e44470b3ab789c5b4135b0a60f24eaf9c0ea560be1cc1c6c156c264218`.
+- All 8,615 other archive files verified byte-identical. Rollback bundle retained
+  in `.artifacts/rollback-edit-session-20261007/chatgpt-dev.app`.
+- Merged 15 source/test/report files into the original workspace using three-way
+  merges with backups. Its 12 focused tests passed (including 39 IPC assertions).
+- At 00:41:06Z the affected chat became dev frontend `role=owner`; at 00:41:13Z
+  resume succeeded with `dangerFullAccess / never / :danger-full-access`.
+  86 history pages loaded without an error. At 00:45:20Z no further role change,
+  source failure, fork, revert, rollback or turn/start was observed.
+- Native read verified the same 432 turns, idle status, no goal and no pending
+  requests. Official desktop PID 99053/local native PID 99152 and rno native
+  PID 20516/starttime 8081145 remained intact.
+- The old edit draft was copied to `恢复的编辑草稿.txt` in the original workspace.
+  Its exact source message is being confirmed rather than selecting another
+  message by guesswork. No real edited message was submitted for verification.
