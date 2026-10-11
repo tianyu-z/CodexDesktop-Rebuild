@@ -34,11 +34,15 @@ export class EngineRouter {
   constructor({ store, native, adapter, emit, templates, workflowFactory }) {
     Object.assign(this, { store, native, adapter, emit });
     this.runs = new Map(); this.approvals = new Map(); this.locks = new Map(); this.closed = false;
-    this.nativeTurnRevisions = new Map(); this.nativeUnpersistedTurnRevisions = new Map(); this.nativeNameRevisions = new Map(); this.pagedHistoryHydrated = new Set();
+    this.nativeTurnRevisions = new Map(); this.nativeUnpersistedTurnRevisions = new Map(); this.nativeNameRevisions = new Map(); this.nativeLifecycle = new Map(); this.pagedHistoryHydrated = new Set();
     this.workflow = new WorkflowRouter(this, { templates, workflowFactory });
     this.claudeCommands = new ClaudeCommandRouter(this);
   }
   assertOpen() { if (this.closed) throw new Error('Engine gateway is shutting down.'); }
+  recordLifecycle(id, status) {
+    const previous = this.nativeLifecycle.get(id);
+    this.nativeLifecycle.set(id, { revision: (previous?.revision ?? 0) + 1, status });
+  }
   async prepareInput(prepare, signal) {
     this.assertOpen(); signal.throwIfAborted();
     let abort;
@@ -148,14 +152,19 @@ export class EngineRouter {
     const revisions = new Map(this.nativeTurnRevisions.get(id));
     const unpersistedRevisions = new Map(this.nativeUnpersistedTurnRevisions.get(id));
     const nameRevision = this.nativeNameRevisions.get(id) ?? 0;
+    const lifecycleRevision = this.nativeLifecycle.get(id)?.revision ?? 0;
     const thread = await this.readNativeThread(id);
     recoverHistoryEdit(this, id, thread);
-    // Notifications can arrive during any page of this snapshot. Keep the newer
-    // live version of those turns, including deltas on still-running turns.
+    const latestLifecycle = this.nativeLifecycle.get(id);
+    const staleLifecycle = (latestLifecycle?.revision ?? 0) !== lifecycleRevision;
+    // A newer lifecycle event makes an older in-progress row unfit to identify
+    // the current turn. Keep newer live rows and deltas already in the store.
     thread.turns = (thread.turns ?? [])
-      .filter(turn => (revisions.get(turn.id) ?? 0) === (this.nativeTurnRevisions.get(id)?.get(turn.id) ?? 0))
+      .filter(turn => (revisions.get(turn.id) ?? 0) === (this.nativeTurnRevisions.get(id)?.get(turn.id) ?? 0)
+        && (!staleLifecycle || turn.status !== 'inProgress'))
       .map(turn => this.cleanNativeTurn(id, turn));
     if (nameRevision !== (this.nativeNameRevisions.get(id) ?? 0)) thread.name = this.store.get(id)?.thread.name;
+    if (staleLifecycle) thread.status = structuredClone(latestLifecycle.status);
     this.store.ensureThread(thread);
     const dirty = this.nativeUnpersistedTurnRevisions.get(id);
     for (const turn of thread.turns) if (dirty?.has(turn.id) && dirty.get(turn.id) === unpersistedRevisions.get(turn.id)) dirty.delete(turn.id);
@@ -188,6 +197,7 @@ export class EngineRouter {
       stored.originalInput ??= active.originalInput;
       stored.firstUserItemId ??= turn.items.find(item => item.type === 'userMessage')?.id;
       active.turnId = turn.id;
+      delete active.pendingStart;
       if (turn.items.some(item => item.type === 'userMessage')) active.acknowledgedSeq = row.seq;
       this.store.save(value);
     }
@@ -317,6 +327,7 @@ export class EngineRouter {
     }
     if (method === 'turn/start') {
       if (!this.store.get(id)) await this.hydrate(id);
+      else if (this.remote && this.store.get(id).mode !== 'codex') await this.hydrate(id);
       if (params.claudeEffort !== undefined && this.store.get(id)?.activeRun) throw new Error('Finish or interrupt the active run before changing Claude effort.');
       if (params.engineMode) assertMode(params.engineMode);
       const current = this.store.get(id), mode = params.engineMode ?? current.mode;
@@ -376,6 +387,7 @@ export class EngineRouter {
     }
     if (value && (value.mode !== 'codex' || value.turns.some(row => row.engine !== 'codex' || row.nativeDetached) || value.discardedNativeTurnIds?.length || (method === 'thread/rollback' && value.thread.historyMode === 'paginated')) && ['thread/fork', 'thread/rollback', 'thread/revert'].includes(method)) return editManagedHistory(this, method, params);
     if (value && value.mode !== 'codex' && /^(turn\/(steer|tool)|thread\/(compact|realtime|startAeon|inject_items|shellCommand)|review\/)/.test(method)) throw new Error(`${method} is unavailable in ${value.mode === 'both' ? 'dual workflow' : 'Claude Code'} mode.`);
+    const listLifecycle = method === 'thread/list' ? new Map([...this.nativeLifecycle].map(([threadId, state]) => [threadId, state.revision])) : null;
     const result = await this.native.request(method, nativeParams(params));
     if (value && ['thread/rollback', 'thread/revert', 'thread/delete'].includes(method)) {
       this.store.remove(id); this.pagedHistoryHydrated.delete(id); this.nativeUnpersistedTurnRevisions.delete(id);
@@ -394,7 +406,11 @@ export class EngineRouter {
       }
       result.data = method === 'thread/search' ? visible : visible.map(thread => {
       if (!this.store.get(thread.id)) return thread;
-      this.store.mergeNativeThread(thread);
+      const latest = this.nativeLifecycle.get(thread.id);
+      const staleLifecycle = (latest?.revision ?? 0) !== (listLifecycle.get(thread.id) ?? 0);
+      const status = staleLifecycle ? latest.status : thread.status;
+      const turns = staleLifecycle ? thread.turns?.filter(turn => turn.status !== 'inProgress') : thread.turns;
+      this.store.mergeNativeThread({ ...thread, status, turns });
       return { ...thread, ...this.thread(thread.id, { includeTurns: false }) };
       });
     }
@@ -415,7 +431,8 @@ export class EngineRouter {
     if (model != null) this.store.setMode(id, 'codex', { models: { codex: model } });
     const handoff = this.handoff(id, 'codex');
     const runId = randomUUID();
-    this.store.beginRun(id, { id: runId, engine: 'codex', turnId: null, originalInput: handoff.text ? params.input : undefined });
+    this.store.beginRun(id, { id: runId, engine: 'codex', turnId: null, pendingStart: true, originalInput: handoff.text ? params.input : undefined });
+    this.recordLifecycle(id, { type: 'active', activeFlags: [] });
     const clean = nativeParams(params);
     if (handoff.text) clean.input = [{ type: 'text', text: `${handoff.text}\n\n[Current user request follows]` }, ...params.input];
     const revisions = new Map(this.nativeTurnRevisions.get(id));
@@ -432,10 +449,14 @@ export class EngineRouter {
         }
       }
       const row = this.rememberNativeTurn(id, turn);
+      if (this.store.get(id).activeRun?.id === runId && row.turn.status === 'inProgress') this.recordLifecycle(id, { type: 'active', activeFlags: [] });
       if (row.turn.items.some(item => item.type === 'userMessage')) this.store.setBinding(id, 'codex', { consumedSeq: Math.max(handoff.throughSeq, this.store.get(id).bindings.codex.consumedSeq) });
       return { ...result, turn: presentTurn(row.turn, 'codex') };
     } catch (error) {
-      if (this.store.get(id).activeRun?.id === runId) this.store.finishRun(id, runId);
+      if (this.store.get(id).activeRun?.id === runId) {
+        this.store.finishRun(id, runId);
+        this.recordLifecycle(id, { type: 'idle' });
+      }
       throw error;
     }
   }
@@ -624,14 +645,24 @@ export class EngineRouter {
     const value = this.store.require(id);
     const nativeTurnId = params.turn?.id ?? params.turnId;
     if (nativeTurnId && value.discardedNativeTurnIds?.includes(nativeTurnId)) return;
-    if (method === 'thread/deleted') { this.store.remove(id); this.pagedHistoryHydrated.delete(id); this.nativeUnpersistedTurnRevisions.delete(id); }
+    if (method === 'thread/deleted') { this.store.remove(id); this.pagedHistoryHydrated.delete(id); this.nativeUnpersistedTurnRevisions.delete(id); this.nativeLifecycle.delete(id); }
     if (method === 'thread/name/updated') { this.nativeNameRevisions.set(id, (this.nativeNameRevisions.get(id) ?? 0) + 1); const current = this.store.require(id); current.thread.name = params.threadName; this.store.save(current); }
     // The native container is idle during a Claude run; don't let an unrelated
     // metadata refresh overwrite its status in the frontend.
     if ((value.activeRun?.engine === 'claude' || value.activeTurn?.mode === 'both') && method === 'thread/status/changed') return;
+    if (method === 'thread/status/changed' && ['active', 'idle'].includes(params.status?.type)) {
+      this.recordLifecycle(id, params.status);
+      value.thread.status = structuredClone(params.status);
+      if (params.status.type === 'idle' && value.activeRun?.engine === 'codex' && !value.activeRun.pendingStart) value.activeRun = null;
+      else if (params.status.type === 'active' && !value.activeRun) value.activeRun = { id: 'native:unknown', turnId: null, engine: 'codex' };
+      this.store.save(value);
+    }
     if (params.turn && (method === 'turn/started' || method === 'turn/completed')) {
       bumpRevision(this.nativeTurnRevisions, id, params.turn.id);
-      if (method === 'turn/started' && !value.activeRun) this.store.beginRun(id, { id: params.turn.id, turnId: params.turn.id, engine: 'codex' });
+      this.recordLifecycle(id, method === 'turn/started' ? { type: 'active', activeFlags: [] } : { type: 'idle' });
+      if (method === 'turn/started' && (!value.activeRun || value.activeRun.id === 'native:unknown')) {
+        value.activeRun = { id: params.turn.id, turnId: params.turn.id, engine: 'codex' }; this.store.save(value);
+      }
       const row = this.rememberNativeTurn(id, params.turn);
       if (method === 'turn/completed') {
         const dirty = this.nativeUnpersistedTurnRevisions.get(id);

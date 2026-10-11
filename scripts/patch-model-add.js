@@ -23,7 +23,7 @@
  *   Layer B — in every `Uqa({...,models:<data>,useHiddenModels:<x>.
  *     useHiddenModels})` call (the model-list builders), replace
  *     `models:<data>` with a synthetic entry appended when missing. The
- *     entry is CLONED from an existing model object (`<data>[0]`) with only
+ *     entry is CLONED from its base model, or the first existing model, with only
  *     its identity + visibility overridden, so it inherits a valid shape
  *     (supportedReasoningEfforts, contextWindow, …) and can never crash
  *     the picker on a missing field. Object KEYS in the call
@@ -44,6 +44,7 @@ class PatchError extends Error {}
 // ─── Models to add ──────────────────────────────────────────────
 const NEW_MODELS = [
   { model: "gpt-6-astra", modelLabel: "6 Astra", efforts: ["low", "medium", "high", "xhigh"] },
+  { model: "gpt-6.1-sol", modelLabel: "6.1 Sol", cloneFrom: "gpt-6-sol", efforts: ["low", "medium", "high", "xhigh"] },
 ];
 
 function candidateEntries(models) {
@@ -68,6 +69,8 @@ const TAIL_B =
 // (the trailing `.useHiddenModels` distinguishes the CALL from Uqa's own
 // destructuring definition `models:s,useHiddenModels:c}`).
 const MODELS_CALL = /,models:(\w+),useHiddenModels:(\w+)\.useHiddenModels\b/g;
+const LEGACY_MODELS_CALL = /,models:\(!([\w]+)\.length\|\|\1\.some\(o=>o&&o\.model===`gpt-6-astra`\)\?\1:\1\.concat\(\[\{\.\.\.\1\[0\],model:`gpt-6-astra`,slug:`gpt-6-astra`,id:`gpt-6-astra`,displayName:`6 Astra`,isDefault:!1,hidden:!1\}\]\)\),useHiddenModels:(\w+)\.useHiddenModels\b/g;
+const INJECT_MARKER = "/*cdx-model-add-v2*/";
 
 /** Replace exactly one occurrence, or throw. */
 function replaceOnce(code, re, build, what) {
@@ -112,39 +115,47 @@ function eachBundle(pattern, platform, fn) {
 }
 
 // ─── Layer A: hardcoded effort-slider candidate lists ───────────
-function layerCandidates(platform, extra) {
+function layerCandidates(platform) {
   console.log("  [layer A] effort-slider candidate lists (Uic/Gic)");
   eachBundle(/^app-initial-.*\.js$/, platform, (code) => {
-    if (code.includes("`gpt-6-astra:low`")) return null;
-    let out = replaceOnce(code, TAIL_A, (m) => m[0] + "," + extra, "primary candidate list tail");
-    out = replaceOnce(out, TAIL_B, (m) => m[0] + "," + extra, "fallback candidate list tail");
-    return out;
+    let out = code;
+    for (const tail of [TAIL_A, TAIL_B]) {
+      out = replaceOnce(out, new RegExp(tail.source + "[^\\]]*\\]"), (m) => {
+        const missing = NEW_MODELS.map(model => ({ ...model,
+          efforts: model.efforts.filter(effort => !m[0].includes("id:`" + model.model + ":" + effort + "`")),
+        }));
+        const extra = candidateEntries(missing);
+        return extra ? m[0].slice(0, -1) + "," + extra + "]" : m[0];
+      }, "candidate list tail " + tail.source);
+    }
+    return out === code ? null : out;
   });
 }
 
 // ─── Layer B: inject into the model/list data (Uqa calls) ───────
-function synthClone(dataVar, model, label) {
-  // Clone an existing model object so every field the picker reads exists.
-  const M = "`" + model + "`";
+function synthModels(dataVar) {
+  // Prefer the same model family. Keep native entries authoritative and leave
+  // empty catalogs untouched because they have no valid metadata to inherit.
+  const models = NEW_MODELS.map(({ model, modelLabel, cloneFrom }) => [model, modelLabel, cloneFrom ?? model]);
   return (
-    "(!" + dataVar + ".length||" + dataVar + ".some(o=>o&&o.model===" + M + ")" +
-    "?" + dataVar + ":" + dataVar + ".concat([{..." + dataVar + "[0]," +
-    "model:" + M + ",slug:" + M + ",id:" + M + "," +
-    "displayName:`" + label + "`,isDefault:!1,hidden:!1}]))"
+    "((catalog)=>" + INJECT_MARKER + "!catalog.length?catalog:" + JSON.stringify(models) +
+    ".reduce((data,[model,displayName,base])=>data.some(o=>o&&o.model===model)?data:" +
+    "data.concat([{...(catalog.find(o=>o&&o.model===base)||catalog[0])," +
+    "model,slug:model,id:model,displayName,isDefault:!1,hidden:!1}]),catalog))(" + dataVar + ")"
   );
 }
 
 function layerInject(platform) {
   console.log("  [layer B] inject synthetic model into model/list builders (Uqa)");
-  const { model, modelLabel } = NEW_MODELS[0]; // one injected clone per builder
-  const marker = "o&&o.model===`" + model + "`";
   eachBundle(/^app-initial-.*\.js$/, platform, (code) => {
-    if (code.includes(marker)) return null;
+    if (code.includes(INJECT_MARKER)) return null;
+    // Upgrade the exact v1 expression already present in installed dev builds.
+    code = code.replace(LEGACY_MODELS_CALL, ",models:$1,useHiddenModels:$2.useHiddenModels");
     const { code: patched, count } = replaceAll(
       code,
       MODELS_CALL,
       (m) =>
-        ",models:" + synthClone(m[1], model, modelLabel) +
+        ",models:" + synthModels(m[1]) +
         ",useHiddenModels:" + m[2] + ".useHiddenModels",
       "Uqa models-list call",
     );
@@ -155,10 +166,9 @@ function layerInject(platform) {
 
 function main() {
   const platform = process.argv.slice(2).find((a) => PLATFORMS.includes(a));
-  const extra = candidateEntries(NEW_MODELS);
   console.log("  [model-add] " + NEW_MODELS.map((m) => m.model).join(", "));
   try {
-    layerCandidates(platform, extra);
+    layerCandidates(platform);
     layerInject(platform);
   } catch (e) {
     if (!(e instanceof PatchError)) throw e;

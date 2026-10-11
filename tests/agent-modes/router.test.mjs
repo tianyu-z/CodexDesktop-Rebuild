@@ -19,6 +19,243 @@ function fixture(t) {
 }
 async function start(f,engineMode='codex'){return f.router.request('thread/start',{cwd:f.dir,engineMode,model:'codex-model',agentMode:'guardian-approvals'});}
 
+test('shared native resume restores a live Codex turn after gateway store recovery', async t => {
+  const f = fixture(t); await start(f);
+  const turn = { id: 'live-native', status: 'inProgress', items: [] };
+  f.store.putTurn('thread-1', turn, { engine: 'codex' });
+  f.store.beginRun('thread-1', { id: turn.id, turnId: turn.id, engine: 'codex' });
+  f.router.store = new ConversationStore(f.dir);
+  assert.equal(f.router.store.get('thread-1').activeRun, null);
+  assert.equal(f.router.store.get('thread-1').turns[0].turn.status, 'interrupted');
+  f.thread.status = { type: 'active', activeFlags: [] }; f.thread.turns = [turn];
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+  assert.equal(f.router.store.hasActiveRun(), true);
+  assert.equal(f.router.store.get('thread-1').turns[0].turn.status, 'inProgress');
+  await assert.rejects(f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude' }), /active run/);
+  f.router.nativeNotification({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { ...turn, status: 'completed' } } });
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+});
+
+test('shared native snapshot activates only the current turn, never an idle orphan', async t => {
+  const f = fixture(t); await start(f);
+  const orphan = { id: 'orphan', status: 'inProgress', items: [] };
+  f.thread.turns = [orphan];
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+  const current = { id: 'official-current', status: 'inProgress', items: [] };
+  f.thread.status = { type: 'active', activeFlags: [] }; f.thread.turns = [orphan, current];
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.store.get('thread-1').activeRun.turnId, current.id);
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+});
+
+test('remote managed turn submission checks a surviving native turn before starting Claude', async t => {
+  const f = fixture(t); f.router.remote = true; await start(f, 'claude');
+  const turn = { id: 'official-live', status: 'inProgress', items: [] };
+  f.thread.status = { type: 'active', activeFlags: [] }; f.thread.turns = [turn];
+  await assert.rejects(f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'new work' }] }), /active/i);
+  assert.equal(f.runs.length, 0);
+  assert.equal(f.router.store.get('thread-1').activeRun.turnId, turn.id);
+});
+
+test('active native status without paged turns stays conservatively busy until idle notification', async t => {
+  const f = fixture(t); await start(f);
+  f.thread.status = { type: 'active', activeFlags: [] }; f.thread.turns = [];
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+  await assert.rejects(f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude' }), /active run/);
+  f.router.nativeNotification({ method: 'thread/status/changed', params: { threadId: 'thread-1', status: { type: 'idle' } } });
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+});
+
+test('authoritative idle hydration releases an unknown native active guard', async t => {
+  const f = fixture(t); await start(f);
+  f.thread.status = { type: 'active', activeFlags: [] }; f.thread.turns = [];
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+  f.thread.status = { type: 'idle' };
+  await f.router.hydrate('thread-1');
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+});
+
+test('delayed active native snapshot cannot resurrect a turn completed by a newer notification', async t => {
+  const f = fixture(t); await start(f);
+  const turn = { id: 'live-race', status: 'inProgress', items: [] };
+  f.router.nativeNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn } });
+  const snapshot = { ...f.thread, status: { type: 'active', activeFlags: [] }, turns: [turn] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === 'thread/read'
+    ? new Promise(resolve => { release = () => resolve({ thread: structuredClone(snapshot) }); }) : original(method, params);
+  const hydration = f.router.hydrate('thread-1'); await tick(); assert.ok(release);
+  f.router.nativeNotification({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { ...turn, status: 'completed' } } });
+  release(); await hydration;
+  assert.equal(f.router.store.get('thread-1').activeRun, null);
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+  assert.equal(f.router.store.get('thread-1').turns[0].turn.status, 'completed');
+});
+
+test('delayed active metadata cannot override a newer idle status notification', async t => {
+  const f = fixture(t); await start(f);
+  const snapshot = { ...f.thread, status: { type: 'active', activeFlags: [] }, turns: [] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === 'thread/read'
+    ? new Promise(resolve => { release = () => resolve({ thread: structuredClone(snapshot) }); }) : original(method, params);
+  const hydration = f.router.hydrate('thread-1'); await tick(); assert.ok(release);
+  f.router.nativeNotification({ method: 'thread/status/changed', params: { threadId: 'thread-1', status: { type: 'idle' } } });
+  release(); await hydration;
+  assert.equal(f.router.thread('thread-1').status.type, 'idle');
+});
+
+test('delayed idle snapshot cannot clear a newer native start notification', async t => {
+  const f = fixture(t); await start(f);
+  const snapshot = { ...f.thread, status: { type: 'idle' }, turns: [] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === 'thread/read'
+    ? new Promise(resolve => { release = () => resolve({ thread: structuredClone(snapshot) }); }) : original(method, params);
+  const hydration = f.router.hydrate('thread-1'); await tick(); assert.ok(release);
+  const turn = { id: 'newer-native', status: 'inProgress', items: [] };
+  f.router.nativeNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn } });
+  release(); await hydration;
+  assert.equal(f.router.store.get('thread-1').activeRun.turnId, turn.id);
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+});
+
+test('delayed sidebar list cannot clear a newer native start notification', async t => {
+  const f = fixture(t); await start(f);
+  const snapshot = { ...f.thread, status: { type: 'idle' }, turns: [] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === 'thread/list'
+    ? new Promise(resolve => { release = () => resolve({ data: [structuredClone(snapshot)], nextCursor: null }); }) : original(method, params);
+  const listing = f.router.request('thread/list', {}); await tick(); assert.ok(release);
+  const turn = { id: 'sidebar-newer-native', status: 'inProgress', items: [] };
+  f.router.nativeNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn } });
+  release(); const result = await listing;
+  assert.equal(f.router.store.get('thread-1').activeRun.turnId, turn.id);
+  assert.equal(result.data[0].status.type, 'active');
+});
+
+test('delayed sidebar list cannot clear a newer metadata-only active guard', async t => {
+  const f = fixture(t); await start(f);
+  const snapshot = { ...f.thread, status: { type: 'idle' }, turns: [] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === 'thread/list'
+    ? new Promise(resolve => { release = () => resolve({ data: [structuredClone(snapshot)], nextCursor: null }); }) : original(method, params);
+  const listing = f.router.request('thread/list', {}); await tick(); assert.ok(release);
+  f.router.nativeNotification({ method: 'thread/status/changed', params: { threadId: 'thread-1', status: { type: 'active', activeFlags: [] } } });
+  release(); const result = await listing;
+  assert.equal(f.router.store.get('thread-1').activeRun.id, 'native:unknown');
+  assert.equal(result.data[0].status.type, 'active');
+});
+
+test('delayed idle list preserves a pending local Codex start and its original input', async t => {
+  const f = fixture(t); await start(f);
+  f.store.putTurn('thread-1', { id: 'claude-history', status: 'completed', items: [
+    { id: 'prior-user', type: 'userMessage', content: [{ type: 'text', text: 'Earlier request' }] },
+    { id: 'prior-answer', type: 'agentMessage', text: 'Earlier answer' },
+  ] }, { engine: 'claude' });
+  const snapshot = { ...f.thread, status: { type: 'idle' }, turns: [] };
+  const original = f.router.native.request.bind(f.router.native);
+  let releaseList, releaseStart, startParams;
+  f.router.native.request = (method, params) => {
+    if (method === 'thread/list' && !releaseList) return new Promise(resolve => { releaseList = () => resolve({ data: [structuredClone(snapshot)], nextCursor: null }); });
+    if (method === 'turn/start') return new Promise(resolve => { startParams = params; releaseStart = turn => resolve({ turn }); });
+    return original(method, params);
+  };
+  const listing = f.router.request('thread/list', {}); await tick(); assert.ok(releaseList);
+  const input = [{ type: 'text', text: 'Current request' }];
+  const starting = f.router.request('turn/start', { threadId: 'thread-1', input });
+  await tick(); assert.ok(releaseStart);
+  const reserved = f.store.get('thread-1').activeRun;
+  assert.match(reserved.id, /^[0-9a-f]{8}-[0-9a-f-]{27,}$/);
+  assert.equal(reserved.turnId, null);
+  assert.deepEqual(reserved.originalInput, input);
+  releaseList(); await listing;
+  assert.deepEqual(f.store.get('thread-1').activeRun, reserved);
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+  releaseStart({ id: 'started-after-list', status: 'inProgress', items: [
+    { id: 'native-user', type: 'userMessage', content: startParams.input },
+  ] });
+  const { turn } = await starting;
+  assert.deepEqual(turn.items[0].content, input);
+  assert.equal(f.store.get('thread-1').activeRun.id, reserved.id);
+  assert.equal(f.store.get('thread-1').activeRun.turnId, turn.id);
+  assert.deepEqual(f.store.get('thread-1').turns.find(row => row.turn.id === turn.id).originalInput, input);
+  await f.router.hydrate('thread-1');
+  assert.equal(f.store.get('thread-1').activeRun, null, 'A later authoritative idle snapshot still releases the native run');
+});
+
+test('idle list requested during local start cannot clear its later native acknowledgement', async t => {
+  const f = fixture(t); await start(f);
+  const original = f.router.native.request.bind(f.router.native);
+  let releaseList, releaseStart;
+  f.router.native.request = (method, params) => {
+    if (method === 'turn/start') return new Promise(resolve => { releaseStart = () => resolve({ turn: {
+      id: 'acknowledged-turn', status: 'inProgress', items: [{ id: 'user', type: 'userMessage', content: params.input }],
+    } }); });
+    if (method === 'thread/list') return new Promise(resolve => { releaseList = () => resolve({ data: [{ ...f.thread, status: { type: 'idle' } }], nextCursor: null }); });
+    return original(method, params);
+  };
+  const starting = f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'work' }] });
+  await tick(); assert.ok(releaseStart);
+  const reservationId = f.store.get('thread-1').activeRun.id;
+  const listing = f.router.request('thread/list', {}); await tick(); assert.ok(releaseList);
+  releaseStart(); await starting;
+  assert.equal(f.store.get('thread-1').activeRun.turnId, 'acknowledged-turn');
+  releaseList(); await listing;
+  assert.equal(f.store.get('thread-1').activeRun.id, reservationId);
+  assert.equal(f.store.get('thread-1').activeRun.turnId, 'acknowledged-turn');
+});
+
+test('active snapshot cannot replace an unacknowledged local Codex reservation', async t => {
+  const f = fixture(t); await start(f);
+  const original = f.router.native.request.bind(f.router.native);
+  let releaseList, releaseStart;
+  f.router.native.request = (method, params) => {
+    if (method === 'turn/start') return new Promise(resolve => { releaseStart = () => resolve({ turn: {
+      id: 'new-local-turn', status: 'inProgress', items: [{ id: 'user', type: 'userMessage', content: params.input }],
+    } }); });
+    if (method === 'thread/list') return new Promise(resolve => { releaseList = () => resolve({ data: [{
+      ...f.thread, status: { type: 'active', activeFlags: [] },
+      turns: [{ id: 'older-native-turn', status: 'inProgress', items: [] }],
+    }], nextCursor: null }); });
+    return original(method, params);
+  };
+  const starting = f.router.request('turn/start', { threadId: 'thread-1', input: [{ type: 'text', text: 'new work' }] });
+  await tick(); assert.ok(releaseStart);
+  const reserved = f.store.get('thread-1').activeRun;
+  const listing = f.router.request('thread/list', {}); await tick(); assert.ok(releaseList);
+  releaseList(); await listing;
+  assert.deepEqual(f.store.get('thread-1').activeRun, reserved);
+  releaseStart(); await starting;
+  assert.equal(f.store.get('thread-1').activeRun.id, reserved.id);
+  assert.equal(f.store.get('thread-1').activeRun.turnId, 'new-local-turn');
+});
+
+for (const source of ['thread/read', 'thread/list']) test(`delayed ${source} snapshot cannot replace a newer native turn identity`, async t => {
+  const f = fixture(t); await start(f);
+  const older = { id: 'older-native', status: 'inProgress', items: [] };
+  const snapshot = { ...f.thread, status: { type: 'active', activeFlags: [] }, turns: [older] };
+  const original = f.router.native.request.bind(f.router.native);
+  let release;
+  f.router.native.request = (method, params) => method === source
+    ? new Promise(resolve => { release = () => resolve(source === 'thread/read'
+      ? { thread: structuredClone(snapshot) } : { data: [structuredClone(snapshot)], nextCursor: null }); }) : original(method, params);
+  const pending = source === 'thread/read' ? f.router.hydrate('thread-1') : f.router.request('thread/list', {});
+  await tick(); assert.ok(release);
+  const newer = { id: 'newer-native', status: 'inProgress', items: [] };
+  f.router.nativeNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn: newer } });
+  assert.equal(f.store.get('thread-1').activeRun.turnId, newer.id);
+  release(); await pending;
+  assert.equal(f.store.get('thread-1').activeRun.turnId, newer.id);
+  assert.equal(f.router.thread('thread-1').status.type, 'active');
+});
+
 test('composer effort persists without a turn and reaches the next Claude run', async t => {
   const f = fixture(t); await start(f, 'claude');
   f.router.adapter.listModels = async () => [{ value: 'opus', supportsEffort: true, supportedEffortLevels: ['low', 'high', 'max'] }];
@@ -293,8 +530,9 @@ test('invalid Claude IDs are rejected before creating a native thread or changin
   await assert.rejects(f.router.request('thread/start', { cwd: f.dir, engineMode: 'claude', engineModel: '--dangerously-skip-permissions' }), /model/i);
   assert.equal(f.calls.length, 0);
   await start(f, 'claude');
+  const selectedModel = f.store.get('thread-1').models.claude;
   await assert.rejects(f.router.request('engine/mode/set', { threadId: 'thread-1', engineMode: 'claude', engineModel: 'bad\nmodel' }), /model/i);
-  assert.equal(f.store.get('thread-1').models.claude, 'default');
+  assert.equal(f.store.get('thread-1').models.claude, selectedModel);
 });
 test('router shutdown closes pending model discovery alongside active runs', async t => {
   const f = fixture(t); let closed = 0;
@@ -312,7 +550,7 @@ test('slow model discovery never blocks interrupting an active Claude turn', asy
   finally { release([]); await Promise.all([catalog, interrupted]); }
 });
 test('mode is scoped to thread; native parameters retain permission agentMode',async t=>{const f=fixture(t);await start(f,'claude');assert.equal(f.store.get('thread-1').mode,'claude');assert.equal(f.calls[0].params.agentMode,'guardian-approvals');assert.equal(f.calls[0].params.engineMode,undefined);assert.equal(f.calls[0].params.model,undefined);await assert.rejects(()=>f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'both'}),/gateway/);assert.equal(f.store.get('thread-1').mode,'claude');});
-test('Claude start never starts Codex inference; completion persists before notification',async t=>{const f=fixture(t);await start(f,'claude');const {turn}=await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'hello'}],model:'wrong-codex-model'});await tick();assert.equal(f.runs.length,1);assert.equal(f.runs[0].options.model,undefined);assert.equal(f.runs[0].options.prompt,'hello');assert.equal(f.calls.filter(c=>c.method==='turn/start').length,0);await assert.rejects(()=>f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'codex'}),/active/);f.runs[0].options.onEvent({type:'session',sessionId:'claude-session'});f.runs[0].options.onEvent({type:'message-start',id:'text-1'});f.runs[0].options.onEvent({type:'text-delta',id:'text-1',delta:'answer'});f.runs[0].options.onEvent({type:'message-completed',id:'text-1',text:'answer'});f.runs[0].finish({status:'completed',nativeSessionId:'claude-session'});await tick();const record=new ConversationStore(f.dir).get('thread-1');assert.equal(record.turns[0].turn.id,turn.id);assert.equal(record.turns[0].turn.status,'completed');assert.equal(record.turns[0].turn.items[1].text,'answer');assert.equal(record.activeRun,null);assert.ok(f.events.some(e=>e.method==='turn/completed'));});
+test('Claude start never starts Codex inference; completion persists before notification',async t=>{const f=fixture(t);await start(f,'claude');const selectedModel=f.store.get('thread-1').models.claude;const {turn}=await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'hello'}],model:'wrong-codex-model'});await tick();assert.equal(f.runs.length,1);assert.equal(f.runs[0].options.model,selectedModel);assert.equal(f.runs[0].options.prompt,'hello');assert.equal(f.calls.filter(c=>c.method==='turn/start').length,0);await assert.rejects(()=>f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'codex'}),/active/);f.runs[0].options.onEvent({type:'session',sessionId:'claude-session'});f.runs[0].options.onEvent({type:'message-start',id:'text-1'});f.runs[0].options.onEvent({type:'text-delta',id:'text-1',delta:'answer'});f.runs[0].options.onEvent({type:'message-completed',id:'text-1',text:'answer'});f.runs[0].finish({status:'completed',nativeSessionId:'claude-session'});await tick();const record=new ConversationStore(f.dir).get('thread-1');assert.equal(record.turns[0].turn.id,turn.id);assert.equal(record.turns[0].turn.status,'completed');assert.equal(record.turns[0].turn.items[1].text,'answer');assert.equal(record.activeRun,null);assert.ok(f.events.some(e=>e.method==='turn/completed'));});
 test('mixed history survives read, resume, pagination and switching context both ways',async t=>{const f=fixture(t);await start(f);f.thread.turns=[{id:'old-codex',status:'completed',items:[{id:'a',type:'agentMessage',text:'codeword violet'}]}];await f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'claude'});const {turn}=await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'remember amber'}]});await tick();assert.match(f.runs[0].options.prompt,/violet/);f.runs[0].options.onEvent({type:'message-completed',id:'b',text:'amber stored'});f.runs[0].finish({status:'completed',nativeSessionId:'cc'});await tick();for(const method of ['thread/read','thread/resume']){const result=await f.router.request(method,{threadId:'thread-1',includeTurns:true});assert.deepEqual(result.thread.turns.map(x=>x.id),['old-codex',turn.id]);}const p1=await f.router.request('thread/turns/list',{threadId:'thread-1',limit:1,sortDirection:'asc'});const p2=await f.router.request('thread/turns/list',{threadId:'thread-1',limit:1,sortDirection:'asc',cursor:p1.nextCursor});assert.equal(p2.data[0].id,turn.id);const reverse=await f.router.request('thread/turns/list',{threadId:'thread-1',sortDirection:'desc',cursor:p2.backwardsCursor});assert.equal(reverse.data[0].id,turn.id);const items=await f.router.request('thread/items/list',{threadId:'thread-1',turnId:turn.id});assert.equal(items.data[1].item.text,'amber stored');await f.router.request('engine/mode/set',{threadId:'thread-1',engineMode:'codex'});await f.router.request('turn/start',{threadId:'thread-1',input:[{type:'text',text:'continue'}]});assert.equal(f.runs.length,1);assert.match(f.calls.find(c=>c.method==='turn/start').params.input[0].text,/amber stored/);});
 test('Claude invalid image completes its visible turn as failed before native startup', async t => {
   const f = fixture(t); await start(f, 'claude');

@@ -20,6 +20,7 @@ const PATCHES = [
   "patch-updater.js",
   "patch-archive-delete.js",
   "patch-branch-edit.js",
+  "patch-thread-ipc.js",
   "patch-model-add.js",
   "patch-sidebar-navigation.js",
   "patch-permission-profiles.js",

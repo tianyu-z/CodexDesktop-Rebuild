@@ -41,6 +41,30 @@ test('native history refresh cannot erase or duplicate Claude turns', () => {
   assert.equal(store.get('thread-one').turns[1].turn.items[0].text, 'second');
 });
 
+test('authoritative native snapshots release a completed Codex run and select a newer active turn', () => {
+  const { store } = setup();
+  const old = { id: 'old-native', status: 'inProgress', items: [] };
+  const next = { id: 'new-native', status: 'inProgress', items: [] };
+  store.ensureThread({ ...thread(), status: { type: 'active' }, turns: [old] });
+  assert.equal(store.get('thread-one').activeRun.turnId, old.id);
+  store.mergeNativeThread({ ...thread(), status: { type: 'active' }, turns: [old, next] });
+  assert.equal(store.get('thread-one').activeRun.turnId, next.id);
+  store.mergeNativeThread({ ...thread(), turns: [{ ...old, status: 'completed' }, { ...next, status: 'completed' }] });
+  assert.equal(store.get('thread-one').activeRun, null);
+  assert.equal(store.hasActiveRun(), false);
+  assert.equal(store.get('thread-one').turns.at(-1).turn.status, 'completed');
+});
+
+test('idle native snapshots preserve active Claude and dual managed runs', () => {
+  for (const mode of ['claude', 'both']) {
+    const { store } = setup();
+    store.ensureThread(thread()); store.setMode('thread-one', mode);
+    store.beginRun('thread-one', { id: `managed-${mode}`, turnId: `turn-${mode}`, engine: mode === 'both' ? 'codex' : 'claude', ...(mode === 'both' ? { mode: 'both' } : {}) });
+    store.mergeNativeThread({ ...thread(), turns: [] });
+    assert.equal(store.get('thread-one').activeRun.id, `managed-${mode}`);
+  }
+});
+
 test('only an idle conversation can change modes, including Both', () => {
   const { store } = setup();
   store.ensureThread(thread());

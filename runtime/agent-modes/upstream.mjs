@@ -33,8 +33,23 @@ export class NativeClient {
       try { message = JSON.parse(line); }
       catch { this.fail(new Error('Native Codex emitted invalid JSON.')); return; }
       if (message.method && message.id !== undefined) {
+        const previousId = this.serverRequestIds.get(message.id);
+        const previous = this.serverRequests.get(previousId);
+        const signature = JSON.stringify(message);
+        // Resume replays the same native request ID. Keep its UI identity so a
+        // later resolution removes the entire request, not just its last copy.
+        // An answered request remains mapped until native resolution and must
+        // not become actionable again while that acknowledgement is in flight.
+        if (previousId !== undefined && (!previous || previous.signature === signature)) return;
+        if (previous) {
+          // Changed command/decision details require a fresh UI decision. The
+          // renderer appends requests rather than updating by ID; retire the
+          // previous card and reject any late response to its old identity.
+          this.serverRequests.delete(previousId);
+          onNotification({ method: 'serverRequest/resolved', params: { threadId: previous.threadId, requestId: previousId } });
+        }
         const id = `native-request:${randomUUID()}`;
-        this.serverRequests.set(id, { nativeId: message.id, threadId: message.params?.threadId, turnId: message.params?.turnId });
+        this.serverRequests.set(id, { nativeId: message.id, threadId: message.params?.threadId, turnId: message.params?.turnId, signature });
         this.serverRequestIds.set(message.id, id);
         onRequest({ ...message, id });
       } else if (message.id !== undefined) {

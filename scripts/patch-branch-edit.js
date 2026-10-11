@@ -202,7 +202,7 @@ const L5_ANCHOR_RE =
 function layerSnapshotEdit(platform) {
   console.log("  [layer 5] thread: snapshot-fork before destructive edit");
   eachBundle(/^local-conversation-thread-(?!turn-entries)[^/]*\.js$/, platform, (code) => {
-    if (code.includes("__cdxBranch?.beforeEdit")) return null;
+    if (code.includes("__cdxBranch?.beforeEdit") || code.includes("__cdxBranch.runEdit(")) return null;
 
     const fork = code.match(L5_FORK_RE);
     if (fork == null) throw new PatchError("fork-from-turn callback not found");
@@ -324,6 +324,9 @@ function main() {
     layerTurnIndex(platform);
     layerSnapshotEdit(platform);
     layerSwitcher(platform);
+    const { patchThreadEdit, patchMessageEditor } = require('./patch-edit-sessions');
+    eachBundle(/^local-conversation-thread-(?!turn-entries)[^/]*\.js$/, platform, patchThreadEdit);
+    eachBundle(/^subagent-activity-chip-group-.*\.js$/, platform, patchMessageEditor);
   } catch (e) {
     if (!(e instanceof PatchError)) throw e;
     console.error(`  [x] ${e.message}`);

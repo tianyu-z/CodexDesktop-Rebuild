@@ -32,6 +32,12 @@ const patches = [
   ['resume response profile source',
     'function Pft(e,t){let n=t?.activePermissionProfile;return t!=null&&e.activePermissionProfile==null&&n?.id===`:danger-full-access`?t:{activePermissionProfile:e.activePermissionProfile??(n!=null&&!n.id.startsWith(`:`)?n:null),runtimeWorkspaceRoots:e.runtimeWorkspaceRoots,approvalPolicy:e.approvalPolicy,approvalsReviewer:e.approvalsReviewer,sandboxPolicy:e.sandbox}}',
     'function Pft(e,t){let n=t?.activePermissionProfile;return{activePermissionProfile:e.activePermissionProfile??(n?.id===`:danger-full-access`&&e.sandbox?.type===`dangerFullAccess`&&e.approvalPolicy===`never`?n:n!=null&&!n.id.startsWith(`:`)?n:null),runtimeWorkspaceRoots:e.runtimeWorkspaceRoots,approvalPolicy:e.approvalPolicy,approvalsReviewer:e.approvalsReviewer,sandboxPolicy:e.sandbox}}'],
+  // A host default is for new chats. The hook's threadMode already includes
+  // explicit next-turn settings, so preferring it also preserves user changes.
+  // A loaded requirements policy can still require a different allowed mode.
+  ['existing chat permission picker source',
+    'de=y?`guardian-approvals`:ue,fe=K??',
+    'de=y?`guardian-approvals`:n!=null&&ee!=null&&(h.isConfigDataPending||M.includes(ee))?ee:ue,fe=K??'],
 ];
 
 function patchPermissionProfiles(source) {

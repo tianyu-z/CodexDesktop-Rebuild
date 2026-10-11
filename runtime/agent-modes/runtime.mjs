@@ -9,7 +9,7 @@ import { RoleRunner } from './orchestration/role-runner.mjs';
 import { WorkflowScheduler } from './orchestration/scheduler.mjs';
 import { GitWorkspaceManager } from './workspaces/manager.mjs';
 
-export function createEngineRuntime({ command, args = ['app-server'], codexRoleArgs, codexReadRoleArgs, directory, emit, onExit, environment, claudePath, remote = false }) {
+export function createEngineRuntime({ command, args = ['app-server'], nativeCommand = command, nativeArgs = args, codexRoleArgs, codexReadRoleArgs, directory, emit, onExit, environment, claudePath, remote = false }) {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const lockPath = join(directory, '.gateway.lock');
   function acquire() {
@@ -28,7 +28,7 @@ export function createEngineRuntime({ command, args = ['app-server'], codexRoleA
   let router, native, closing;
   try {
     const store = new ConversationStore(directory);
-    native = new NativeClient({ command, args, env: process.env, onNotification: message => router?.nativeNotification(message), onRequest: emit, onExit });
+    native = new NativeClient({ command: nativeCommand, args: nativeArgs, env: process.env, onNotification: message => router?.nativeNotification(message), onRequest: emit, onExit });
     const adapter = new ClaudeAdapter({ executablePath: claudePath, ...(environment ? { environment } : {}) });
     const templates = new TemplateStore(join(directory, 'templates'));
     const runner = new RoleRunner({ claudeAdapter: adapter, codexCommand: command, codexArgs: codexRoleArgs, codexReadArgs: codexReadRoleArgs });

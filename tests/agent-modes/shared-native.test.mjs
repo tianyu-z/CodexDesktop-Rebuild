@@ -1,0 +1,153 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { PassThrough } from 'node:stream';
+import { createServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
+import { WebSocketServer } from '../../runtime/agent-modes/node_modules/ws/wrapper.mjs';
+import { NativeClient } from '../../runtime/agent-modes/upstream.mjs';
+import { startSharedNativeBridge } from '../../runtime/agent-modes/remote/shared-native.mjs';
+
+const bridge = resolve('runtime/agent-modes/remote/shared-native.mjs');
+
+test('shared daemon startup reuses the official owner and fails closed on timeout', { timeout: 5000 }, async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'cdx-shared-start-')), cli = join(dir, 'codex'), log = join(dir, 'calls');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(cli, `#!${process.execPath}\n` + String.raw`
+const fs = require('node:fs');
+fs.appendFileSync(process.env.CDX_TEST_LOG, JSON.stringify(process.argv.slice(2)) + '\n');
+if (process.env.CDX_TEST_HANG) setInterval(() => {}, 1000);
+else console.log(JSON.stringify({ status: 'alreadyRunning', socketPath: '/tmp/official-codex.sock', appServerVersion: '0.142.5' }));
+`, { mode: 0o700 });
+  const { ensureSharedNativeDaemon } = await import('../../runtime/agent-modes/remote/shared-native.mjs');
+  assert.equal(typeof ensureSharedNativeDaemon, 'function');
+  const env = { ...process.env, CDX_TEST_LOG: log };
+  assert.equal(await ensureSharedNativeDaemon({ command: cli, env, timeoutMs: 2000 }), '/tmp/official-codex.sock');
+  assert.equal(await ensureSharedNativeDaemon({ command: cli, env, timeoutMs: 2000 }), '/tmp/official-codex.sock');
+  assert.deepEqual(readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse), Array(2).fill(['-c', 'features.code_mode_host=true', 'app-server', 'daemon', 'start']));
+  await assert.rejects(ensureSharedNativeDaemon({ command: cli, env: { ...env, CDX_TEST_HANG: '1' }, timeoutMs: 50 }), /timed out/i);
+});
+
+test('daemon startup timeout releases pipes inherited by an unrelated descendant', { timeout: 5000 }, t => {
+  const dir = mkdtempSync(join(tmpdir(), 'cdx-shared-inherited-')), cli = join(dir, 'codex');
+  writeFileSync(cli, `#!${process.execPath}\n` + String.raw`
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const descendant = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 8000)'], { stdio: ['ignore', 'inherit', 'inherit'] });
+fs.writeFileSync(process.env.CDX_TEST_DESCENDANT_MARKER, String(descendant.pid));
+descendant.unref(); setInterval(() => {}, 1000);
+`, { mode: 0o700 });
+  const module = new URL('../../runtime/agent-modes/remote/shared-native.mjs', import.meta.url).href;
+  const script = `const {ensureSharedNativeDaemon}=await import(${JSON.stringify(module)});\n` +
+    `try { await ensureSharedNativeDaemon({command:process.argv[1],timeoutMs:2000}); process.exitCode=2; }\n` +
+    `catch(error) { console.log(error.message); }`;
+  const marker = join(dir, 'spawned');
+  t.after(() => {
+    if (existsSync(marker)) try { process.kill(Number(readFileSync(marker, 'utf8')), 'SIGTERM'); } catch {}
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const run = spawnSync(process.execPath, ['--input-type=module', '-e', script, cli],
+    { encoding: 'utf8', timeout: 4000, env: { ...process.env, CDX_TEST_DESCENDANT_MARKER: marker } });
+  assert.equal(existsSync(marker), true, 'The descendant inherited the CLI pipes before timeout');
+  assert.equal(run.status, 0, run.error?.message ?? run.stderr);
+  assert.match(run.stdout, /timed out/i);
+});
+
+async function fixture(t, { slowProxy = false } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'cdx-shared-native-'));
+  const socketPath = join(dir, 'native.sock');
+  const server = createServer(), sockets = new WebSocketServer({ server });
+  sockets.on('connection', ws => {
+    if (slowProxy) { ws._socket.pause(); setTimeout(() => ws._socket.resume(), 300); }
+    ws.on('message', (bytes, binary) => {
+      if (binary) { ws.close(1003, 'Native RPC requires text frames'); return; }
+      const message = JSON.parse(bytes);
+      if (message.method === 'initialize') {
+        ws.send(JSON.stringify({ id: message.id, result: { userAgent: 'fixture' } }));
+        ws.send(JSON.stringify({ method: 'fixture/ready' }));
+      } else if (message.method === 'fixture/approval') {
+        ws.send(JSON.stringify({ id: 17, method: 'item/commandExecution/requestApproval', params: { threadId: 'thread', turnId: 'turn' } }));
+        ws.send(JSON.stringify({ id: message.id, result: { sent: true } }));
+      } else if (message.method === 'fixture/large-response') {
+        ws.send(JSON.stringify({ id: message.id, result: { text: 'x'.repeat(65 * 1024 * 1024) } }));
+      } else if (message.id === 17) {
+        ws.send(JSON.stringify({ method: 'fixture/decision', params: message.result }));
+      } else if (message.id != null) ws.send(JSON.stringify({ id: message.id, result: { method: message.method } }));
+    });
+  });
+  await new Promise(resolve => server.listen(socketPath, resolve));
+  t.after(async () => {
+    for (const ws of sockets.clients) ws.terminate();
+    await new Promise(resolve => sockets.close(resolve));
+    await new Promise(resolve => server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return { socketPath };
+}
+
+test('shared native bridge carries requests, notifications, and pending approvals', { timeout: 5000 }, async t => {
+  const { socketPath } = await fixture(t), notifications = [], approvals = [];
+  const client = new NativeClient({ command: process.execPath, args: [bridge, socketPath], env: process.env,
+    onNotification: message => notifications.push(message), onRequest: message => approvals.push(message) });
+  t.after(() => client.close());
+  assert.deepEqual(await client.request('initialize', {}), { userAgent: 'fixture' });
+  assert.deepEqual(await client.request('fixture/approval', {}), { sent: true });
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].method, 'item/commandExecution/requestApproval');
+  assert.equal(client.respond({ id: approvals[0].id, result: { decision: 'decline' } }), true);
+  await client.request('fixture/barrier', {});
+  assert.ok(notifications.some(message => message.method === 'fixture/ready'));
+  assert.ok(notifications.some(message => message.method === 'fixture/decision' && message.params.decision === 'decline'));
+});
+
+test('shared native bridge drains queued JSON lines after a slow proxy resumes', { timeout: 20000 }, async t => {
+  const { socketPath } = await fixture(t, { slowProxy: true });
+  const client = new NativeClient({ command: process.execPath, args: [bridge, socketPath],
+    env: process.env, onNotification: () => {}, onRequest: () => {}, requestTimeoutMs: 15000 });
+  t.after(() => client.close());
+  await client.request('initialize', {});
+  const messages = Array.from({ length: 4 }, (_, index) => client.request(`fixture/${index}`, { payload: 'x'.repeat(9 * 1024 * 1024) }));
+  assert.deepEqual((await Promise.all(messages)).map(result => result.method), ['fixture/0', 'fixture/1', 'fixture/2', 'fixture/3']);
+});
+
+test('shared native bridge preserves a response above the desktop frame limit', { timeout: 20000 }, async t => {
+  const { socketPath } = await fixture(t);
+  const client = new NativeClient({ command: process.execPath, args: [bridge, socketPath], env: process.env,
+    onNotification: () => {}, onRequest: () => {}, requestTimeoutMs: 15000 });
+  t.after(() => client.close());
+  await client.request('initialize', {});
+  assert.equal((await client.request('fixture/large-response', {})).text.length, 65 * 1024 * 1024);
+});
+
+test('shared native bridge closes a socket that never completes its handshake', { timeout: 3000 }, async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'cdx-stalled-socket-')), socketPath = join(dir, 'native.sock');
+  const peers = new Set();
+  const server = createNetServer(socket => { peers.add(socket); socket.on('close', () => peers.delete(socket)); socket.resume(); });
+  await new Promise(resolve => server.listen(socketPath, resolve));
+  t.after(async () => {
+    for (const socket of peers) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const input = new PassThrough(), output = new PassThrough();
+  const failed = new Promise(resolve => {
+    const bridge = startSharedNativeBridge({ socketPath, input, output, timeoutMs: 75, onError: resolve });
+    t.after(() => bridge.close());
+  });
+  assert.match((await failed).message, /handshake.*timed out/i);
+});
+
+test('shared native bridge rejects a request above its native input limit', { timeout: 10000 }, async t => {
+  const { socketPath } = await fixture(t);
+  const stderr = new PassThrough(); let diagnostics = '';
+  stderr.on('data', bytes => diagnostics += bytes);
+  const client = new NativeClient({ command: process.execPath, args: [bridge, socketPath], env: process.env,
+    stderr, onNotification: () => {}, onRequest: () => {}, requestTimeoutMs: 8000 });
+  t.after(() => client.close());
+  await client.request('initialize', {});
+  await assert.rejects(client.request('fixture/too-large', { text: 'x'.repeat(17 * 1024 * 1024) }), /Native Codex exited|unavailable|EPIPE/i);
+  assert.match(diagnostics, /16 MiB limit/);
+});

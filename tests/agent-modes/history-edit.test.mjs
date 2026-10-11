@@ -36,7 +36,9 @@ function fixture(t, engines = ['claude', 'claude', 'claude'], { historyMode = 'p
     if (method === 'thread/fork') {
       const end = params.lastTurnId ? thread.turns.findIndex(row => row.id === params.lastTurnId) + 1 : thread.turns.length;
       assert.ok(!params.lastTurnId || end > 0, 'Synthetic Claude turn IDs must never reach native fork');
-      const fork = { ...structuredClone(thread), id: `fork-${++counter}`, forkedFromId: thread.id, turns: thread.turns.slice(0, end).map((row, i) => ({ ...structuredClone(row), id: `fork-${counter}-native-${i}` })) };
+      // A new native branch has no running turn of its own. The source may
+      // continue running independently while its history is copied.
+      const fork = { ...structuredClone(thread), status: { type: 'idle' }, id: `fork-${++counter}`, forkedFromId: thread.id, turns: thread.turns.slice(0, end).map((row, i) => ({ ...structuredClone(row), id: `fork-${counter}-native-${i}` })) };
       nativeThreads.set(fork.id, fork);
       return { thread: { ...structuredClone(fork), turns: [] }, model: 'codex-test', cwd: dir };
     }
@@ -374,18 +376,20 @@ test('a Codex turn that starts during source hydration can still be forked', asy
   f.native.request = async (method, params) => {
     if (method === 'thread/read' && params.threadId === 'source' && !started) {
       started = true;
+      const snapshot = await originalRequest(method, params);
       const partial = { ...turn('turn-2', 'LATE-START'), status: 'inProgress' };
       f.nativeThreads.get('source').turns.push(structuredClone(partial));
-      f.store.putTurn('source', partial, { engine: 'codex' });
-      f.store.beginRun('source', { id: 'late-run', engine: 'codex', turnId: 'turn-2' });
+      f.nativeThreads.get('source').status = { type: 'active', activeFlags: [] };
+      f.router.nativeNotification({ method: 'turn/started', params: { threadId: 'source', turn: partial } });
+      return snapshot;
     }
     return originalRequest(method, params);
   };
   const fork = await f.router.request('thread/fork', { threadId: 'source' });
   assert.deepEqual(fork.thread.turns.map(row => row.status), ['completed', 'completed', 'interrupted']);
   assert.equal(f.store.get(fork.thread.id).turns[2].nativeDetached, true);
-  assert.equal(f.store.get('source').activeRun.id, 'late-run');
-  f.store.finishRun('source', 'late-run');
+  assert.equal(f.store.get('source').activeRun.turnId, 'turn-2');
+  f.store.finishRun('source', 'turn-2');
 });
 
 test('a fork freezes source content when the active native turn finishes during native I/O', async t => {

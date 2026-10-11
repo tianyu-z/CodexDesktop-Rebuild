@@ -35,8 +35,40 @@ function save(s) {
 }
 
 const api = {
-  /** "branch" (fork a snapshot, default) or "inplace" (destructive truncate). */
-  mode: null,
+  /** Editing mode belongs to an open editor, not the next global submission. */
+  _editors: new Map(),
+  _editingThreads: new Map(),
+  editKey({ hostId, threadId, turnId }) {
+    return JSON.stringify([hostId ?? 'local', threadId, turnId]);
+  },
+  beginEdit(options) {
+    const key = this.editKey(options), previous = this._editors.get(key);
+    if (previous?.pending || previous?.mode === options.mode) return;
+    this._editors.set(key, { mode: options.mode === 'inplace' ? 'inplace' : 'branch', snapshot: null, pending: null });
+  },
+  cancelEdit(options) {
+    const key = this.editKey(options);
+    if (!this._editors.get(key)?.pending) this._editors.delete(key);
+  },
+  runEdit(options) {
+    const key = this.editKey(options), session = this._editors.get(key);
+    if (!session) return Promise.reject(new Error('Reopen the message editor to select an editing mode.'));
+    if (session.pending) return session.pending;
+    const threadKey = JSON.stringify([options.hostId ?? 'local', options.threadId]);
+    if (this._editingThreads.has(threadKey)) return Promise.reject(new Error('Another message edit is still running in this chat.'));
+    const pending = Promise.resolve().then(async () => {
+      await this.beforeEdit(options);
+      const result = await options.edit();
+      if (this._editors.get(key) === session) this._editors.delete(key);
+      return result;
+    }).finally(() => {
+      session.pending = null;
+      if (this._editingThreads.get(threadKey) === pending) this._editingThreads.delete(threadKey);
+    });
+    session.pending = pending;
+    this._editingThreads.set(threadKey, pending);
+    return pending;
+  },
   /** Set by the thread view each render: (threadId) => void. */
   nav: null,
   /** threadId -> { turnId: turnIndex }, rebuilt every session. */
@@ -84,13 +116,13 @@ const api = {
    * Called from the thread view right before a destructive edit is dispatched.
    * `fork()` must create a full copy of the current thread and resolve to its id.
    */
-  async beforeEdit({ threadId, turnId, fork }) {
-    const mode = this.mode;
-    this.mode = null;
-    if (mode === "inplace") return;
+  async beforeEdit({ hostId, threadId, turnId, fork }) {
+    const session = this._editors.get(this.editKey({ hostId, threadId, turnId }));
+    if (session?.mode === "inplace" || session?.snapshot != null) return;
     const idx = this.turnIndex(threadId, turnId);
     const snapId = await fork();
     if (snapId == null) throw new Error("Could not save the previous message version. Editing was cancelled.");
+    if (session) session.snapshot = snapId;
     if (snapId != null && idx != null) this.record(threadId, snapId, idx);
   },
 
